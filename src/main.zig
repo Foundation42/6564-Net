@@ -183,7 +183,12 @@ pub fn main() !void {
                 opts.seed = parseOr(u64, s, "seed");
             }
         }
-        if (args.next()) |s| opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+        if (args.next()) |s| {
+            opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+            // loss 0 asks for a CLEAN fabric: duplication off too — a
+            // teletype has no dedup, and doubled greetings help no one.
+            if (opts.loss_ppm4k == 0) opts.dup_ppm4k = 0;
+        }
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
         return sim.joe_run.run(alloc, source, opts);
     }

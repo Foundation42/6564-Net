@@ -1,0 +1,17 @@
+// hello.joe — the machine's first words, now in joe.
+//
+// The console is not a port: it is an actor on the peripheral row
+// (spec §7), and in joe it is just another name in the system block —
+// wired like any peer, spoken to with SEND like everything else,
+// because SEND is the only I/O there is. A device is an optimization,
+// never an interface (§7.5); the Greeter can't tell.
+
+actor Greeter(tty addr) {
+    send tty, "HELLO, WORLD - JOE SPEAKS.\n"
+    halt ok
+}
+
+system {
+    greeter = Greeter(tty) on 0
+    tty = Console()
+}

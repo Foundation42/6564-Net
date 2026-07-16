@@ -507,3 +507,40 @@ arithmetic (3 Griefer lives, 2 Sleeper lives). The dead lie where they
 fell (brk, watchdog), their clocks stopped, and the machine went
 quiet in 5,368 cycles — quiescence is the proof the disarm logic
 works. 89 tests green; frozen table intact.
+
+## The corpus converges: scatter, pipeline, hello in joe (2026-07-16)
+
+Three more conversions, one new construct.
+
+**scatter.joe** needed nothing new — four workers spelled out where the
+sketch has arrays (`for` waits its turn), 16-byte Replies giving the
+SEND path its first exercise. Through 25% loss + duplication: got=15,
+r0..r3 = 500..503, machine quiescent. The sketch's rule holds in
+compiled form: the result is the ack, and idempotent workers make
+duplicates harmless — the coordinator has NO dedup and needs none.
+
+**pipeline.joe** brought `quiesce` into the language (statement +
+lame-duck case block, sketch §2.3). The compiler emits a second
+dispatch loop: entering it kills the timer (AUTO_REARM flag cleared),
+serves only the quiesce cases, and consumes everything else in
+silence. The poison pill is an ordinary item (val 0) riding the same
+stop-and-wait discipline as the data — no Done message needed at all.
+sum = 12,615 exact at 25% AND 61% loss; every stage lame-ducks to
+parked and the machine goes quiet. Backpressure remains the absence
+of an ack; the `case Item(_): say nothing` branch IS the flow control.
+
+**hello.joe** made devices system-block citizens: `tty = Console()` is
+wired like any peer (a PTT slot aimed at $FF00), spoken to with
+`send tty, "HELLO, WORLD - JOE SPEAKS.\n"` — string literals stage
+after the code and ride an ordinary SQE. §7.5 honored end to end: the
+Greeter cannot tell it is talking to silicon. One honest note: the
+default fabric duplicates, a teletype has no dedup, and the first run
+greeted the world twice — `loss 0` on the CLI now means a clean
+fabric, and unreliable-fabric device output is a real open question
+for the device protocol, not something the loader should paper over.
+
+Corpus scoreboard: pingpong ✓ ring ✓ supervise ✓ scatter ✓ pipeline ✓
+hello ✓ — six of the demo suite's protocols now compile from joe.
+92 tests green; frozen table intact (2820 / 171,112 / 479,273).
+Next: item 4 — park-point liveness and the bank collapse, measured
+against ring.joe's 110 cy/pass.

@@ -30,7 +30,16 @@ const std = @import("std");
 const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
+const dev = @import("dev.zig");
 const joe = @import("joe.zig");
+
+/// Builtin device types a `system` block may instantiate — peripherals
+/// are actors made of different silicon (spec §7), so they are named
+/// like actors and wired like actors; only the loader knows they need
+/// no context.
+const device_table = [_]struct { name: []const u8, coord: u16 }{
+    .{ .name = "Console", .coord = 0xFF00 },
+};
 
 pub const Options = struct {
     seed: u64 = 0x6564,
@@ -59,6 +68,8 @@ pub const Outcome = struct {
     alloc: std.mem.Allocator,
     reason: machine.StopReason,
     instances: []InstanceOut,
+    /// What the console heard, when the system had one.
+    console: ?[]u8 = null,
     cycles: u64,
     stats: machine.Stats,
 
@@ -70,6 +81,7 @@ pub const Outcome = struct {
             self.alloc.free(inst.vars);
         }
         self.alloc.free(self.instances);
+        if (self.console) |c| self.alloc.free(c);
     }
 
     pub fn instance(self: *const Outcome, name: []const u8) ?*const InstanceOut {
@@ -128,10 +140,20 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     // ── Place the declared instances: explicit `on N` wins; the rest
     //    fill fresh cores. ──
     var all = std.ArrayList(Placed).init(scratch);
+    var devices = std.ArrayList(struct { name: []const u8, coord: u16 }).init(scratch);
     var next_core: u16 = 0;
     var ctx_count = std.AutoHashMap(u16, u8).init(scratch);
     for (pl.instances) |inst| {
         if (inst.args.len > 8) return fail("more than 8 instance args", .{});
+        const coord: ?u16 = for (device_table) |d| {
+            if (std.mem.eql(u8, d.name, inst.actor)) break d.coord;
+        } else null;
+        if (coord) |c| {
+            if (inst.args.len != 0)
+                return fail("{s}: a device takes no arguments", .{inst.name});
+            try devices.append(.{ .name = inst.name, .coord = c });
+            continue;
+        }
         const core = inst.core orelse blk: {
             while (ctx_count.contains(next_core)) next_core += 1;
             break :blk next_core;
@@ -230,6 +252,9 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         while (it.next()) |e| max_ctx = @max(max_ctx, e.value_ptr.*);
     }
 
+    if (all.items.len == 0)
+        return fail("a system of only devices has nothing to run", .{});
+
     // ── The machine. ──
     var m = try machine.Machine.init(alloc, .{
         .cores = cores,
@@ -248,18 +273,27 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     });
     defer m.deinit();
 
+    for (devices.items) |*d| {
+        std.debug.assert(d.coord == 0xFF00); // Console is v1's only device
+        try m.attachDevice(d.coord, joe.abi.token, .{ .console = dev.Console.init(alloc) });
+    }
+
     // ── Wire capabilities and black holes (rings are self-staged). ──
     for (all.items, compiled.items) |*p, *c| {
         for (p.args, 0..) |a, k| {
             if (a != .ref) continue;
             if (!c.r.params[k].addr)
                 return fail("{s}: arg {d} names an instance but the param is not addr", .{ p.name, k });
-            const target = for (all.items) |*t| {
-                if (t.parent == null and std.mem.eql(u8, t.name, a.ref)) break t;
+            const lo: u64 = for (all.items) |*t| {
+                if (t.parent == null and std.mem.eql(u8, t.name, a.ref))
+                    break ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx);
+            } else for (devices.items) |*d| {
+                if (std.mem.eql(u8, d.name, a.ref))
+                    break ring.PttEntry.loFrom(d.coord, 0, 0);
             } else return fail("{s}: no instance named {s}", .{ p.name, a.ref });
             m.setPtt(p.core, p.ref_slots[k], .{
                 .prefix_hi = 0xfd65_6400_0000_0000,
-                .prefix_lo = ring.PttEntry.loFrom(target.core, target.ctx, ring.slot_rx),
+                .prefix_lo = lo,
                 .rights = .{ .send = true },
                 .token = joe.abi.token,
             });
@@ -335,10 +369,18 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             .vars = try vars.toOwnedSlice(),
         });
     }
+    var console: ?[]u8 = null;
+    for (devices.items) |*d| {
+        if (d.coord == 0xFF00) {
+            console = try alloc.dupe(u8, m.device(d.coord).?.console.out.items);
+            break;
+        }
+    }
     return .{
         .alloc = alloc,
         .reason = reason,
         .instances = try insts.toOwnedSlice(),
+        .console = console,
         .cycles = max_clock,
         .stats = m.stats,
     };
@@ -392,6 +434,13 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
         try stdout.print(" [{d} B]", .{inst.code_bytes});
         for (inst.vars) |v| try stdout.print("  {s}={d}", .{ v.name, v.value });
         try stdout.print("\n", .{});
+    }
+    if (o.console) |text| {
+        try stdout.print("\n  the console heard:\n\n", .{});
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |l| {
+            if (l.len > 0) try stdout.print("    {s}\n", .{l});
+        }
     }
     try stdout.print(
         \\

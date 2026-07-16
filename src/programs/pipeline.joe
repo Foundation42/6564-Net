@@ -1,0 +1,102 @@
+// pipeline.joe — the sketch's §2.3: backpressure by silence,
+// termination as a phase.
+//
+// Stop-and-wait per hop on application acks with sequence dedup;
+// stages ack on OWNERSHIP so hops overlap; backpressure is the absence
+// of an ack (out of order, or no room: say nothing — upstream's timer
+// is the retry loop). The poison pill is an ordinary item (val 0)
+// riding the same reliability discipline as the data, and `quiesce`
+// makes termination a phase: timers die, a lame duck serves re-acks,
+// stragglers converge, the machine goes quiet instead of staying awake.
+
+message Item { seq u32, val u64 }
+message Ack { seq u32 }
+
+actor Source(down addr, count u32) {
+    var seq u32 = 0
+    var val u64 = 100
+
+    send down, Item{0, 100}
+
+    serve {
+        case Ack(a) where a.seq == seq:
+            seq += 1
+            if seq > count { halt ok }
+            val = seq + 100
+            if seq == count { val = 0 }     // the pill: in sequence, val 0
+            send down, Item{seq, val}
+
+        case Ack(_):
+            // a stale ack: nothing to do
+
+        after 700:
+            send down, Item{seq, val}       // retransmit the unacked one
+    }
+}
+
+actor Stage(up addr, down addr) {
+    var expect u32 = 0
+    var holding u64 = 0                     // one item in flight downstream
+    var hseq u32 = 0
+    var hval u64 = 0
+
+    serve {
+        case Item(i) where i.seq == expect && holding == 0:
+            send up, Ack{i.seq}             // ack on ownership — hops overlap
+            hseq = i.seq
+            hval = i.val + 1000             // the transform
+            if i.val == 0 { hval = 0 }      // the pill passes untransformed
+            holding = 1
+            expect += 1
+            send down, Item{hseq, hval}
+
+        case Item(i) where i.seq < expect:
+            send up, Ack{i.seq}             // re-ack the past, never the future
+
+        case Item(_):
+            // out of order, or no room: say nothing.
+            // silence IS backpressure — upstream's timer is the retry loop
+
+        case Ack(a) where holding == 1 && a.seq == hseq:
+            holding = 0
+            if hval == 0 { quiesce }        // the pill is acked: lame-duck out
+
+        after 700:
+            if holding == 1 { send down, Item{hseq, hval} }
+    }
+
+    quiesce {
+        case Item(i) where i.seq < expect:
+            send up, Ack{i.seq}             // a lame duck serves re-acks
+    }
+}
+
+actor Sink(up addr) {
+    var expect u32 = 0
+    var sum u64 = 0
+
+    serve {
+        case Item(i) where i.seq == expect:
+            send up, Ack{i.seq}
+            expect += 1
+            if i.val == 0 { quiesce }
+            sum += i.val
+
+        case Item(i) where i.seq < expect:
+            send up, Ack{i.seq}
+
+        case Item(_):
+    }
+
+    quiesce {
+        case Item(i) where i.seq < expect:
+            send up, Ack{i.seq}
+    }
+}
+
+system {
+    source = Source(s1, 6) on 0
+    s1 = Stage(source, s2)
+    s2 = Stage(s1, sink)
+    sink = Sink(s2) on 3
+}

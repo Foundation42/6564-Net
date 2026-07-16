@@ -160,9 +160,15 @@ const AssignOp = enum { set, add, sub };
 const Stmt = union(enum) {
     assign: struct { name: []const u8, op: AssignOp, expr: *Expr },
     send: struct { target: []const u8, msg: []const u8, args: []*Expr, line: usize },
+    /// `send tty, "TEXT"` — raw bytes to a device: no tag, no fields,
+    /// just the payload a teletype expects.
+    send_str: struct { target: []const u8, text: []const u8, line: usize },
     if_: struct { cond: *Expr, then: []Stmt, els: []Stmt },
     halt: struct { ok: bool },
     bounded: struct { n: u64, body: []Stmt },
+    /// Enter the lame-duck phase: timers die, the quiesce case set takes
+    /// over. Termination is a phase, not an instruction.
+    quiesce,
     spawn: struct {
         actor: []const u8,
         args: []u64, // v1: literal args only
@@ -202,6 +208,10 @@ const Actor = struct {
     vars: []VarDecl,
     body: []Stmt,
     handlers: []Handler,
+    /// The lame-duck case set (sketch §2.3): served after a `quiesce`
+    /// statement, with timers dead — stragglers converge, the machine
+    /// goes quiet instead of staying awake.
+    quiesce: []Handler,
 };
 
 /// One line of a `system` block: `name = Actor(args) [on core]`.
@@ -231,6 +241,7 @@ const Program = struct {
 const TokKind = enum {
     ident,
     int,
+    string,
     lbrace,
     rbrace,
     lparen,
@@ -324,6 +335,18 @@ const Lexer = struct {
                 self.pos += 1;
                 return .{ .kind = o[1], .line = line };
             }
+        }
+        if (c == '"') {
+            self.pos += 1;
+            const start = self.pos;
+            while (self.pos < self.src.len and self.src[self.pos] != '"') {
+                if (self.src[self.pos] == '\\') self.pos += 1; // escape: skip the next char
+                self.pos += 1;
+            }
+            if (self.pos >= self.src.len) return Error.Syntax;
+            const raw = self.src[start..self.pos];
+            self.pos += 1; // closing quote
+            return .{ .kind = .string, .text = raw, .line = line };
         }
         if (c == '$' or std.ascii.isDigit(c)) {
             const start = self.pos;
@@ -479,6 +502,7 @@ const Parser = struct {
             const fname = try self.expect(.ident, "field name");
             const ty = try self.parseType();
             try fields.append(.{ .name = fname.text, .ty = ty });
+            if (self.tok.kind == .comma) try self.advance();
         }
         try self.advance(); // }
         return .{ .name = name.text, .fields = try fields.toOwnedSlice() };
@@ -523,8 +547,17 @@ const Parser = struct {
             }
             try self.advance(); // }
         }
-        if (self.isKw("quiesce"))
-            return self.fail("`quiesce` is not in v1 yet", Error.Unsupported);
+        var quiesce = std.ArrayList(Handler).init(self.arena);
+        if (try self.eatKw("quiesce")) {
+            _ = try self.expect(.lbrace, "{");
+            while (self.tok.kind != .rbrace) {
+                const h = try self.parseHandler();
+                if (h != .case)
+                    return self.fail("a quiesce block holds only cases — timers are dead here", Error.Syntax);
+                try quiesce.append(h);
+            }
+            try self.advance(); // }
+        }
         _ = try self.expect(.rbrace, "} to close the actor");
         return .{
             .name = name.text,
@@ -532,6 +565,7 @@ const Parser = struct {
             .vars = try vlist.toOwnedSlice(),
             .body = try body.toOwnedSlice(),
             .handlers = try handlers.toOwnedSlice(),
+            .quiesce = try quiesce.toOwnedSlice(),
         };
     }
 
@@ -617,6 +651,28 @@ const Parser = struct {
         if (try self.eatKw("send")) {
             const target = try self.expect(.ident, "target");
             _ = try self.expect(.comma, ",");
+            if (self.tok.kind == .string) {
+                // decode escapes into the arena
+                var text = std.ArrayList(u8).init(self.arena);
+                var j: usize = 0;
+                const raw = self.tok.text;
+                while (j < raw.len) : (j += 1) {
+                    if (raw[j] == '\\' and j + 1 < raw.len) {
+                        j += 1;
+                        try text.append(switch (raw[j]) {
+                            'n' => '\n',
+                            't' => '\t',
+                            else => raw[j],
+                        });
+                    } else try text.append(raw[j]);
+                }
+                try self.advance();
+                return .{ .send_str = .{
+                    .target = target.text,
+                    .text = try text.toOwnedSlice(),
+                    .line = line,
+                } };
+            }
             const msg = try self.expect(.ident, "message name");
             _ = try self.expect(.lbrace, "{");
             var args = std.ArrayList(*Expr).init(self.arena);
@@ -670,7 +726,8 @@ const Parser = struct {
                 .line = line,
             } };
         }
-        inline for (.{ "chain", "for", "let", "quiesce", "region", "grant", "log" }) |kw| {
+        if (try self.eatKw("quiesce")) return .quiesce;
+        inline for (.{ "chain", "for", "let", "region", "grant", "log" }) |kw| {
             if (self.isKw(kw))
                 return self.fail("`" ++ kw ++ "` is not in v1 yet", Error.Unsupported);
         }
@@ -798,6 +855,8 @@ const Gen = struct {
 
     labels: usize = 0,
     serve_label: usize = 0,
+    quiesce_label: usize = 0,
+    has_quiesce: bool = false,
     /// Current case binding: name → the landing pointer internal.
     bind: ?[]const u8 = null,
     bind_msg: ?*const Message = null,
@@ -809,6 +868,9 @@ const Gen = struct {
     timer_period: u64 = 0,
     spawn_count: u16 = 0,
     spawn_seen: u16 = 0,
+
+    /// String literals staged after the code, one label each.
+    strings: std.ArrayList(struct { label: usize, text: []const u8 }),
 
     // Near-page slot offsets, assigned in layout().
     slots: std.StringHashMap(u16),
@@ -889,6 +951,29 @@ const Gen = struct {
         for (self.actor.body) |s| {
             if (s == .spawn) self.spawn_count += 1;
         }
+        self.has_quiesce = self.actor.quiesce.len > 0 or anyQuiesce(self.actor.body) or blk: {
+            for (self.actor.handlers) |h| {
+                const body = switch (h) {
+                    .case => |c| c.body,
+                    .after => |a| a.body,
+                    .exit_case => |e| e.body,
+                };
+                if (anyQuiesce(body)) break :blk true;
+            }
+            break :blk false;
+        };
+    }
+
+    fn anyQuiesce(list: []const Stmt) bool {
+        for (list) |s| {
+            switch (s) {
+                .quiesce => return true,
+                .if_ => |i| if (anyQuiesce(i.then) or anyQuiesce(i.els)) return true,
+                .bounded => |b| if (anyQuiesce(b.body)) return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn spawnRec(self: *Gen, k: u16) u16 {
@@ -1068,6 +1153,21 @@ const Gen = struct {
                 }
             },
             .send => |sd| try self.send(sd),
+            .send_str => |ss| {
+                const tslot = self.slots.get(ss.target) orelse
+                    return self.fail(ss.line, "unknown send target", Error.Semantics);
+                const lbl = self.label();
+                try self.strings.append(.{ .label = lbl, .text = ss.text });
+                try self.w("        LDA #1              ; SQE: op = send", .{});
+                try self.w("        STA !${X}", .{self.layout.sqBase()});
+                try self.w("        LDA ${X}", .{tslot});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
+                try self.w("        LDA ##L{d}", .{lbl});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 16});
+                try self.w("        LDA ##${X}", .{@as(u64, 1) << 32 | ss.text.len});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 24});
+                try self.w("        SEND 0", .{});
+            },
             .if_ => |i| {
                 const l_else = self.label();
                 try self.branchIfFalse(i.cond, l_else);
@@ -1097,6 +1197,15 @@ const Gen = struct {
             .bounded => |b| {
                 try self.w("        WDEX ##{d}", .{b.n});
                 try self.stmts(b.body);
+            },
+            .quiesce => {
+                // Termination is a phase: kill the clock, cross into the
+                // lame-duck case set, never come back.
+                if (self.uses_timer) {
+                    try self.w("        LDA #2              ; quiesce: the timer dies here", .{});
+                    try self.w("        STA !${X}", .{self.layout.timerBase()});
+                }
+                try self.w("        BRA L{d}", .{self.quiesce_label});
             },
             .spawn => |sp| {
                 if (self.in_handler)
@@ -1276,11 +1385,13 @@ const Gen = struct {
 
         if (self.actor.handlers.len == 0) {
             try self.w("        HLT", .{});
+            try self.emitStrings();
             return;
         }
 
         // ── serve ──
         self.serve_label = self.label();
+        self.quiesce_label = self.label();
         const l_dispatch = self.label();
         const l_exit = self.label();
         try self.w("; serve: LSTN, pop, dispatch — acks are consumed, never seen", .{});
@@ -1347,6 +1458,75 @@ const Gen = struct {
         try self.w("        BRA L{d}", .{self.serve_label});
 
         if (self.spawn_count > 0) try self.emitExitRuntime(l_exit);
+        if (self.has_quiesce) try self.emitQuiesce();
+        try self.emitStrings();
+    }
+
+    fn emitStrings(self: *Gen) Error!void {
+        if (self.strings.items.len == 0) return;
+        try self.w("; string literals", .{});
+        for (self.strings.items) |s| {
+            try self.w("L{d}:", .{s.label});
+            var idx: usize = 0;
+            while (idx < s.text.len) {
+                const chunk = @min(16, s.text.len - idx);
+                self.out.writer().writeAll("        .byte ") catch return Error.OutOfMemory;
+                for (s.text[idx .. idx + chunk], 0..) |b, bi| {
+                    if (bi > 0) self.out.writer().writeAll(",") catch return Error.OutOfMemory;
+                    self.out.writer().print("{d}", .{b}) catch return Error.OutOfMemory;
+                }
+                self.out.writer().writeAll("\n") catch return Error.OutOfMemory;
+                idx += chunk;
+            }
+        }
+    }
+
+    /// The lame-duck loop (sketch §2.3): a restricted case set, no
+    /// timers, everything else consumed in silence. Stragglers converge;
+    /// the machine goes quiet instead of staying awake.
+    fn emitQuiesce(self: *Gen) Error!void {
+        const lq = self.quiesce_label;
+        const l_dispatch = self.label();
+        // Case-body BRAs loop back to the quiesce serve, not the live one.
+        const saved = self.serve_label;
+        self.serve_label = lq;
+        defer self.serve_label = saved;
+        try self.w("; quiesce: the lame-duck serve", .{});
+        try self.w("L{d}:   LSTN 1", .{lq});
+        try self.w("        CQPOP 1", .{});
+        try self.w("        BEQ L{d}", .{lq});
+        try self.w("        STA ${X}", .{self.off_w0});
+        try self.w("        STX ${X}", .{self.off_ptr});
+        try self.w("        AND #$FF", .{});
+        try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});
+        try self.w("        BEQ L{d}", .{l_dispatch});
+        try self.w("        BRA L{d}", .{lq});
+        try self.w("L{d}:   LDA ${X}", .{ l_dispatch, self.off_w0 });
+        try self.w("        LSR #8", .{});
+        try self.w("        AND #$FF", .{});
+        try self.w("        BNE L{d}", .{lq});
+        for (self.actor.quiesce) |*h| {
+            const c = h.case;
+            const msg = self.message(c.msg) orelse
+                return self.fail(c.line, "unknown message in quiesce case", Error.Semantics);
+            const l_next = self.label();
+            try self.w("; quiesce case {s}({s})", .{ c.msg, c.bind orelse "_" });
+            try self.w("        LDA (${X})", .{self.off_ptr});
+            try self.w("        AND ##$FFFF", .{});
+            try self.w("        CMP {s}", .{try self.imm(msg.tag)});
+            try self.w("        BNE L{d}", .{l_next});
+            self.bind = c.bind;
+            self.bind_msg = msg;
+            if (c.where) |g| try self.branchIfFalse(g, l_next);
+            self.in_handler = true;
+            try self.stmts(c.body);
+            self.in_handler = false;
+            self.bind = null;
+            self.bind_msg = null;
+            try self.w("        BRA L{d}", .{lq});
+            try self.w("L{d}:", .{l_next});
+        }
+        try self.w("        BRA L{d}", .{lq});
     }
 
     /// The supervision runtime (sketch §2.2: "restarts N is policy, not
@@ -1580,6 +1760,7 @@ pub fn compile(
         .layout = layout,
         .diag = diag,
         .slots = std.StringHashMap(u16).init(arena),
+        .strings = .init(arena),
     };
     errdefer gen.out.deinit();
     try gen.emit();

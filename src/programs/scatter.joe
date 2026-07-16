@@ -1,0 +1,70 @@
+// scatter.joe — the sketch's §2.4: the result is the ack.
+//
+// Fan a task out to four workers; results converge on the coordinator.
+// There is no ack protocol at all — stragglers are re-asked on timer
+// ticks, and idempotent workers make duplicates harmless. Choosing WHAT
+// to make reliable is the protocol design.
+//
+// (v1 has no arrays or `for` yet, so the four workers are spelled out —
+// the unrolling is the only difference from the sketch.)
+
+message Ask { task u32 }
+message Reply { k u32, value u32 }
+
+actor Coordinator(w0 addr, w1 addr, w2 addr, w3 addr, task u32) {
+    var got u64 = 0
+    var r0 u64 = 0
+    var r1 u64 = 0
+    var r2 u64 = 0
+    var r3 u64 = 0
+
+    send w0, Ask{task}
+    send w1, Ask{task}
+    send w2, Ask{task}
+    send w3, Ask{task}
+
+    serve {
+        case Reply(r) where r.k == 0:
+            got = got | 1
+            r0 = r.value
+            if got == 15 { halt ok }
+
+        case Reply(r) where r.k == 1:
+            got = got | 2
+            r1 = r.value
+            if got == 15 { halt ok }
+
+        case Reply(r) where r.k == 2:
+            got = got | 4
+            r2 = r.value
+            if got == 15 { halt ok }
+
+        case Reply(r) where r.k == 3:
+            got = got | 8
+            r3 = r.value
+            if got == 15 { halt ok }
+
+        after 900:
+            if (got & 1) == 0 { send w0, Ask{task} }
+            if (got & 2) == 0 { send w1, Ask{task} }
+            if (got & 4) == 0 { send w2, Ask{task} }
+            if (got & 8) == 0 { send w3, Ask{task} }
+    }
+}
+
+// Stateless: recompute on duplicates, no dedup, no memory of having
+// answered — idempotence IS the reliability contribution.
+actor Worker(k u32, coord addr) {
+    serve {
+        case Ask(a):
+            send coord, Reply{k, a.task + k}
+    }
+}
+
+system {
+    coord = Coordinator(w0, w1, w2, w3, 500) on 0
+    w0 = Worker(0, coord)
+    w1 = Worker(1, coord)
+    w2 = Worker(2, coord)
+    w3 = Worker(3, coord)
+}

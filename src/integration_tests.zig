@@ -883,6 +883,49 @@ test "joe: supervision — spawn, respawn, hung, abandoned, all from the system 
     try testing.expectEqual(machine.Fault.watchdog, sleeper.fault);
 }
 
+test "joe: scatter — the result is the ack; re-asks converge through loss" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/scatter.joe");
+    var o = try joe_run.simulate(testing.allocator, src, .{});
+    defer o.deinit();
+    try testing.expectEqual(machine.CtxState.halted, o.instance("coord").?.state);
+    try testing.expectEqual(@as(u64, 15), o.varOf("coord", "got").?);
+    // Reply is a 16-byte message: this is the SEND path's gauntlet.
+    try testing.expectEqual(@as(u64, 500), o.varOf("coord", "r0").?);
+    try testing.expectEqual(@as(u64, 501), o.varOf("coord", "r1").?);
+    try testing.expectEqual(@as(u64, 502), o.varOf("coord", "r2").?);
+    try testing.expectEqual(@as(u64, 503), o.varOf("coord", "r3").?);
+}
+
+test "joe: pipeline — backpressure by silence, termination as a phase" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/pipeline.joe");
+    // 25% loss AND deep loss: every item arrives checksum-verified, the
+    // pill drains the line, and every stage lame-ducks into quiescence.
+    for ([_]u16{ 1024, 2500 }) |loss| {
+        var o = try joe_run.simulate(testing.allocator, src, .{ .loss_ppm4k = loss });
+        defer o.deinit();
+        try testing.expectEqual(machine.CtxState.halted, o.instance("source").?.state);
+        try testing.expectEqual(machine.CtxState.parked, o.instance("s1").?.state);
+        try testing.expectEqual(machine.CtxState.parked, o.instance("s2").?.state);
+        // sum = Σ(k+100) for k=0..5, +1000 per stage per item, ×2 stages
+        try testing.expectEqual(@as(u64, 12615), o.varOf("sink", "sum").?);
+        try testing.expectEqual(@as(u64, 7), o.varOf("sink", "expect").?);
+    }
+}
+
+test "joe: hello — the console is just another name in the system block" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/hello.joe");
+    var o = try joe_run.simulate(testing.allocator, src, .{
+        .loss_ppm4k = 0,
+        .dup_ppm4k = 0,
+    });
+    defer o.deinit();
+    try testing.expectEqual(machine.CtxState.halted, o.instance("greeter").?.state);
+    try testing.expectEqualStrings("HELLO, WORLD - JOE SPEAKS.\n", o.console.?);
+}
+
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {
     // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
     // FSUB/FCMP results, every one of which must round exactly as the
