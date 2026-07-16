@@ -1,6 +1,6 @@
 # sim6564 — Reference Simulator, v0.1 Implementation Record
 
-Companion to [6564-net-architecture-v2.1.md](6564-net-architecture-v2.1.md). The
+Companion to [6564-net-architecture-v2.2.md](6564-net-architecture-v2.2.md). The
 spec says what the machine *is*; this records what v0.1 of the simulator
 *decided* where the spec left latitude, what it deliberately simplifies, and
 what building it taught us. Zig 0.14.1.
@@ -186,7 +186,11 @@ ack; first-ack-wins means a sender can be told "no buffer" about a message
 that was delivered. This is truthful (each report describes one copy's fate)
 but subtle — worth a normative sentence in §6.1.
 
-## Pre-normative prototypes (MAC & chains sketch)
+## The MAC & chains mechanisms (campaign concluded; spec v2.2)
+
+Adoption status: **SQE format, LINK + chain_cancelled, AUTO_REARM are
+normative** (spec §4.2–§4.3). AUTO_REPOST is a permitted optional
+implementation feature. MAC remains pre-normative, deferred with its data.
 
 **`MAC n`** ($0F–$FF, the whole $?F column): one-byte vectored call —
 exactly `JSR [MACTAB + n*8]`, MACTAB at near $F80–$FFF, per-context, so

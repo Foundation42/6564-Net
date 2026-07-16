@@ -2,7 +2,15 @@
 
 **Prototype design for sim6564 — pattern-collapse mechanisms atop the core ISA.**
 
-*Companion to 6564-net-architecture v2.1 and the sim6564 implementation record. Status: pre-normative. Nothing here enters the spec until the measurement plan (§6) says it earns its transistors.*
+*Companion to the 6564-net architecture spec and the sim6564 implementation record.*
+
+> **Status: campaign concluded (July 2026).** Every mechanism was built and
+> measured against the plan in §6; the ledger is in measurements.md. Adopted
+> into spec v2.2 (§4.2–§4.3): the SQE format, `LINK` + `chain_cancelled`,
+> and `AUTO_REARM`. Parked as optional: `AUTO_REPOST` (flat on cycles; its
+> value is deadlock-class elimination). Deferred with data: `MAC` (this
+> corpus can't feed it). Never built, as designed: `ECHO`. Three of five
+> predictions below were wrong — kept intact, because that's the point.
 
 ---
 

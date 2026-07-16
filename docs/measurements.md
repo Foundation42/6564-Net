@@ -134,3 +134,13 @@ constant at 66 cycles/pass throughout. The honest summary: the chain
 machinery pays for itself exactly where autonomous hardware behavior
 replaces *executed software loops* (LINK, AUTO_REARM), and not where it
 merely relocates one instruction (AUTO_REPOST) or one call (MAC).
+
+### Adoption decision (2026-07-16)
+
+Christian's call, data in hand: **AUTO_REARM and LINK adopted** into spec
+v2.2 (§4.3) — they do real work, and the transistor budget is honest: both
+reuse the SEND-accept and descriptor-fetch paths, while everything that
+scales lives in software-visible memory ("memory is also transistors —
+just shoved somewhere better"). AUTO_REPOST stays a permitted optional
+feature; MAC stays deferred; ECHO stays unbuilt. The campaign closes at
+five mechanisms prototyped, five measured, two adopted.

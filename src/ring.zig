@@ -30,17 +30,18 @@
 //!
 //! ## Ring entry formats
 //!
-//! SQ entry (32 B) — a transmit descriptor (§6.2):
-//!   word0 dst pointer (network window)   word1 src buffer address
-//!   word2 length[0..32) | OWNED bit 63   word3 user cookie
+//! SQ entry (32 B) — the normative submission entry (§4.2; see SqEntry):
+//!   word0 op | flags (b0 LINK, b1 AUTO_REARM, b7 OWNED) | link | hint
+//!   word1 target (window pointer)        word2 buffer base / txr immediate
+//!   word3 len[0..32) | cookie_lo[32..64)
 //!
 //! RX entry (32 B) — a posted landing buffer:
 //!   word0 buffer address                 word1 buffer capacity (bytes)
 //!   word2 filled length (hw-written)     word3 user cookie
 //!
 //! CQ entry (16 B) — a completion record (§4.2):
-//!   word0 tag[0..8) | status[8..16) | byte count[32..64)
-//!   word1 user cookie
+//!   word0 tag[0..8) | status[8..16) | source ring[16..24) | count[32..64)
+//!   word1 cookie (low half software's, high half hw-stamped)
 //!
 //! `CQPOP` loads word0 into A and word1 into X.
 
@@ -189,7 +190,7 @@ pub const Completion = struct {
 /// to `_` and fault at execution, honestly.
 pub const SqOp = enum(u8) { nop = 0, send = 1, txr = 2, recv = 3, _ };
 
-/// A submission entry, 32 bytes, per the MAC & chains sketch §2:
+/// A submission entry, 32 bytes, normative as of spec v2.2 (§4.2):
 ///
 ///   word0  op[0..8) | flags[8..16) | link[16..32) | status_hint[32..64)
 ///   word1  target — window pointer (PTT-mapped)
@@ -213,9 +214,9 @@ pub const SqEntry = struct {
     /// The §6.2 ownership bit, set at accept, cleared when the completion
     /// posts. Byte offset 1 of the entry, bit 7.
     pub const flag_owned: u8 = 0x80;
-    /// Chain to the staged entry at `link` on ok completion (LINK, §3.1).
+    /// Chain to the staged entry at `link` on ok completion (LINK, §4.3).
     pub const flag_link: u8 = 0x01;
-    /// Resubmit this entry when it completes with timeout (AUTO_REARM, §3.2).
+    /// Resubmit this entry when it completes with timeout (AUTO_REARM, §4.3).
     pub const flag_auto_rearm: u8 = 0x02;
 
     pub fn unpack(words: [4]u64) SqEntry {

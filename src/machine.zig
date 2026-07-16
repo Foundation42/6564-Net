@@ -625,7 +625,7 @@ pub const Machine = struct {
             .byte_count = byte_count,
             .cookie = reply.cookie,
         });
-        // Autonomous descriptor behavior (sketch §3): the RBC re-reads the
+        // Autonomous descriptor behavior (§4.3): the RBC re-reads the
         // STAGED entry — its current bytes are the contract, which is what
         // makes clearing a flag the disarm mechanism.
         const sqe = staged orelse return;
