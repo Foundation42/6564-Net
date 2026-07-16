@@ -447,3 +447,25 @@ migration is byte-identical: the loader-run pingpong reproduces the
 hand-harness numbers exactly (1,056 instructions / 11,125 cycles),
 and demo_joe.zig is deleted — the first harness was also the last.
 87 tests green.
+
+## ring.joe: the second conversion, and item 4's starting line (2026-07-16)
+
+Armstrong's ring in the language named for him — Head + 7 Nodes, all
+`on 0` as banked contexts, the whole deployment eight declarative
+lines. The token is still one 8-byte TXR datagram. 100 laps × 8 hops:
+
+| | cy/pass | instr/pass |
+|---|---:|---:|
+| ring_node.asm (hand-written) | 60 | ~24 |
+| ring.joe, v1 naive codegen | **110** | 38.5 |
+
+This number is the point: it is the **pre-registered baseline for
+handoff item 4**. The §1 prediction ("ring stays under 70 cy/pass
+through joe") is about compiled code AFTER park-point liveness and the
+bank collapse; v1's tree-walker reloads every var from the near page,
+laps the serve loop once per transport ack just to discard it, and
+spills every intermediate. The gap from 110 to <70 is exactly the
+work item 4 is for — and now it's measured, not guessed. A regression
+guard sits at 130 cy/pass without blessing the current cost.
+
+88 tests green.

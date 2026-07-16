@@ -1,0 +1,43 @@
+// ring.joe — Joe Armstrong's challenge (Programming Erlang, ch. 12),
+// in the language named after him: N processes in a ring, a message
+// around M times. The hand-written ring_node.asm does a pass in 60
+// cycles; this is the same ring as the compiler sees it — the honest
+// baseline the bank-collapse experiment (handoff item 4) will improve.
+//
+// All eight nodes share core 0 as banked contexts: the system block's
+// `on 0` is the whole placement story, and the loader gives each its
+// own block. The token is one 8-byte register datagram (TXR), same as
+// the hand-written ring.
+
+message Token { laps u32 }
+
+actor Head(next addr, laps u32) {
+    var remaining u32 = laps
+
+    send next, Token{laps}
+
+    serve {
+        case Token(_):
+            remaining -= 1
+            if remaining == 0 { halt ok }
+            send next, Token{remaining}
+    }
+}
+
+actor Node(next addr) {
+    serve {
+        case Token(t):
+            send next, Token{t.laps}
+    }
+}
+
+system {
+    n0 = Head(n1, 100) on 0
+    n1 = Node(n2) on 0
+    n2 = Node(n3) on 0
+    n3 = Node(n4) on 0
+    n4 = Node(n5) on 0
+    n5 = Node(n6) on 0
+    n6 = Node(n7) on 0
+    n7 = Node(n0) on 0
+}

@@ -838,6 +838,26 @@ test "joe: two instances share a core in separate blocks — placement is data" 
     try testing.expectEqual(@as(u8, 1), o.instance("ponger").?.ctx);
 }
 
+test "joe: the ring turns — 8 instances from one system block, token comes home" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/ring.joe");
+    var o = try joe_run.simulate(testing.allocator, src, .{});
+    defer o.deinit();
+    try testing.expectEqual(machine.CtxState.halted, o.instance("n0").?.state);
+    try testing.expectEqual(@as(u64, 0), o.varOf("n0", "remaining").?);
+    for (1..8) |k| {
+        var name_buf: [4]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "n{d}", .{k});
+        try testing.expectEqual(machine.CtxState.parked, o.instance(name).?.state);
+    }
+    // The joe-ring baseline for handoff item 4: the bank-collapse
+    // measurement runs THIS ring and reads THIS number. Naive v1
+    // codegen paces well over the hand-written 60 cy/pass; a guard at
+    // 130 catches regressions without blessing the current cost.
+    const cy_per_pass = o.cycles / 800;
+    try testing.expect(cy_per_pass < 130);
+}
+
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {
     // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
     // FSUB/FCMP results, every one of which must round exactly as the
