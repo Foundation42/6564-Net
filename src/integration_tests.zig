@@ -1569,3 +1569,91 @@ test "churn: LFSR sweep counts every line, threaded same as sequential" {
         par.die_stats[0].stats.instructions,
     );
 }
+
+// ── The socket bridge (§6.5 across host processes) ───────────────────────
+
+const bridge_mod = @import("bridge.zig");
+const demo_net = @import("demo_net.zig");
+
+const NetSide = struct {
+    out: ?demo_net.Outcome = null,
+    err: ?anyerror = null,
+};
+
+fn netConnector(port: u16, parallel: bool, res: *NetSide) void {
+    var br = bridge_mod.Bridge.connect("127.0.0.1", port) catch |e| {
+        res.err = e;
+        return;
+    };
+    defer br.deinit();
+    res.out = demo_net.simulate(testing.allocator, .{
+        .role = .connector,
+        .dies = 2,
+        .nodes = 8,
+        .laps = 3,
+        .parallel = parallel,
+    }, &br) catch |e| {
+        res.err = e;
+        return;
+    };
+}
+
+fn runFederation(parallel: bool) !struct { l: demo_net.Outcome, c: demo_net.Outcome } {
+    var server = try bridge_mod.Bridge.listenOn(0);
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var side = NetSide{};
+    const t = try std.Thread.spawn(.{}, netConnector, .{ port, parallel, &side });
+    var br = try bridge_mod.Bridge.accept(&server);
+    defer br.deinit();
+    const lout = demo_net.simulate(testing.allocator, .{
+        .role = .listener,
+        .dies = 2,
+        .nodes = 8,
+        .laps = 3,
+        .parallel = parallel,
+    }, &br);
+    t.join();
+    if (side.err) |e| {
+        if (lout) |o| o.deinit(testing.allocator) else |_| {}
+        return e;
+    }
+    return .{ .l = try lout, .c = side.out.? };
+}
+
+test "socket bridge: the ring crosses a real socket and comes home" {
+    const f = try runFederation(false);
+    defer f.l.deinit(testing.allocator);
+    defer f.c.deinit(testing.allocator);
+    try testing.expect(f.l.finished_here);
+    try testing.expect(!f.c.finished_here);
+    try testing.expectEqual(f.l.windows, f.c.windows); // lock-step agreed
+    try testing.expectEqual(@as(u64, 96), f.l.passes); // 2 x 2 x 8 x 3
+    // Each side egressed half the crossings, and nothing vanished.
+    try testing.expectEqual(@as(u64, 6), f.l.plane.grams);
+    try testing.expectEqual(@as(u64, 6), f.c.plane.grams);
+    try testing.expectEqual(@as(u64, 0), f.l.plane.lost + f.c.plane.lost);
+}
+
+test "socket bridge: the federation replays bit-identically, threaded or not" {
+    const a = try runFederation(false);
+    defer a.l.deinit(testing.allocator);
+    defer a.c.deinit(testing.allocator);
+    const b = try runFederation(false);
+    defer b.l.deinit(testing.allocator);
+    defer b.c.deinit(testing.allocator);
+    const p = try runFederation(true);
+    defer p.l.deinit(testing.allocator);
+    defer p.c.deinit(testing.allocator);
+    // Same seeds, same federation → same virtual history, every time,
+    // at any thread count, regardless of real socket timing.
+    try testing.expectEqual(a.l.cycles, b.l.cycles);
+    try testing.expectEqual(a.l.cycles, p.l.cycles);
+    try testing.expectEqual(a.c.cycles, p.c.cycles);
+    try testing.expectEqual(a.l.windows, p.l.windows);
+    try testing.expectEqual(
+        a.l.die_stats[0].stats.instructions,
+        p.l.die_stats[0].stats.instructions,
+    );
+    try testing.expect(a.l.finished_here and b.l.finished_here and p.l.finished_here);
+}

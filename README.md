@@ -84,6 +84,13 @@ with die-local rings — **6.1× wall-clock over sequential** in
 ReleaseFast with `spread`/`vcache`/`freq` L3-domain pinning
 (`src/topology.zig`; placement changes seconds, never bits).
 
+**net** runs the ring across two OS **processes** joined by a real TCP
+socket (`sim6564 net listen 6564` + `sim6564 net connect 127.0.0.1
+6564`): the IO plane's window barriers cross the wire as frames of
+virtual-time-stamped datagrams, so the federation replays
+bit-identically from its seeds regardless of real network timing. The
+wall clock never enters the machine — TCP is just a slow backplane.
+
 Everything decodes from one declarative ISA table (`src/isa.zig`): the
 simulator, the assembler, and the disassembly of intent. Adding an
 instruction is one line; a duplicate opcode is a compile error.

@@ -48,6 +48,11 @@ pub const Config = struct {
     seed: u64 = 0x6564,
     /// Step dies on host threads within each window.
     parallel: bool = false,
+    /// First global die id of this cluster (§6.5 federation): a cluster
+    /// owns ids [node_base, node_base + dies). Ids outside that range
+    /// belong to other host processes and reach them through the
+    /// `exchange` hook at each window barrier. 0 for standalone.
+    node_base: u16 = 0,
     /// Where die threads land on an asymmetric host (Zen X3D: one
     /// big-cache CCD, one high-frequency CCD). Placement is a wall-clock
     /// knob only — results are bit-identical regardless (the whole point
@@ -84,8 +89,10 @@ pub const PlaneStats = struct {
     }
 };
 
-/// One item of barrier traffic, fault model already applied.
-const Queued = struct {
+/// One item of barrier traffic, fault model already applied. Die ids are
+/// GLOBAL (federation-wide); pub because the exchange hook ships these
+/// across host processes verbatim.
+pub const Queued = struct {
     dst_die: u16,
     src_die: u16,
     seq: u64,
@@ -100,6 +107,29 @@ const Queued = struct {
         if (a.src_die != b.src_die) return a.src_die < b.src_die;
         return a.seq < b.seq;
     }
+};
+
+/// The federation hook (§6.5 across host processes): called once per
+/// window barrier with the items bound off-node. The implementation
+/// ships them to the peer, receives the peer's items for the SAME
+/// window (a barrier — both sides send before either proceeds), and
+/// injects them via `Cluster.injectItem`. The wall clock never enters
+/// the virtual machine: frames carry virtual due-times, so determinism
+/// survives any real transport.
+pub const Exchange = struct {
+    ctx: *anyopaque,
+    swap: *const fn (
+        ctx: *anyopaque,
+        cl: *Cluster,
+        window: u64,
+        quiescent: bool,
+        outgoing: []const Queued,
+    ) anyerror!ExchangeResult,
+};
+
+pub const ExchangeResult = struct {
+    peer_quiescent: bool,
+    received_any: bool,
 };
 
 /// A die's side of the plane: outbox, egress PRNG, per-window stats.
@@ -192,6 +222,8 @@ pub const Cluster = struct {
     outboxes: []Outbox,
     window: u64,
     stats: PlaneStats = .{},
+    /// Federation hook; null for a single-process cluster.
+    exchange: ?Exchange = null,
 
     /// Heap-constructed so outbox back-pointers stay stable.
     pub fn init(alloc: std.mem.Allocator, cfg: Config) !*Cluster {
@@ -221,19 +253,23 @@ pub const Cluster = struct {
         }
         for (self.dies, 0..) |*d, i| {
             var die_cfg = cfg.die;
-            die_cfg.seed = cfg.seed ^ (0x9E37_79B9_7F4A_7C15 *% (@as(u64, i) + 1));
+            // Seeds derive from the GLOBAL die id, so a federation of
+            // clusters never runs two dies on identical streams.
+            const gid = @as(u64, cfg.node_base) + i;
+            die_cfg.seed = cfg.seed ^ (0x9E37_79B9_7F4A_7C15 *% (gid + 1));
             d.* = try machine.Machine.init(shared, die_cfg);
             made += 1;
         }
         for (self.outboxes, 0..) |*ob, i| {
+            const gid = @as(u64, cfg.node_base) + i;
             ob.* = .{
                 .cluster = self,
                 .die = @intCast(i),
                 .prng = std.Random.DefaultPrng.init(
-                    cfg.seed ^ (0xC2B2_AE3D_27D4_EB4F *% (@as(u64, i) + 1)),
+                    cfg.seed ^ (0xC2B2_AE3D_27D4_EB4F *% (gid + 1)),
                 ),
             };
-            self.dies[i].attachPlane(@intCast(i), .{ .ctx = ob, .emit = emit });
+            self.dies[i].attachPlane(@intCast(gid), .{ .ctx = ob, .emit = emit });
         }
         return self;
     }
@@ -259,12 +295,46 @@ pub const Cluster = struct {
         return &self.dies[i];
     }
 
-    /// Name the die a route byte leads to, per source die. Route 0 is the
-    /// on-die mesh by definition and cannot be remapped.
+    /// Name the LOCAL die a route byte leads to, per source die (both
+    /// local indices). Route 0 is the on-die mesh and cannot be remapped.
     pub fn setRoute(self: *Cluster, from_die: u16, route_byte: u8, to_die: u16) void {
         std.debug.assert(route_byte != 0);
         std.debug.assert(to_die < self.dies.len and to_die != from_die);
-        self.routes[from_die][route_byte] = to_die;
+        self.routes[from_die][route_byte] = self.cfg.node_base + to_die;
+    }
+
+    /// Name a die on ANOTHER host process: `to_global` is a federation-
+    /// wide die id outside this cluster's [node_base, node_base+dies)
+    /// range. Traffic for it leaves through the exchange hook.
+    pub fn setRemoteRoute(self: *Cluster, from_die: u16, route_byte: u8, to_global: u16) void {
+        std.debug.assert(route_byte != 0);
+        std.debug.assert(to_global < self.cfg.node_base or
+            to_global >= self.cfg.node_base + self.dies.len);
+        self.routes[from_die][route_byte] = to_global;
+    }
+
+    fn isLocal(self: *const Cluster, global_die: u16) bool {
+        return global_die >= self.cfg.node_base and
+            global_die < self.cfg.node_base + self.dies.len;
+    }
+
+    /// Inject one barrier item into its destination die. Foreign or
+    /// unknown destinations vanish (the sender's timeout speaks). Used by
+    /// the local barrier and by exchange-hook implementations.
+    pub fn injectItem(self: *Cluster, q: Queued) !void {
+        if (!self.isLocal(q.dst_die)) {
+            switch (q.kind) {
+                .gram => |g| self.alloc.free(g.payload),
+                else => {},
+            }
+            self.stats.unroutable += 1;
+            return;
+        }
+        const d = &self.dies[q.dst_die - self.cfg.node_base];
+        switch (q.kind) {
+            .gram => |g| try d.injectDeliver(g, q.due),
+            .ack => |a| try d.injectAck(a.send_id, a.status, a.byte_count, q.due),
+        }
     }
 
     /// The die-side egress hook: applies routing and the plane's fault
@@ -275,12 +345,15 @@ pub const Cluster = struct {
         const ob: *Outbox = @ptrCast(@alignCast(ctx));
         const cl = ob.cluster;
         const shared = cl.alloc;
+        const my_gid = cl.cfg.node_base + ob.die;
         switch (out.kind) {
             .gram => |g| {
                 const dst = cl.routes[ob.die][out.route];
-                if (dst == no_route or dst >= cl.dies.len or dst == ob.die) {
-                    // A route byte with no path: the plane's black hole.
-                    // Only the sender's timeout speaks (§6.1).
+                // A route byte with no path (or pointing home) is the
+                // plane's black hole: only the sender's timeout speaks
+                // (§6.1). Foreign ids can't be validated here — a bad one
+                // vanishes at the peer's injectItem, same honesty.
+                if (dst == no_route or dst == my_gid) {
                     shared.free(g.payload);
                     ob.stats.unroutable += 1;
                     return;
@@ -299,7 +372,7 @@ pub const Cluster = struct {
                     ob.seq += 1;
                     try ob.items.append(shared, .{
                         .dst_die = dst,
-                        .src_die = ob.die,
+                        .src_die = my_gid,
                         .seq = ob.seq,
                         .due = due,
                         .kind = .{ .gram = gg },
@@ -307,7 +380,8 @@ pub const Cluster = struct {
                 }
             },
             .ack => |a| {
-                if (a.dst_die >= cl.dies.len) return;
+                // dst is a global id from the datagram's src_die stamp;
+                // local or foreign, the barrier routes it.
                 ob.stats.acks += 1;
                 if (mesh.roll(ob.prng.random(), cl.cfg.plane.loss_ppm4k)) {
                     ob.stats.lost += 1;
@@ -316,7 +390,7 @@ pub const Cluster = struct {
                 ob.seq += 1;
                 try ob.items.append(shared, .{
                     .dst_die = a.dst_die,
-                    .src_die = ob.die,
+                    .src_die = my_gid,
                     .seq = ob.seq,
                     .due = out.sent_at + mesh.latency(cl.cfg.plane, ob.prng.random()),
                     .kind = .{ .ack = .{
@@ -327,6 +401,15 @@ pub const Cluster = struct {
                 });
             },
         }
+    }
+
+    /// Outgoing items stay cluster-owned: exchange implementations
+    /// serialize them, never retain them.
+    fn freeOutbound(self: *Cluster, items: []const Queued) void {
+        for (items) |q| switch (q.kind) {
+            .gram => |g| self.alloc.free(g.payload),
+            else => {},
+        };
     }
 
     fn dieWorker(d: *machine.Machine, horizon: u64, result: *?machine.StopReason, err: *?anyerror) void {
@@ -421,6 +504,8 @@ pub const Cluster = struct {
         defer self.alloc.free(errs);
         var scratch = std.ArrayListUnmanaged(Queued){};
         defer scratch.deinit(self.alloc);
+        var outbound = std.ArrayListUnmanaged(Queued){};
+        defer outbound.deinit(self.alloc);
 
         const threaded = self.cfg.parallel and n > 1;
         var pool = Pool{};
@@ -463,24 +548,46 @@ pub const Cluster = struct {
             for (errs) |e| if (e) |err| return err;
 
             // The barrier: drain every outbox into one deterministically
-            // ordered sequence and inject.
+            // ordered sequence; inject local items, batch foreign ones.
             scratch.clearRetainingCapacity();
+            outbound.clearRetainingCapacity();
             for (self.outboxes) |*ob| {
                 try scratch.appendSlice(self.alloc, ob.items.items);
                 ob.items.clearRetainingCapacity();
                 self.stats.fold(&ob.stats);
             }
             std.mem.sort(Queued, scratch.items, {}, Queued.lessThan);
-            for (scratch.items) |q| switch (q.kind) {
-                .gram => |g| try self.dies[q.dst_die].injectDeliver(g, q.due),
-                .ack => |a| try self.dies[q.dst_die].injectAck(a.send_id, a.status, a.byte_count, q.due),
-            };
+            for (scratch.items) |q| {
+                if (self.isLocal(q.dst_die)) {
+                    try self.injectItem(q);
+                } else {
+                    try outbound.append(self.alloc, q);
+                }
+            }
 
             var all_done = true;
             for (results) |r| {
                 if (r == null) all_done = false;
             }
-            if (all_done and scratch.items.len == 0) break;
+            // Quiescent = terminal AND nothing moved anywhere this window.
+            // Both sides of an exchange evaluate (mine and peer's) flags
+            // from the same window's frames, so they agree on the stopping
+            // window without a separate consensus round.
+            const my_quiescent = all_done and scratch.items.len == 0;
+            if (self.exchange) |ex| {
+                const res = ex.swap(ex.ctx, self, windows, my_quiescent, outbound.items) catch |err| {
+                    self.freeOutbound(outbound.items);
+                    return err;
+                };
+                self.freeOutbound(outbound.items);
+                if (my_quiescent and res.peer_quiescent and !res.received_any) break;
+            } else {
+                // Foreign traffic with nobody to carry it: off the edge of
+                // the world, sender's timeout speaks.
+                self.stats.unroutable += outbound.items.len;
+                self.freeOutbound(outbound.items);
+                if (my_quiescent) break;
+            }
             horizon += self.window;
         }
 

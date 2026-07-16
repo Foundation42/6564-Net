@@ -335,6 +335,26 @@ L3); vcache vs freq is a wash until per-die footprints outgrow the
 small CCD's 32 MB. Placement never changes results — md5-identical
 output across all five policies.
 
+**The socket bridge** (`src/bridge.zig`, `sim6564 net`): the plane
+between HOST PROCESSES. Die ids federate — a cluster owns
+[node_base, node_base+dies); routes to foreign ids leave through the
+`Exchange` hook at every window barrier, which the bridge implements as
+a framed TCP swap (HELLO validates version/window/seed/range-disjoint;
+per window both sides send their frame then read the peer's — a true
+barrier). Frames carry VIRTUAL due-times, so determinism survives the
+socket: the federation replays bit-identically from its seeds no matter
+what the real network does (test-guarded, including threaded-vs-
+sequential). Distributed termination without a consensus round: each
+frame carries a quiescent flag = "terminal and moved nothing this
+window"; both sides evaluate (mine AND peer's) from the same window's
+frames and agree on the stopping window. Ownership rule: outgoing items
+stay cluster-owned (the bridge serializes, never retains); inbound
+payloads are allocated from the receiving cluster's allocator so
+`deliver()` frees them normally. Known v1 cost: one socket RTT per
+window (lock-step); PDES null-message/lookahead batching is the obvious
+refinement if federations ever get chatty. If one process dies, the
+peer blocks on read — Ctrl-C, not corruption.
+
 `sim6564 churn` is the experiment that makes the X3D asymmetry speak:
 each die read-modify-writes a multi-MB stripe in maximal-period LFSR
 order (programs/mem_churn.asm). The order matters — a linear +64 stride

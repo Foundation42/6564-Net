@@ -65,6 +65,13 @@ const usage_text =
     \\      On asymmetric hosts (Zen X3D), add spread | vcache | freq to
     \\      pin die threads by L3 domain — wall-clock only, same bits.
     \\
+    \\  sim6564 net <listen [port] | connect [host] [port]> [dies] [nodes] [laps]
+    \\      The ring across two OS PROCESSES: each runs half the dies; the
+    \\      IO plane's window barriers cross a real TCP socket. Virtual
+    \\      time rides the wire, so the federation replays bit-identically
+    \\      from its seeds regardless of real network timing. Start the
+    \\      listener first, then the connector (same dies/nodes/laps).
+    \\
     \\  sim6564 churn [dies] [stripe_mb] [sweeps] [spread|vcache|freq] [seq]
     \\      The cache-footprint experiment: each die read-modify-writes a
     \\      multi-MB stripe in prefetcher-proof LFSR order
@@ -153,6 +160,23 @@ pub fn main() !void {
             }
         }
         return sim.demo_dies.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "net")) {
+        const role_s = args.next() orelse usage(1);
+        var opts: sim.demo_net.Options = undefined;
+        if (std.mem.eql(u8, role_s, "listen")) {
+            opts = .{ .role = .listener };
+            if (args.next()) |s| opts.port = parseOr(u16, s, "port");
+        } else if (std.mem.eql(u8, role_s, "connect")) {
+            opts = .{ .role = .connector };
+            if (args.next()) |s| opts.host = s;
+            if (args.next()) |s| opts.port = parseOr(u16, s, "port");
+        } else usage(1);
+        if (args.next()) |s| opts.dies = @min(16, parseOr(u16, s, "dies"));
+        if (args.next()) |s| opts.nodes = @min(200, parseOr(u16, s, "nodes_per_die"));
+        if (args.next()) |s| opts.laps = @min(1000, parseOr(u64, s, "laps"));
+        return sim.demo_net.run(alloc, opts);
     }
 
     if (std.mem.eql(u8, first, "churn")) {
