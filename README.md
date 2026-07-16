@@ -43,6 +43,13 @@ processes in a ring, a message around M times (`sim6564 ring 200 1000` =
 register-datagram, and a pass costs **66 cycles** at steady state —
 scheduler, completion queue, and zero-cycle context switch included.
 
+**bigbrother** floods one actor from 10,000 senders (`sim6564
+bigbrother`): 61 cycles per absorbed message, every voice heard exactly
+once, zero completion records lost — saturation is backpressure, not
+corruption. **forkjoin** forks one message to 1,000 workers through a
+LINK-chain-plus-hierarchy tree, relays it, and joins it back to one
+aggregator in a 61,000-cycle makespan (`sim6564 forkjoin`).
+
 **supervise** runs a one-for-one supervision tree on one core: exit links
 post a dead worker's obituary to the supervisor's completion queue as an
 ordinary completion record, and `SPWN` resurrects it with fresh registers

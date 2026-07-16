@@ -144,3 +144,36 @@ scales lives in software-visible memory ("memory is also transistors —
 just shoved somewhere better"). AUTO_REPOST stays a permitted optional
 feature; MAC stays deferred; ECHO stays unbuilt. The campaign closes at
 five mechanisms prototyped, five measured, two adopted.
+
+## Capstone stress tests (2026-07-16)
+
+Two published actor-machine stress tests, run at full scale (ReleaseFast):
+
+**The Fan-In / Big Brother Test — 10,000 senders, one target.**
+Every voice heard exactly once: 10,000/10,000 received, checksum
+50,005,000 verified. 610,000 cycles to absorb the flood (61/message,
+pop-bound at the sink); 791,742 send attempts with 390,871 no-buffer
+rejects answered by per-sender backoff — and **zero CQ overflows**: the
+new admission rule (a delivery needs a landing buffer AND a completion
+slot; CQ-full is backpressure, §10 Q6) held under maximum contention.
+No head-of-line blocking exists to measure: a saturated ring drops and
+reject-completes by design.
+
+**The Fork-Join Matrix — 1 → 8×125 = 1,000 → 1,000 relays → 1.**
+Forked, relayed, joined: 1,000/1,000, checksum 501,500 verified,
+makespan 61,000 cycles across ~2,010 actors. The fork is hierarchical BY
+CONSTRUCTION — a destination costs a PTT slot (256/core) and a chain
+entry costs 32 near-page bytes (~59 fit) — so fan-out degree is an
+architectural constant (data for open question 1). Root→lieutenants is
+a LINK chain (7 fires), lieutenant→workers on-die fire-and-forget.
+
+**Found and fixed: AUTO_REPOST's validity window collapsed at
+saturation.** The pop-time-immediate grant re-armed the just-consumed
+buffer; with the ring drained dry (the flood regime), the next delivery
+landed in that buffer between the pop and the software's read —
+checksums corrupted at exactly K≳500. The fix is the **deferred grant**:
+each pop re-arms the previous pop's buffer, making the contract
+unconditional — *a popped payload is valid until the next CQPOP from
+that ring*. One bit of hardware state; regression-tested at saturation.
+(This slightly shifts the frozen table: total instructions 217,537 →
+217,341, cycles 523,078 → 524,034; all demos still verify.)

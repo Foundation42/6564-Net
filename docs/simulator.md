@@ -207,13 +207,17 @@ completion word0 bits 16..24 carry the source-ring slot. Verified no-op
 dynamically.
 
 **AUTO_REPOST** (ring-descriptor flag): on CQPOP of a landed delivery
-from a flagged RX ring, hardware re-enqueues the consumed landing buffer
-(+1 countable cycle, `stats.auto_reposts`). Capacity-1 rings fault at
-first trigger (zero-width validity window). Measured flat-to-negative on
-this corpus (see measurements.md) — its real value is making the
-missed-repost bug class unrepresentable, which is exactly the class both
-of Phase 3's real deadlocks belonged to. Recommendation: optional
-implementation feature, not architectural.
+from a flagged RX ring, hardware re-enqueues a landing buffer — with the
+**deferred grant**: each pop re-arms the *previous* pop's buffer, so a
+popped payload is valid until the next CQPOP from that ring,
+unconditionally. (The first design granted the just-consumed buffer
+immediately; the Big Brother stress test proved that collapses the
+validity window to zero exactly when a flood drains the ring dry —
+checksums corrupted until the grant was deferred.) Capacity-1 rings
+fault at first trigger. Measured flat-to-negative on the protocol corpus
+but load-bearing at the fan-in sink; its other value is making the
+missed-repost bug class unrepresentable. Status: optional implementation
+feature, not architectural.
 
 **AUTO_REARM** (SQE flag bit 1): an entry completing with `timeout` is
 re-read from its staging bytes and resubmitted by the RBC — a timeout is
@@ -235,6 +239,21 @@ the straggler timer re-scatters the cancelled. −24% instructions on
 that demo. Fixed en route: local PTT rights-rejects now route through
 the normal completion path (they previously leaked OWNED and would have
 skipped cancellation).
+
+## Capstone stress tests
+
+`sim6564 bigbrother` (10,000 senders → one target) and `sim6564 forkjoin`
+(1 → 1,000 → 1,000 relays → 1) — results in measurements.md. Three
+machine-level consequences, all regression-tested: the **admission rule**
+(a delivery is accepted only if a landing buffer AND a completion slot
+exist — CQ-full is backpressure, answering open question 6 for the
+simulator); **no_buffer rejects report to the sender only** (flow
+control, not a security event — receiver-side reject records would crowd
+landed records out of a flooded CQ; capability rejects still post both
+ends); and AUTO_REPOST's **deferred grant** (above). Architectural data:
+fan-out degree is bounded by PTT size (256/core, shared by the core's
+contexts) and LINK chains by near-page scratch (~59 entries), so big
+fan-out is hierarchical by construction.
 
 ## Stats and tracing
 

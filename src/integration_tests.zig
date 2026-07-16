@@ -1215,3 +1215,43 @@ test "AUTO_REARM: stage once, tick forever, disarm by clearing the flag" {
         .little,
     ));
 }
+
+// ── Capstone stress tests ────────────────────────────────────────────────
+
+test "big brother: 600 senders saturate the ring; deferred repost keeps sums exact" {
+    // 600 > 256 landing buffers → the ring drains dry and rejects fly. The
+    // original pop-time-immediate AUTO_REPOST grant corrupted checksums in
+    // exactly this regime (payload overwritten between pop and read); the
+    // deferred grant must keep every value intact.
+    const o = try @import("demo_bigbrother.zig").simulate(testing.allocator, .{
+        .senders = 600,
+        .loss_ppm4k = 0,
+    });
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    try testing.expectEqual(@as(u64, 600), o.received);
+    try testing.expectEqual(o.expected_sum, o.sum);
+    try testing.expect(o.stats.rejects > 0); // saturation really happened
+    try testing.expectEqual(@as(u64, 0), o.stats.cq_overflows);
+}
+
+test "big brother: sub-saturation flood delivers first time" {
+    const o = try @import("demo_bigbrother.zig").simulate(testing.allocator, .{
+        .senders = 200,
+        .loss_ppm4k = 0,
+    });
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    try testing.expectEqual(@as(u64, 200), o.received);
+    try testing.expectEqual(o.expected_sum, o.sum);
+}
+
+test "fork-join matrix at full scale: 8x125, forked, relayed, joined" {
+    const o = try @import("demo_forkjoin.zig").simulate(testing.allocator, .{
+        .lieutenants = 8,
+        .workers = 125,
+    });
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    try testing.expectEqual(@as(u64, 1000), o.received);
+    try testing.expectEqual(o.expected_sum, o.sum);
+    try testing.expectEqual(@as(u64, 7), o.stats.chain_fires);
+    try testing.expectEqual(@as(u64, 0), o.stats.cq_overflows);
+}

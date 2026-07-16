@@ -522,6 +522,15 @@ pub const Machine = struct {
 
         if (d.token != 0 and d.token != gram.token) {
             status = .reject_capability;
+        } else if (blk: {
+            // Admission needs BOTH a landing buffer and a completion slot:
+            // accepting a delivery whose record can't post would silently
+            // break the mandatory-completion guarantee under fan-in floods.
+            // A full CQ is therefore ordinary backpressure (open question 6).
+            const cq = readDesc(ctx, d.companion_cq);
+            break :blk cq.isFull();
+        }) {
+            status = .reject_no_buffer;
         } else {
             var words: [4]u64 = undefined;
             const got = ringPop(core, ctx, gram.dst_slot, &words) catch false;
@@ -569,15 +578,21 @@ pub const Machine = struct {
             });
         } else {
             self.stats.rejects += 1;
-            // …and a reject posts to *both* ends (§6.4): the victim sees the
-            // attempt on its companion CQ, the sender gets a reject ack.
-            self.cqPost(gram.dst_core, gram.dst_ctx, d.companion_cq, .{
-                .tag = .deliver,
-                .status = status,
-                .slot = gram.dst_slot,
-                .byte_count = 0,
-                .cookie = gram.token,
-            });
+            // Capability rejects post to *both* ends (§6.4) — a forged or
+            // stale token is a security event the victim must be able to
+            // see. A no_buffer reject is flow control: the receiver has
+            // nothing actionable and, under a fan-in flood, receiver-side
+            // reject records would crowd landed records out of the CQ.
+            // The sender's reject ack below tells the whole story.
+            if (status == .reject_capability) {
+                self.cqPost(gram.dst_core, gram.dst_ctx, d.companion_cq, .{
+                    .tag = .deliver,
+                    .status = status,
+                    .slot = gram.dst_slot,
+                    .byte_count = 0,
+                    .cookie = gram.token,
+                });
+            }
         }
         // The ack rides the same fault-injected fabric back: it can be lost,
         // in which case the sender's timeout tells the truth (§6.1) — "your
@@ -1093,12 +1108,15 @@ pub const Machine = struct {
                     ctx.a = words[0];
                     ctx.x = words[1];
                     ctx.p.z = false;
-                    // AUTO_REPOST (sketch §3.3): popping a LANDED delivery
-                    // record from a flagged RX ring re-enqueues the consumed
-                    // landing buffer. Pop-time, not delivery-time, so the
-                    // payload stays valid until the ring's other N−1 buffers
-                    // are consumed. Capacity-1 rings have a zero-width
-                    // validity window: architecturally meaningless, fault.
+                    // AUTO_REPOST with the DEFERRED grant: popping a landed
+                    // delivery from a flagged ring re-enqueues the buffer of
+                    // the PREVIOUS pop, holding the current one back — the
+                    // just-popped payload is valid until the next CQPOP from
+                    // this ring, unconditionally, even when a flood drains
+                    // the ring dry. (An immediate grant collapses the window
+                    // to zero at exactly that moment; found by Big Brother.)
+                    // Capacity-1 rings would re-grant the buffer being read:
+                    // architecturally meaningless, fault.
                     const rec = ring.Completion.fromWords(words[0], words[1]);
                     if (rec.tag == .deliver and
                         (rec.status == .ok or rec.status == .truncated))
@@ -1106,12 +1124,16 @@ pub const Machine = struct {
                         var rx = readDesc(ctx, rec.slot);
                         if (rx.flags & ring.desc_flag_auto_repost != 0) {
                             if (rx.capacity() == 1) return error.BadDescriptor;
-                            if (!rx.isFull()) {
-                                rx.tail +%= 1;
-                                writeDesc(ctx, rec.slot, rx);
-                                self.stats.auto_reposts += 1;
-                                core.clock += 1; // countable, not free
+                            if (rx.flags & ring.desc_flag_repost_pending != 0) {
+                                if (!rx.isFull()) {
+                                    rx.tail +%= 1;
+                                    self.stats.auto_reposts += 1;
+                                }
+                            } else {
+                                rx.flags |= ring.desc_flag_repost_pending;
                             }
+                            writeDesc(ctx, rec.slot, rx);
+                            core.clock += 1; // countable, not free
                         }
                     }
                 } else {

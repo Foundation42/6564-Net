@@ -11,6 +11,8 @@ pub const demo_supervise = @import("demo_supervise.zig");
 pub const demo_pipeline = @import("demo_pipeline.zig");
 pub const demo_scatter = @import("demo_scatter.zig");
 pub const demo_ring = @import("demo_ring.zig");
+pub const demo_bigbrother = @import("demo_bigbrother.zig");
+pub const demo_forkjoin = @import("demo_forkjoin.zig");
 pub const measure = @import("measure.zig");
 
 test {

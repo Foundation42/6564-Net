@@ -34,6 +34,15 @@ const usage_text =
     \\      around M times — N·M passes, timed in cycles per pass. All N
     \\      processes are banked contexts on one core (programs/ring_node.asm).
     \\
+    \\  sim6564 bigbrother [senders] [loss_ppm4k] [trace]
+    \\      The fan-in stress test: up to 10,000 actors flood one target
+    \\      (programs/flood_sender.asm, fanin_sink.asm). Default 10000, loss 0.
+    \\
+    \\  sim6564 forkjoin [lieutenants] [workers] [trace]
+    \\      The fork-join matrix: 1 → LxW workers → LxW relays → 1 aggregator
+    \\      (programs/fj_root.asm, fj_lieutenant.asm, fj_pass.asm,
+    \\      fanin_sink.asm). Default 8x125 = 1000.
+    \\
     \\  sim6564 measure
     \\      Run every demo at its frozen baseline config and emit the
     \\      instructions / cycles / code-bytes table (the MAC & chains
@@ -87,6 +96,22 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, first, "measure"))
         return sim.measure.run(alloc);
+
+    if (std.mem.eql(u8, first, "bigbrother")) {
+        var opts = sim.demo_bigbrother.Options{};
+        if (args.next()) |s| opts.senders = @min(10_000, parseOr(u64, s, "senders"));
+        if (args.next()) |s| opts.loss_ppm4k = @min(4096, parseOr(u16, s, "loss_ppm4k"));
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_bigbrother.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "forkjoin")) {
+        var opts = sim.demo_forkjoin.Options{};
+        if (args.next()) |s| opts.lieutenants = @min(16, parseOr(u16, s, "lieutenants"));
+        if (args.next()) |s| opts.workers = @min(125, parseOr(u16, s, "workers"));
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_forkjoin.run(alloc, opts);
+    }
 
     if (std.mem.eql(u8, first, "ring")) {
         var opts = sim.demo_ring.Options{};

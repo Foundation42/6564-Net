@@ -90,6 +90,14 @@ pub const Tag = enum(u8) {
 
 /// Ring-descriptor flags (word1 bits 56..64).
 pub const desc_flag_auto_repost: u8 = 0x01;
+/// Hardware-managed state for AUTO_REPOST's deferred grant: set once the
+/// first delivery record has been popped; thereafter each pop re-grants the
+/// PREVIOUS pop's buffer. The just-popped payload is thus valid until the
+/// next CQPOP from this ring — unconditionally, even with the ring drained
+/// dry under a flood. (The original pop-time-immediate grant collapsed the
+/// validity window to zero exactly when a saturated ring went empty; the
+/// Big Brother stress test caught it corrupting checksums.)
+pub const desc_flag_repost_pending: u8 = 0x80;
 
 pub const Desc = struct {
     base: u64,
