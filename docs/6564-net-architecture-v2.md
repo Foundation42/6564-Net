@@ -148,6 +148,8 @@ Actors fail; the architecture makes failure a first-class message. A context may
 
 The restart half is the **`SPWN`** instruction: it points at a 32-byte near-page spawn block — target context, entry IP, stack pointer, and an argument that lands in A — and resets the target to a fresh incarnation with its continuation queued. The target's near page (its ring wiring, its mailbox) and its exit link survive; its registers and any queued continuations from the dead incarnation do not (hardware tags run-queue entries with an incarnation number and discards stale ones at dispatch). `SPWN` is privileged, like `CAPLD`.
 
+Cooperative scheduling leaves one failure mode exit links alone cannot reach: a context spinning in a compute loop never blocks, so it starves its entire core — supervisor included. The answer is the **watchdog burst budget**: privileged software may give a context a maximum number of *consecutive* cycles it can hold the pipeline. Any park, yield, or halt resets the budget; exceeding it force-faults the context with a `watchdog` fault code, and its exit link fires like any other crash. Detection silicon is one comparator against the dispatch-time cycle count; the reporting and recovery paths are §5.4 unchanged. A supervisor cannot distinguish a hang from a crash except by the fault code — which is exactly right.
+
 Together these are Erlang's links and supervisors, in silicon: detection is a completion record, restart is one instruction, and supervision trees compose from nothing else. Cross-core supervision is deliberately not hardware: it is a software protocol built from messages and timers, exactly like every other distributed agreement on this machine.
 
 ---
@@ -273,7 +275,7 @@ Recorded honestly, for future revisions:
 
 6. **Timers** — *resolved in this revision.* The black-hole-prefix idiom (§6.3, "the fabric as clock") is now normative; no first-class timer ring. Still open within it: per-send timeout values in the transmit descriptor, and whether a well-known black-hole PTT slot number should be architecturally fixed rather than conventional.
 
-7. **Supervising the compute-hung** — exit links (§5.4) catch actors that halt or fault, but under cooperative scheduling an actor spinning in a compute loop starves its whole core, including its supervisor: it can be neither detected nor SPWN'd away. Simulation confirms this is the one failure mode supervision cannot reach. Candidate answers, in ascending silicon cost: the §5.3 priority nibble (a high-priority supervisor still needs the hog to block *eventually*), a per-context watchdog cycle counter that force-parks the context and fires its exit link, or true preemptive rotation. The watchdog-to-exit-link path is attractive because it reuses §5.4 unchanged.
+7. **Supervising the compute-hung** — *resolved in this revision.* The watchdog burst budget (§5.4) force-faults a context that holds the pipeline past its allowance, and the existing exit-link machinery reports it; no preemption, no new completion paths. Simulation exercises it end-to-end (a worker that stops yielding is caught, restarted, and eventually budget-abandoned exactly like a crasher). Still open within it: whether the budget belongs in the spawn block rather than a privileged config register, and interaction with the §5.3 priority nibble.
 
 ---
 

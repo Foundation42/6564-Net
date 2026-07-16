@@ -44,6 +44,9 @@ pub const Fault = enum {
     bad_descriptor,
     /// BRK executed.
     brk,
+    /// The context held the pipeline past its watchdog burst budget (§5.4):
+    /// a compute-hung actor, force-faulted so its exit link can speak.
+    watchdog,
 };
 
 pub const CtxState = enum {
@@ -79,6 +82,11 @@ pub const Context = struct {
     /// actor is never resumed at its dead predecessor's continuation.
     gen: u32 = 0,
     sup_link: ?SupLink = null,
+    /// Watchdog burst budget: the most consecutive cycles this context may
+    /// hold the pipeline without parking, yielding, or halting. 0 = no
+    /// watchdog. Exceeding it is a `watchdog` fault — the exit link fires
+    /// like any other crash. Privileged config; survives SPWN.
+    watchdog: u64 = 0,
     instructions: u64 = 0,
 };
 
@@ -93,6 +101,9 @@ pub const Core = struct {
     /// Context currently owning the pipeline, if any.
     current: ?u8 = null,
     clock: u64 = 0,
+    /// Cycle at which the current context was dispatched — the base the
+    /// watchdog measures bursts from.
+    burst_start: u64 = 0,
 
     fn hasWork(self: *const Core) bool {
         return self.current != null or self.runq.count != 0;
@@ -109,6 +120,7 @@ pub const Core = struct {
             if (ctx.state != .ready or ctx.gen != entry.gen) continue;
             ctx.ip = entry.ip;
             self.current = entry.ctx;
+            self.burst_start = self.clock;
             return;
         }
     }
@@ -142,6 +154,9 @@ pub const Stats = struct {
     /// truth (§6.1). Software exploits this deliberately: a send to an
     /// unroutable prefix is a guaranteed-timeout completion, i.e. a timer.
     unroutable: u64 = 0,
+    /// Contexts force-faulted for holding the pipeline past their burst
+    /// budget (§5.4) — each one is a compute-hang the exit link then reports.
+    watchdog_trips: u64 = 0,
     cq_overflows: u64 = 0,
 };
 
@@ -272,6 +287,12 @@ pub const Machine = struct {
     /// or faults, hardware posts an exit completion to the supervisor's CQ.
     pub fn linkSupervisor(self: *Machine, core_idx: u16, child: u8, sup: u8, cq_slot: u8) void {
         self.cores[core_idx].contexts[child].sup_link = .{ .ctx = sup, .cq_slot = cq_slot };
+    }
+
+    /// Arm a context's watchdog: the most consecutive cycles it may hold the
+    /// pipeline (0 disables). Privileged config; survives SPWN restarts.
+    pub fn setWatchdog(self: *Machine, core_idx: u16, ctx_idx: u8, cycles: u64) void {
+        self.cores[core_idx].contexts[ctx_idx].watchdog = cycles;
     }
 
     // ── Memory ───────────────────────────────────────────────────────────
@@ -622,7 +643,23 @@ pub const Machine = struct {
             return;
         };
         switch (dispo) {
-            .keep => {},
+            .keep => {
+                // The watchdog (§5.4): a context that holds the pipeline past
+                // its burst budget is force-faulted, so a compute-hung actor
+                // can't starve its own supervisor. Checked between
+                // instructions — instructions themselves stay atomic.
+                if (ctx.watchdog != 0 and core.clock - core.burst_start >= ctx.watchdog) {
+                    self.trace("c{d}x{d} @{d} WATCHDOG after {d}-cycle burst at ip=0x{X}", .{
+                        core.id, ctx_idx, core.clock, core.clock - core.burst_start, ctx.ip,
+                    });
+                    ctx.state = .faulted;
+                    ctx.fault = .watchdog;
+                    ctx.fault_addr = ctx.ip;
+                    core.current = null;
+                    self.stats.watchdog_trips += 1;
+                    self.notifyExit(core, ctx_idx, ctx);
+                }
+            },
             .switched_out => {
                 core.current = null;
                 self.stats.context_switches += 1;

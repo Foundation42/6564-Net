@@ -460,19 +460,105 @@ test "determinism: identical seeds produce identical runs" {
 
 // ── Phase 3: supervision ─────────────────────────────────────────────────
 
-test "supervision tree: restarts, budget, accumulated work (full demo)" {
+test "supervision tree: restarts, budgets, watchdog, accumulated work" {
     const o = try @import("demo_supervise.zig").simulate(testing.allocator, false);
     // Reliable workers met quota and exited clean.
     try testing.expectEqual(@as(u64, 12), o.progress[1]);
     try testing.expectEqual(@as(u64, 12), o.progress[3]);
-    // The flaky worker produced 5 items per incarnation across 4 lives
-    // (initial + 3 restarts) — its RAM progress cell survived every SPWN.
+    // The crasher produced 5 items per incarnation across 4 lives (initial +
+    // 3 restarts) — its RAM progress cell survived every SPWN.
     try testing.expectEqual(@as(u64, 20), o.progress[2]);
-    try testing.expectEqual(@as(u64, 3), o.restarts);
+    // The hanger produced 3 items per incarnation across 3 lives (initial +
+    // 2 restarts); each life ended in a watchdog trip, not a BRK.
+    try testing.expectEqual(@as(u64, 9), o.progress[4]);
+    try testing.expectEqual(@as(u64, 3), o.watchdog_trips);
+    try testing.expectEqual(machine.Fault.watchdog, o.hanger_fault);
+    // Total restarts across both budgets.
+    try testing.expectEqual(@as(u64, 5), o.restarts);
     try testing.expect(o.supervisor_halted);
-    // Abandoned honestly: the crasher's last incarnation stays faulted.
-    try testing.expectEqual(machine.CtxState.faulted, o.flaky_state);
+    // Abandoned honestly: both unreliable workers' last lives stay faulted.
+    try testing.expectEqual(machine.CtxState.faulted, o.crasher_state);
+    try testing.expectEqual(machine.CtxState.faulted, o.hanger_state);
     try testing.expectEqual(machine.StopReason.faulted, o.reason);
+}
+
+test "a hang without a watchdog starves the whole core (the old finding)" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 2,
+        .ram_size = 0x4000,
+        .max_cycles = 20_000,
+    });
+    defer m.deinit();
+    const src =
+        \\        .org $1000
+        \\spin:   BRA spin
+    ;
+    var out = try asm6564.assemble(testing.allocator, src, null);
+    defer out.deinit();
+    m.load(0, out.origin, out.code);
+    // No watchdog: the spinner holds the pipeline until max_cycles. Its
+    // sibling never runs a single instruction.
+    m.linkSupervisor(0, 0, 1, ring.slot_cq);
+    try m.spawn(0, 0, 0x1000, 0x2000, 0);
+    try testing.expectEqual(machine.StopReason.max_cycles, try m.run());
+}
+
+test "watchdog force-faults a spinner and its exit link reports it" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 2,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    // ctx1 spins forever; ctx0 supervises and records the obituary.
+    const spinner_src =
+        \\        .org $1200
+        \\spin:   BRA spin
+    ;
+    const sup_src =
+        \\        .org $1000
+        \\wait:   LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wait
+        \\        STA !$2280      ; exit completion word0
+        \\        STX !$2288      ; cookie (child id)
+        \\        HLT
+    ;
+    var spinner_out = try asm6564.assemble(testing.allocator, spinner_src, null);
+    defer spinner_out.deinit();
+    var sup_out = try asm6564.assemble(testing.allocator, sup_src, null);
+    defer sup_out.deinit();
+    m.load(0, spinner_out.origin, spinner_out.code);
+    m.load(0, sup_out.origin, sup_out.code);
+    m.setRing(0, 0, ring.slot_cq, .{
+        .base = 0x2000,
+        .cap_log2 = 3,
+        .entry_size = ring.cq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    });
+    m.linkSupervisor(0, 1, 0, ring.slot_cq);
+    m.setWatchdog(0, 1, 300);
+    try m.spawn(0, 1, 0x1200, 0x3800, 0);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+
+    try testing.expectEqual(machine.StopReason.faulted, try m.run());
+    const spinner = &m.cores[0].contexts[1];
+    try testing.expectEqual(machine.CtxState.faulted, spinner.state);
+    try testing.expectEqual(machine.Fault.watchdog, spinner.fault);
+    try testing.expectEqual(@as(u64, 1), m.stats.watchdog_trips);
+    // The supervisor received the obituary as an ordinary completion record.
+    const ram = m.cores[0].ram;
+    const w0 = std.mem.readInt(u64, ram[0x2280 - machine.ram_base ..][0..8], .little);
+    const c = ring.Completion.fromWords(w0, std.mem.readInt(u64, ram[0x2288 - machine.ram_base ..][0..8], .little));
+    try testing.expectEqual(ring.Tag.exit, c.tag);
+    try testing.expectEqual(ring.Status.fault, c.status);
+    try testing.expectEqual(@intFromEnum(machine.Fault.watchdog), c.byte_count);
+    try testing.expectEqual(@as(u64, 1), c.cookie);
 }
 
 test "SPWN invalidates the dead incarnation's queued continuations" {

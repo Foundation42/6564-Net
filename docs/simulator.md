@@ -72,6 +72,13 @@ number, so a dead life's continuations are skipped at dispatch. `SPWN` of
 self or an out-of-range context faults the spawner (`bad_descriptor`).
 Same-core only — cross-core supervision is a software protocol.
 
+**Watchdog (spec §5.4).** `setWatchdog(core, ctx, cycles)` arms a per-context
+burst budget (0 = off; survives SPWN, like the exit link). The check runs
+between instructions against the dispatch-time clock: exceed the budget and
+the context faults with code `watchdog`, `stats.watchdog_trips` increments,
+and the exit link fires. Instructions stay atomic — the trip lands after the
+instruction that crossed the line.
+
 ## Deliberate v0.1 simplifications
 
 1. **The RBC drains SQs instantly.** `SEND` accepts and transmits in the same
@@ -125,12 +132,14 @@ end-to-end evidence (the echo) plus timers. This is the end-to-end argument
 reproduced from first principles in ~60 instructions. The CQ ack still
 matters for one thing: buffer ownership release (§6.2).
 
-**Supervision cannot reach the compute-hung.** Exit links catch halts and
-faults, but a worker spinning in a pure compute loop starves the whole core —
-including its supervisor, which can then neither observe nor restart it. The
-supervision demo works precisely because workers `YLD` between items; delete
-that one instruction and the tree is helpless. This is now spec open
-question 7 (watchdog-into-exit-link looks like the cheapest honest fix).
+**Supervision cannot reach the compute-hung — without a watchdog.** Exit
+links catch halts and faults, but a worker spinning in a pure compute loop
+starves the whole core — including its supervisor, which can then neither
+observe nor restart it (a regression test pins this failure mode down). The
+fix became spec §5.4's watchdog burst budget: one comparator, and the hang
+turns into an ordinary fault the existing exit link reports. The demo's
+worker 4 exercises the full arc — hang, trip, restart, budget exhaustion.
+Open question 7: resolved.
 
 **One program, many actors.** All three demo workers execute the same code at
 one RAM address with per-actor config blocks passed via the spawn argument —
@@ -160,5 +169,5 @@ takes `trace` as its 4th CLI arg.
   two-generals is live), deterministic replay verified by test.
 - **Phase 3 — actor workloads: in progress.** Ping-pong with end-to-end
   reliability (`sim6564 pingpong`) and a one-for-one supervision tree with
-  exit links, SPWN restarts, and a restart budget (`sim6564 supervise`).
-  Pipelines and scatter-gather: next.
+  exit links, SPWN restarts, per-child budgets, and watchdog-caught hangs
+  (`sim6564 supervise`). Pipelines and scatter-gather: next.

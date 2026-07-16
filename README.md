@@ -27,10 +27,13 @@ an unroutable prefix is a guaranteed timeout completion, spec §6.3) — and
 completes its rounds at any loss rate below total.
 
 **supervise** runs a one-for-one supervision tree on one core: exit links
-post a crashed worker's obituary to the supervisor's completion queue as an
+post a dead worker's obituary to the supervisor's completion queue as an
 ordinary completion record, and `SPWN` resurrects it with fresh registers
 while its work survives in RAM — Erlang's supervisors, in silicon (spec
-§5.4). The restart budget runs out; the crasher is abandoned, honestly.
+§5.4). One worker crashes (BRK); another *hangs*, spinning without yielding,
+and only its watchdog burst budget can tell — the hang becomes an ordinary
+fault with its own fault code. Per-child restart budgets run out; the
+unreliable are abandoned, honestly.
 
 Everything decodes from one declarative ISA table (`src/isa.zig`): the
 simulator, the assembler, and the disassembly of intent. Adding an
