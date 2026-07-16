@@ -311,3 +311,33 @@ cycles 524,034 → 479,273 (-8.5%), code 2877 → 2820. Benchmarks of
 record: Armstrong ring 66 → **60 cy/pass** (200x1000 steady state);
 Big Brother 61 → **55 cy/absorbed message** at 10,000 senders. This
 table is the new frozen baseline for future null-cost checks.
+
+## WDEX landed (2026-07-16, post-v2.5 handoff item 1)
+
+`WDEX ##n` at $B7 (the $?7 concurrency column, imm64, 3 cycles like
+every wide immediate): declare the current burst long by setting its
+remaining watchdog budget to `n`. The declaration is supervisor-bounded
+— the control block gains a **declaration ceiling** alongside the base
+budget (`setWdexCeiling`, privileged, survives SPWN), and `n` above the
+ceiling is a fault (`wdex_ceiling`), not a longer leash. At the next
+park everything resets to the base budget; a second WDEX in the same
+burst replaces the first. The naive "feed the dog" design stays
+rejected: a hung loop containing WDEX still dies, because the hang
+either re-declares past the ceiling (fault) or exhausts its declared
+budget (watchdog trip). Total unyielding time never exceeds what the
+supervisor authorized.
+
+Two semantic calls made in implementation, flagged for spec v2.6:
+
+1. **No watchdog armed → WDEX is an architectural no-op.** There is no
+   leash to extend, and a joe program full of `bounded` blocks must run
+   identically whether or not anyone is supervising it.
+2. **`WDEX ##0` cancels the declaration** (back to the base budget,
+   measured from burst start) rather than meaning "trip me now".
+
+Null-cost check: `sim6564 measure` reproduces the frozen v2.5 table
+byte-identically (2820 / 171,112 / 479,273) — WDEX present but unused
+costs nothing. 4 new tests (75 total): declared burst outlives base
+budget then declaration dies at the park (fault_addr proves which spin
+tripped), over-ceiling faults, replace + cancel semantics, no-watchdog
+no-op.

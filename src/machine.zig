@@ -50,6 +50,9 @@ pub const Fault = enum {
     watchdog,
     /// MAC through a zero vector: a bug, not a jump to page zero.
     bad_macro,
+    /// WDEX declared a burst budget above the supervisor's ceiling (§5.4):
+    /// asking for more leash than authorized is a fault, not a longer leash.
+    wdex_ceiling,
 };
 
 pub const CtxState = enum {
@@ -90,6 +93,11 @@ pub const Context = struct {
     /// watchdog. Exceeding it is a `watchdog` fault — the exit link fires
     /// like any other crash. Privileged config; survives SPWN.
     watchdog: u64 = 0,
+    /// Ceiling on WDEX declarations: the largest burst budget this context
+    /// may set for itself. The supervisor's contract about worst-case
+    /// unyielding time — an actor must not edit its own leash. Privileged
+    /// config; survives SPWN. 0 = no declarations authorized.
+    wdex_ceiling: u64 = 0,
     instructions: u64 = 0,
 };
 
@@ -107,6 +115,12 @@ pub const Core = struct {
     /// Cycle at which the current context was dispatched — the base the
     /// watchdog measures bursts from.
     burst_start: u64 = 0,
+    /// Active WDEX declaration for the current burst (§5.4): the cycle it
+    /// was declared at and the remaining budget granted. budget 0 = no
+    /// declaration. Cleared at dispatch — a declaration never outlives the
+    /// burst it was made in.
+    wdex_base: u64 = 0,
+    wdex_budget: u64 = 0,
 
     fn hasWork(self: *const Core) bool {
         return self.current != null or self.runq.count != 0;
@@ -124,6 +138,7 @@ pub const Core = struct {
             ctx.ip = entry.ip;
             self.current = entry.ctx;
             self.burst_start = self.clock;
+            self.wdex_budget = 0; // declarations reset to base at the park
             return;
         }
     }
@@ -384,6 +399,13 @@ pub const Machine = struct {
     /// pipeline (0 disables). Privileged config; survives SPWN restarts.
     pub fn setWatchdog(self: *Machine, core_idx: u16, ctx_idx: u8, cycles: u64) void {
         self.cores[core_idx].contexts[ctx_idx].watchdog = cycles;
+    }
+
+    /// Authorize WDEX declarations up to `cycles` for a context (§5.4): the
+    /// supervisor's ceiling on how long a burst the actor may declare for
+    /// itself. Privileged, like the base budget; survives SPWN.
+    pub fn setWdexCeiling(self: *Machine, core_idx: u16, ctx_idx: u8, cycles: u64) void {
+        self.cores[core_idx].contexts[ctx_idx].wdex_ceiling = cycles;
     }
 
     // ── Memory ───────────────────────────────────────────────────────────
@@ -947,7 +969,7 @@ pub const Machine = struct {
 
     // ── Instruction execution ────────────────────────────────────────────
 
-    const StepError = MemError || error{ BadOpcode, NoCapability, BadDescriptor, Brk, BadMacro, OutOfMemory };
+    const StepError = MemError || error{ BadOpcode, NoCapability, BadDescriptor, Brk, BadMacro, WdexCeiling, OutOfMemory };
 
     /// Outcome of one instruction: does the current context keep the core?
     const Disposition = enum { keep, switched_out, halted };
@@ -967,6 +989,7 @@ pub const Machine = struct {
                 error.BadDescriptor => .bad_descriptor,
                 error.Brk => .brk,
                 error.BadMacro => .bad_macro,
+                error.WdexCeiling => .wdex_ceiling,
                 error.OutOfMemory => return err,
             };
             ctx.fault_addr = ctx.ip;
@@ -980,7 +1003,13 @@ pub const Machine = struct {
                 // its burst budget is force-faulted, so a compute-hung actor
                 // can't starve its own supervisor. Checked between
                 // instructions — instructions themselves stay atomic.
-                if (ctx.watchdog != 0 and core.clock - core.burst_start >= ctx.watchdog) {
+                // A WDEX declaration, while active, replaces the base budget:
+                // the burst may run until (declaration cycle + declared n).
+                const tripped = if (core.wdex_budget != 0)
+                    core.clock - core.wdex_base >= core.wdex_budget
+                else
+                    ctx.watchdog != 0 and core.clock - core.burst_start >= ctx.watchdog;
+                if (tripped) {
                     self.trace("c{d}x{d} @{d} WATCHDOG after {d}-cycle burst at ip=0x{X}", .{
                         core.id, ctx_idx, core.clock, core.clock - core.burst_start, ctx.ip,
                     });
@@ -1367,6 +1396,22 @@ pub const Machine = struct {
                 const base = near_off & (near_size - 1);
                 for (&words, 0..) |*w, i| w.* = try read64(core, ctx, base + i * 8);
                 core.ptt[cap_slot] = ring.PttEntry.unpack(words);
+            },
+            .wdex => {
+                // WDEX ##n (§5.4): declare this burst long — set its
+                // remaining watchdog budget to n, checked against the
+                // control block's ceiling (the supervisor's contract; an
+                // actor must not edit its own leash). A second WDEX in the
+                // same burst replaces the first; ##0 cancels back to the
+                // base budget. No watchdog armed = nothing to extend.
+                if (ctx.watchdog != 0) {
+                    if (imm > ctx.wdex_ceiling) return error.WdexCeiling;
+                    core.wdex_base = core.clock;
+                    core.wdex_budget = imm;
+                    self.trace("c{d}x{d} @{d} WDEX declares {d}-cycle burst (ceiling {d})", .{
+                        core.id, ctx_idx, core.clock, imm, ctx.wdex_ceiling,
+                    });
+                }
             },
             .spwn => {
                 // (Re)start a sibling from a spawn block at ea:

@@ -390,6 +390,21 @@ printed it) and the data reply never came. The retirement stats made
 the diagnosis arithmetic: 104 console bytes = 80 response + 24 = one
 recv request, verbatim.
 
+## WDEX: bounded declarations (post-v2.5 handoff item 1)
+
+`WDEX ##n` ($B7, imm64, 3 cycles) sets the current burst's remaining
+watchdog budget to `n`, checked against a per-context **declaration
+ceiling** (`Machine.setWdexCeiling` — privileged like the base budget,
+survives SPWN; the actor must not edit its own leash). Implementation:
+the declaration lives on the Core (`wdex_base`/`wdex_budget`) because
+only the context holding the pipeline can have one, and `dispatch()`
+clears it — a declaration structurally cannot outlive its burst.
+Over-ceiling declarations fault (`wdex_ceiling`, bad_descriptor-class);
+a second WDEX replaces; `##0` cancels; with no watchdog armed WDEX is
+an architectural no-op (nothing to extend — joe's `bounded` blocks run
+identically supervised or not). This is the lowering target for joe's
+`bounded N { … }`. Null-cost verified against the frozen v2.5 table.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

@@ -561,6 +561,136 @@ test "watchdog force-faults a spinner and its exit link reports it" {
     try testing.expectEqual(@as(u64, 1), c.cookie);
 }
 
+test "WDEX: a declared burst outlives the base budget; the declaration dies at the park" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    // Two identical ~400-cycle spins under a 300-cycle base budget. The
+    // first is declared (WDEX ##1000) and survives; the YLD parks, the
+    // declaration resets to base, and the undeclared second spin trips.
+    try assembleInto(&m, 0,
+        \\        .org $1000
+        \\        WDEX ##1000
+        \\        LDX #100
+        \\sp1:    DEX
+        \\        BNE sp1
+        \\        YLD
+        \\sp2:    LDX #100
+        \\sp3:    DEX
+        \\        BNE sp3
+        \\        HLT
+    );
+    m.setWatchdog(0, 0, 300);
+    m.setWdexCeiling(0, 0, 2000);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.faulted, try m.run());
+    const ctx = &m.cores[0].contexts[0];
+    try testing.expectEqual(machine.Fault.watchdog, ctx.fault);
+    try testing.expectEqual(@as(u64, 1), m.stats.watchdog_trips);
+    // The trip happened in the SECOND spin — the declared one ran to term.
+    try testing.expect(ctx.fault_addr >= 0x1010);
+}
+
+test "WDEX above the ceiling faults: asking is not receiving" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    try assembleInto(&m, 0,
+        \\        .org $1000
+        \\        WDEX ##5000
+        \\        HLT
+    );
+    m.setWatchdog(0, 0, 300);
+    m.setWdexCeiling(0, 0, 1000);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.faulted, try m.run());
+    const ctx = &m.cores[0].contexts[0];
+    try testing.expectEqual(machine.Fault.wdex_ceiling, ctx.fault);
+    try testing.expectEqual(@as(u64, 0), m.stats.watchdog_trips);
+}
+
+test "WDEX: a second declaration replaces, and ##0 cancels back to base" {
+    // Replace: ##1000 then ##50 — if the first survived, the 400-cycle
+    // spin would pass; the replacement budget of 50 trips it.
+    {
+        var m = try Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .ram_size = 0x4000,
+        });
+        defer m.deinit();
+        try assembleInto(&m, 0,
+            \\        .org $1000
+            \\        WDEX ##1000
+            \\        WDEX ##50
+            \\        LDX #100
+            \\sp:     DEX
+            \\        BNE sp
+            \\        HLT
+        );
+        m.setWatchdog(0, 0, 300);
+        m.setWdexCeiling(0, 0, 1000);
+        try m.spawn(0, 0, 0x1000, 0x3000, 0);
+        try testing.expectEqual(machine.StopReason.faulted, try m.run());
+        try testing.expectEqual(machine.Fault.watchdog, m.cores[0].contexts[0].fault);
+    }
+    // Cancel: declare ##1000, spin ~200, cancel — the base budget is
+    // measured from burst start, so the next ~200 cycles cross 300.
+    {
+        var m = try Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .ram_size = 0x4000,
+        });
+        defer m.deinit();
+        try assembleInto(&m, 0,
+            \\        .org $1000
+            \\        WDEX ##1000
+            \\        LDX #50
+            \\c1:     DEX
+            \\        BNE c1
+            \\        WDEX ##0
+            \\        LDX #50
+            \\c2:     DEX
+            \\        BNE c2
+            \\        HLT
+        );
+        m.setWatchdog(0, 0, 300);
+        m.setWdexCeiling(0, 0, 1000);
+        try m.spawn(0, 0, 0x1000, 0x3000, 0);
+        try testing.expectEqual(machine.StopReason.faulted, try m.run());
+        try testing.expectEqual(machine.Fault.watchdog, m.cores[0].contexts[0].fault);
+    }
+}
+
+test "WDEX with no watchdog armed is a no-op: nothing to extend, nothing to fault" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    // No watchdog, no ceiling: a joe program full of `bounded` blocks must
+    // run identically whether or not anyone is holding its leash.
+    try assembleInto(&m, 0,
+        \\        .org $1000
+        \\        WDEX ##123456
+        \\        LDX #200
+        \\sp:     DEX
+        \\        BNE sp
+        \\        HLT
+    );
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    try testing.expectEqual(machine.CtxState.halted, m.cores[0].contexts[0].state);
+}
+
 test "SPWN invalidates the dead incarnation's queued continuations" {
     var m = try Machine.init(testing.allocator, .{
         .cores = 1,

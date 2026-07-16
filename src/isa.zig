@@ -133,6 +133,7 @@ pub const Mnemonic = enum {
     cqpop,
     capld,
     spwn,
+    wdex,
     // One-byte vectored calls through the per-context MACTAB (near page
     // $F80–$FFF). Semantics are exactly JSR [MACTAB + n*8]; the slot index
     // is the opcode's high nibble. Pre-normative — see the MAC & chains
@@ -266,6 +267,13 @@ pub const table = [_]Encoding{
     // {ctx, entry IP, SP, arg→A}; near,X enables indexed spawn-block tables.
     e(.spwn, .near, 0x87, 6),
     e(.spwn, .near_x, 0x97, 6),
+    // WDEX ##n (§5.4) — declare the current burst long: set its remaining
+    // watchdog budget to n. Supervisor-bounded: n above the control block's
+    // declaration ceiling faults (`wdex_ceiling`) instead of extending the
+    // leash. Resets to the base budget at the next park; ##0 cancels the
+    // declaration. With no watchdog armed there is no leash to extend —
+    // architectural no-op.
+    e(.wdex, .imm64, 0xB7, 3),
     // ── MAC: the $?F column, spent whole on one feature ──────────────────
     e(.mac, .impl, 0x0F, 6),
     e(.mac, .impl, 0x1F, 6),
