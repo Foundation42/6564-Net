@@ -1363,3 +1363,185 @@ test "a device demands its token like any ring: wrong token, reject_capability" 
     try testing.expectEqual(@as(usize, 0), m.device(0xFF00).?.console.out.items.len);
     try testing.expectEqual(@as(u64, 0), m.stats.dev_deliveries);
 }
+
+// ── The IO plane (§6.5): dies, windows, threads ──────────────────────────
+
+const cluster_mod = @import("cluster.zig");
+
+test "io plane: a reliable send crosses dies through a lossy plane" {
+    var cl = try cluster_mod.Cluster.init(testing.allocator, .{
+        .dies = 2,
+        .die = .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .ram_size = 0x8000,
+            .link = .{ .send_timeout = 6000 },
+            .max_cycles = 3_000_000,
+        },
+        .plane = .{
+            .base_latency = 2000,
+            .jitter = 500,
+            .loss_ppm4k = 1024, // 25% each way, datagrams AND acks
+            .dup_ppm4k = 256,
+        },
+        .seed = 0x5EED,
+    });
+    defer cl.deinit();
+    cl.setRoute(0, 1, 1);
+    // The sender's capability differs from an on-die one by ONE byte.
+    cl.die(0).setPtt(0, 0, .{
+        .prefix_lo = ring.PttEntry.loFrom(0, 0, ring.slot_rx),
+        .route = 1,
+        .rights = .{ .send = true },
+        .token = 0xCAFE,
+    });
+    wireSender(cl.die(0), 0, 0, 0x2300, 0x2400);
+    wireReceiver(cl.die(1), 0, 0, 0x2000, 0x2100, 0xCAFE);
+    const sender_src =
+        \\        .org $1000
+        \\        LDA ##$6564_6564_6564_6564
+        \\        STA !$2500
+        \\        LDA #1
+        \\        STA !$2400
+        \\        LDA ##$FF00_0000_0000_0000
+        \\        STA !$2408
+        \\        LDA ##$2500
+        \\        STA !$2410
+        \\        LDA ##$42_0000_0008
+        \\        STA !$2418
+        \\retry:  SEND 0
+        \\        LSTN 1
+        \\        CQPOP 1
+        \\        BEQ retry
+        \\        LSR
+        \\        LSR
+        \\        LSR
+        \\        LSR
+        \\        LSR
+        \\        LSR
+        \\        LSR
+        \\        LSR
+        \\        AND #$FF
+        \\        CMP #0
+        \\        BEQ done                    ; delivered and acknowledged
+        \\        CMP #3
+        \\        BEQ done                    ; peer stopped listening: it has it
+        \\        INC !$22A0
+        \\        BRA retry
+        \\done:   HLT
+    ;
+    try assembleInto(cl.die(0), 0, sender_src);
+    try assembleInto(cl.die(1), 0, receiver_src);
+    try cl.die(0).spawn(0, 0, 0x1000, 0x3000, 0);
+    try cl.die(1).spawn(0, 0, 0x1400, 0x3800, 0);
+
+    var out = try cl.run();
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(machine.StopReason.all_halted, out.reasons[0]);
+    try testing.expectEqual(machine.StopReason.all_halted, out.reasons[1]);
+    // The message crossed dies intact.
+    const rram = cl.die(1).cores[0].ram;
+    try testing.expectEqual(
+        @as(u64, 0x6564_6564_6564_6564),
+        std.mem.readInt(u64, rram[0x2290 - machine.ram_base ..][0..8], .little),
+    );
+    try testing.expect(out.plane.grams >= 1);
+    try testing.expect(out.plane.acks >= 1);
+}
+
+test "io plane: the dies ring — same program bytes, one route byte" {
+    const o = try @import("demo_dies.zig").simulate(testing.allocator, .{
+        .dies = 2,
+        .nodes = 8,
+        .laps = 3,
+        .parallel = false,
+    });
+    defer testing.allocator.free(o.reasons);
+    try testing.expect(o.exactly_one_finisher);
+    try testing.expect(o.finisher_is_origin);
+    try testing.expectEqual(@as(u64, 48), o.passes);
+    try testing.expectEqual(@as(u64, 6), o.crossings);
+    try testing.expectEqual(@as(u64, 6), o.plane.grams);
+    try testing.expectEqual(@as(u64, 0), o.plane.lost);
+}
+
+test "io plane: bit-identical at any thread count" {
+    const seq = try @import("demo_dies.zig").simulate(testing.allocator, .{
+        .dies = 4,
+        .nodes = 20,
+        .laps = 5,
+        .parallel = false,
+    });
+    defer testing.allocator.free(seq.reasons);
+    const par = try @import("demo_dies.zig").simulate(testing.allocator, .{
+        .dies = 4,
+        .nodes = 20,
+        .laps = 5,
+        .parallel = true,
+    });
+    defer testing.allocator.free(par.reasons);
+    try testing.expectEqual(seq.cycles, par.cycles);
+    try testing.expectEqual(seq.windows, par.windows);
+    try testing.expectEqual(seq.instructions, par.instructions);
+    try testing.expectEqual(seq.plane.grams, par.plane.grams);
+    try testing.expectEqual(seq.plane.acks, par.plane.acks);
+    try testing.expectEqualSlices(machine.StopReason, seq.reasons, par.reasons);
+    try testing.expect(par.exactly_one_finisher and par.finisher_is_origin);
+}
+
+test "io plane: a route with no path times out honestly" {
+    var cl = try cluster_mod.Cluster.init(testing.allocator, .{
+        .dies = 2,
+        .die = .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .ram_size = 0x8000,
+            .max_cycles = 100_000,
+        },
+    });
+    defer cl.deinit();
+    // No setRoute: route byte 1 leads nowhere — the plane's black hole.
+    cl.die(0).setPtt(0, 0, .{
+        .prefix_lo = ring.PttEntry.loFrom(0, 0, ring.slot_rx),
+        .route = 1,
+        .rights = .{ .send = true },
+        .token = 0,
+    });
+    wireSender(cl.die(0), 0, 0, 0x2300, 0x2400);
+    try assembleInto(cl.die(0), 0, dev_token_probe_src);
+    try cl.die(0).spawn(0, 0, 0x1000, 0x3000, 0);
+    var out = try cl.run();
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(machine.StopReason.all_halted, out.reasons[0]);
+    const word0 = std.mem.readInt(u64, cl.die(0).cores[0].contexts[0].near[0x840..][0..8], .little);
+    try testing.expectEqual(
+        @as(u64, @intFromEnum(ring.Status.timeout)),
+        (word0 >> 8) & 0xFF,
+    );
+    try testing.expectEqual(@as(u64, 1), out.plane.unroutable);
+}
+
+test "io plane: busy mode — local rings finish on every die, still bit-identical" {
+    const seq = try @import("demo_dies.zig").simulate(testing.allocator, .{
+        .dies = 3,
+        .nodes = 10,
+        .laps = 2,
+        .busy = 20,
+        .parallel = false,
+    });
+    defer testing.allocator.free(seq.reasons);
+    const par = try @import("demo_dies.zig").simulate(testing.allocator, .{
+        .dies = 3,
+        .nodes = 10,
+        .laps = 2,
+        .busy = 20,
+        .parallel = true,
+    });
+    defer testing.allocator.free(par.reasons);
+    try testing.expect(seq.exactly_one_finisher and seq.finisher_is_origin);
+    try testing.expect(seq.busy_rings_finished);
+    try testing.expectEqual(seq.cycles, par.cycles);
+    try testing.expectEqual(seq.instructions, par.instructions);
+    try testing.expectEqual(seq.windows, par.windows);
+    try testing.expect(par.busy_rings_finished);
+}

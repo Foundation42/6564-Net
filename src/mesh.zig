@@ -52,6 +52,10 @@ pub const ReplyPath = struct {
 /// A datagram in flight.
 pub const Datagram = struct {
     send_id: u64,
+    /// Die the send originated on (§6.5). send_ids are per-die counters, so
+    /// a delivery from another die must never consult the local pending map:
+    /// its ack rides the IO plane home instead.
+    src_die: u16 = 0,
     dst_core: u16,
     dst_ctx: u8,
     dst_slot: u8,
@@ -63,6 +67,32 @@ pub const Datagram = struct {
     token: u64,
     /// Owned by the event queue; freed after delivery.
     payload: []u8,
+};
+
+/// Traffic handed to the inter-die IO plane (§6.5). The machine states an
+/// intent; the plane owns routing (route byte → die), its own fault model,
+/// and arrival times. `gram` payloads transfer ownership to the plane.
+pub const Outbound = struct {
+    /// PTT route byte that selected the off-die path (grams; acks return
+    /// to a die directly and carry it as 0).
+    route: u8,
+    /// Sender-die virtual time of the egress.
+    sent_at: u64,
+    kind: union(enum) {
+        /// A datagram crossing dies; `src_die` is set so the ack finds home.
+        gram: Datagram,
+        /// An ack riding the plane back to the sender's pending map.
+        ack: struct { dst_die: u16, send_id: u64, status: ring.Status, byte_count: u32 },
+    },
+};
+
+/// A die's hook onto the IO plane: the machine calls `emit` for traffic
+/// whose PTT route byte selects an off-die path. Called mid-window on the
+/// die's own thread — implementations must touch die-local state only
+/// (each die owns its outbox and its plane PRNG).
+pub const Egress = struct {
+    ctx: *anyopaque,
+    emit: *const fn (ctx: *anyopaque, out: Outbound) error{OutOfMemory}!void,
 };
 
 pub const Event = struct {

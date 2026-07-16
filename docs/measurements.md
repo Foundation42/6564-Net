@@ -200,3 +200,36 @@ New workload data points (not part of the frozen table):
   printer (33 console round-trips at ~400 cycles of fabric latency
   each). Console I/O is fabric-latency-bound, as it should be — a
   teletype across a network costs network.
+
+## The IO plane landed (2026-07-16, spec v2.4)
+
+Again no opcodes, again no cycle-model changes — the route byte was
+already in the PTT entry (word2 bits 8..16, reserved since v2). Null
+cost holds: the frozen table reproduces byte-identically on single-die
+machines, with `run()` now literally `runUntil(∞)`.
+
+Multi-die numbers (`sim6564 dies`, ReleaseFast, 16-thread host):
+
+| config | result |
+|---|---|
+| 16 dies x 200 nodes x 100 laps | 320,000 passes, 24,665,093 cycles (77 cy/pass incl. 1,600 crossings), 0 lost |
+| ...threaded vs sequential | **bit-identical** (also at 4x20x5, and with busy rings — test-guarded) |
+| busy mode 16x100x10 + 2000 local laps | sequential 1.01 s → threaded 0.27 s (**3.7x**, 666% CPU) |
+| ...10x the work | 10.3 s → 2.8 s (**3.7x**) |
+| pure global ring, threaded | ≈ sequential wall clock — one token = one busy die at a time; Amdahl's law is about the workload |
+
+Two host-side findings that mattered more than the parallelism itself:
+
+- Thread-per-window spawning burned 3.7x the sequential wall clock
+  before the persistent worker pool (16 dies x 12k windows of
+  spawn/join). Barriers are cheap; spawns are not.
+- The shared GPA was the real bottleneck end to end: switching release
+  builds to `std.heap.smp_allocator` took the busy benchmark from
+  7.7 s to 1.0 s *sequential* and 2.7 s to 0.27 s threaded. Measure the
+  allocator before crediting the architecture.
+
+Correctness catch (worth keeping): the first draft let a die's local
+deliveries consult another die's pending map (send-ids are per-die
+counters; the origin die wasn't stamped). The plane's own counters
+exposed it — 1,510 acks for 40 datagrams. Datagrams now carry src_die,
+and foreign acks ride the plane home.

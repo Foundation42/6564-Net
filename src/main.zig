@@ -1,6 +1,7 @@
 //! sim6564 CLI — demo dispatcher. See usage() for the interface.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sim = @import("sim6564");
 
 const usage_text =
@@ -54,6 +55,14 @@ const usage_text =
     \\      round-trips them through a disk sector and prints its own cycle
     \\      bill (programs/periph.asm).
     \\
+    \\  sim6564 dies [dies] [nodes_per_die] [laps] [busy_laps] [seq] [trace]
+    \\      Armstrong's ring across whole dies joined by the IO plane —
+    \\      one host thread per die, bit-identical to the sequential run.
+    \\      Remoteness is one route byte in a PTT entry; the program can't
+    \\      tell (programs/ring_node.asm, unmodified). Default 4x50x10.
+    \\      busy_laps > 0 adds a local ring per die so every host thread
+    \\      has work (the lone global token is Amdahl's law incarnate).
+    \\
     \\  sim6564 measure
     \\      Run every demo at its frozen baseline config and emit the
     \\      instructions / cycles / code-bytes table (the MAC & chains
@@ -76,9 +85,12 @@ fn parseOr(comptime T: type, s: []const u8, what: []const u8) T {
 }
 
 pub fn main() !void {
+    // Debug builds keep the leak-checking GPA; release builds use the
+    // lock-avoiding SMP allocator — the dies demo runs one thread per die,
+    // and a shared allocator mutex is where that speedup goes to die.
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const alloc = if (builtin.mode == .Debug) gpa.allocator() else std.heap.smp_allocator;
 
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
@@ -113,6 +125,23 @@ pub fn main() !void {
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
         return sim.demo_hello.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "dies")) {
+        var opts = sim.demo_dies.Options{};
+        if (args.next()) |s| opts.dies = @min(16, parseOr(u16, s, "dies"));
+        if (args.next()) |s| opts.nodes = @min(200, parseOr(u16, s, "nodes_per_die"));
+        if (args.next()) |s| opts.laps = @min(1000, parseOr(u64, s, "laps"));
+        while (args.next()) |s| {
+            if (std.mem.eql(u8, s, "seq")) {
+                opts.parallel = false;
+            } else if (std.mem.eql(u8, s, "trace")) {
+                opts.trace = true;
+            } else {
+                opts.busy = @min(100_000, parseOr(u64, s, "busy_laps"));
+            }
+        }
+        return sim.demo_dies.run(alloc, opts);
     }
 
     if (std.mem.eql(u8, first, "periph")) {

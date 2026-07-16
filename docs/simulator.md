@@ -1,6 +1,6 @@
 # sim6564 — Reference Simulator, v0.1 Implementation Record
 
-Companion to [6564-net-architecture-v2.3.md](6564-net-architecture-v2.3.md). The
+Companion to [6564-net-architecture-v2.4.md](6564-net-architecture-v2.4.md). The
 spec says what the machine *is*; this records what v0.1 of the simulator
 *decided* where the spec left latitude, what it deliberately simplifies, and
 what building it taught us. Zig 0.14.1.
@@ -290,6 +290,41 @@ ack-wait therefore stashes any delivery record it pops ($8B0/$8B8) for
 the reply-collector to pick up. Sequential request/reply protocols need
 one stash slot; pipelined ones need a real dispatch loop.
 
+## The IO plane (spec §6.5, v2.4)
+
+`src/cluster.zig` joins N complete Machines (dies) under a
+conservative-horizon window loop; each die's single-threaded event loop
+is untouched (`run()` is now literally `runUntil(∞)`, verified
+byte-identical against the frozen table). The window equals the plane's
+base latency, so traffic emitted in window k is due no earlier than
+window k+1 and barrier injection never hands a die an event in its past
+(a core may overshoot the horizon by one instruction — the same
+tolerance the event loop always had). Machine-side hooks: `attachPlane`
+(die id + egress callback), egress on PTT route byte != 0 (timeout still
+arms locally), `injectDeliver`/`injectAck` for barrier ingress, and
+datagrams carry `src_die` so a foreign delivery's ack rides the plane
+home instead of touching the local pending map — send-ids are per-die
+counters, and the first draft's failure to stamp origin produced 1,510
+acks for 40 datagrams before the plane's counters caught it.
+
+Determinism at any thread count: within a window dies share nothing
+(each owns its outbox and plane PRNG and rolls its own egress faults);
+the barrier merge sorts by (due, src_die, seq). `parallel = true` runs
+one persistent worker thread per die — persistent because
+thread-per-window burned 3.7x the sequential wall clock in spawn/join
+before the pool. Release builds use `std.heap.smp_allocator`
+(main.zig): the shared-mutex GPA was the real end-to-end bottleneck
+(7.7 s → 1.0 s sequential on the busy benchmark). Cluster requires a
+thread-safe allocator when parallel (GPA default config and
+testing.allocator qualify).
+
+Demo: `sim6564 dies [dies] [nodes] [laps] [busy_laps] [seq]` — the ring
+spans dies with ring_node.asm unmodified; remoteness is one route byte.
+`busy_laps > 0` adds a die-local ring per die so all host threads have
+work: the lone global token is Amdahl's law incarnate (one busy die at
+a time), and the harness says so rather than pretending. Numbers in
+measurements.md; bit-identity threaded-vs-sequential is test-guarded.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,
@@ -321,6 +356,10 @@ takes `trace` as its 4th CLI arg.
   block devices as fabric endpoints; `sim6564 hello` and `sim6564 periph`
   drive them end to end from assembly; null cost verified against the
   frozen measurement table.
+- **IO plane (spec §6.5, v2.4): complete.** Multi-die clusters with
+  conservative windows, one host thread per die, bit-identical at any
+  thread count; `sim6564 dies` spans Armstrong's ring across 16 dies on
+  unmodified program bytes. Null cost verified again.
 - **Measured claims** (`sim6564 ring` — Joe Armstrong's N-processes-in-a-ring
   challenge from Programming Erlang ch. 12, run as N banked contexts on one
   core passing a single-register TXR): **66 cycles per message pass** at

@@ -200,6 +200,10 @@ pub const Machine = struct {
     seq: u64 = 0,
     pending: std.AutoHashMap(u64, PendingSend),
     devices: std.AutoHashMap(u16, DevEndpoint),
+    /// Which die this machine is on the IO plane (§6.5); 0 standalone.
+    die_id: u16 = 0,
+    /// The die's hook onto the plane; PTT entries with route != 0 need it.
+    egress: ?mesh.Egress = null,
     stats: Stats = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) !Machine {
@@ -327,6 +331,42 @@ pub const Machine = struct {
     pub fn device(self: *Machine, coord: u16) ?*dev.Device {
         const ep = self.devices.getPtr(coord) orelse return null;
         return &ep.dev;
+    }
+
+    // ── The IO plane (§6.5): egress hook and window-barrier ingress ──────
+
+    /// Join the IO plane as `die_id`. From here on, sends through PTT
+    /// entries whose route byte is non-zero leave through `egress`.
+    pub fn attachPlane(self: *Machine, die_id: u16, egress: mesh.Egress) void {
+        self.die_id = die_id;
+        self.egress = egress;
+    }
+
+    /// Plane ingress: schedule a cross-die datagram arrival. Call only at
+    /// window barriers, in the cluster's deterministic merge order. The
+    /// destination coordinates were composed on another die, so they are
+    /// validated here; an invalid target vanishes and the sender's timeout
+    /// speaks (§6.1), exactly as for an unroutable local prefix.
+    pub fn injectDeliver(self: *Machine, gram: mesh.Datagram, due: u64) !void {
+        const ok = self.devices.contains(gram.dst_core) or
+            (gram.dst_core < self.cores.len and
+                gram.dst_ctx < self.cfg.contexts_per_core and
+                gram.dst_slot < ring.desc_slots);
+        if (!ok) {
+            self.alloc.free(gram.payload);
+            self.stats.unroutable += 1;
+            return;
+        }
+        try self.events.add(.{ .due = due, .seq = self.nextSeq(), .kind = .{ .deliver = gram } });
+    }
+
+    /// Plane ingress: an ack that crossed home. Window barriers only.
+    pub fn injectAck(self: *Machine, send_id: u64, status: ring.Status, byte_count: u32, due: u64) !void {
+        try self.events.add(.{
+            .due = due,
+            .seq = self.nextSeq(),
+            .kind = .{ .ack = .{ .send_id = send_id, .status = status, .byte_count = byte_count } },
+        });
     }
 
     pub fn writeNear(self: *Machine, core_idx: u16, ctx_idx: u8, offset: u16, bytes: []const u8) void {
@@ -495,6 +535,38 @@ pub const Machine = struct {
         try self.pending.put(send_id, .{ .reply = reply });
 
         const now = self.cores[src_core].clock;
+        if (entry.route != 0) {
+            // Off-die (§6.5): the route byte selected an IO-plane path. The
+            // plane owns it from here — its own latency, its own losses.
+            // The RBC's part is unchanged: OWNED stays set, the timeout
+            // arms, and the ack (if it survives the crossing twice) is an
+            // ordinary completion. Software cannot tell remoteness except
+            // by reading the bill.
+            if (self.egress) |eg| {
+                const g = mesh.Datagram{
+                    .send_id = send_id,
+                    .src_die = self.die_id,
+                    .dst_core = entry.dstCore(),
+                    .dst_ctx = entry.dstContext(),
+                    .dst_slot = entry.dstSlot(),
+                    .offset = offset,
+                    .token = entry.token,
+                    .payload = try self.alloc.dupe(u8, payload),
+                };
+                errdefer self.alloc.free(g.payload);
+                try eg.emit(eg.ctx, .{ .route = entry.route, .sent_at = now, .kind = .{ .gram = g } });
+            } else {
+                // A route with no plane attached: off the edge of the
+                // world. Only the timeout below speaks, honestly.
+                self.stats.unroutable += 1;
+            }
+            try self.events.add(.{
+                .due = now + self.cfg.link.send_timeout,
+                .seq = self.nextSeq(),
+                .kind = .{ .timeout = .{ .send_id = send_id } },
+            });
+            return;
+        }
         // The peripheral row (§7): a device coordinate routes like any
         // other — context/slot bits below the row are device-defined.
         const routable = self.devices.contains(entry.dstCore()) or
@@ -514,6 +586,7 @@ pub const Machine = struct {
         }
         const gram = mesh.Datagram{
             .send_id = send_id,
+            .src_die = self.die_id,
             .dst_core = entry.dstCore(),
             .dst_ctx = entry.dstContext(),
             .dst_slot = entry.dstSlot(),
@@ -638,13 +711,26 @@ pub const Machine = struct {
                 });
             }
         }
-        try self.ackSender(due, gram.send_id, gram.dst_core, status, count);
+        try self.ackSender(due, gram, gram.dst_core, status, count);
     }
 
     /// The ack rides the same fault-injected fabric back: it can be lost,
     /// in which case the sender's timeout tells the truth (§6.1) — "your
-    /// datagram MAY have arrived; you don't get to know."
-    fn ackSender(self: *Machine, due: u64, send_id: u64, from_core: u16, status: ring.Status, count: u32) !void {
+    /// datagram MAY have arrived; you don't get to know." A datagram from
+    /// another die never touches the local pending map (send_ids are
+    /// per-die counters): its ack rides the IO plane home instead.
+    fn ackSender(self: *Machine, due: u64, gram: mesh.Datagram, from_core: u16, status: ring.Status, count: u32) !void {
+        const send_id = gram.send_id;
+        if (gram.src_die != self.die_id) {
+            const eg = self.egress orelse return; // a plane we're not on: drop
+            try eg.emit(eg.ctx, .{ .route = 0, .sent_at = due, .kind = .{ .ack = .{
+                .dst_die = gram.src_die,
+                .send_id = send_id,
+                .status = status,
+                .byte_count = count,
+            } } });
+            return;
+        }
         const pend = self.pending.get(send_id) orelse return; // dup already resolved
         const onchip = pend.reply.core == from_core;
         if (onchip) {
@@ -686,7 +772,7 @@ pub const Machine = struct {
             }
             if (res.reply) |r| try self.deviceReply(ep, due, r);
         }
-        try self.ackSender(due, gram.send_id, gram.dst_core, status, count);
+        try self.ackSender(due, gram, gram.dst_core, status, count);
     }
 
     /// Fire a device reply through the device's PTT: same capability
@@ -714,6 +800,7 @@ pub const Machine = struct {
         self.stats.dev_replies += 1;
         const gram = mesh.Datagram{
             .send_id = self.nextSeq(), // never in pending: no ack sought
+            .src_die = self.die_id,
             .dst_core = entry.dstCore(),
             .dst_ctx = entry.dstContext(),
             .dst_slot = entry.dstSlot(),
@@ -1384,12 +1471,25 @@ pub const Machine = struct {
     /// Run until every context is halted/faulted, the machine deadlocks, or
     /// a core hits max_cycles.
     pub fn run(self: *Machine) !StopReason {
+        // runUntil(∞) never pauses: no clock or due date reaches maxInt.
+        while (true) if (try self.runUntil(std.math.maxInt(u64))) |reason| return reason;
+    }
+
+    /// Advance the die to `horizon`: execution and events strictly before
+    /// it. Returns null when paused at the horizon with work or events
+    /// still ahead — the die proceeds next window — or the terminal
+    /// StopReason once nothing remains at all. A core may overshoot the
+    /// horizon by the width of its last instruction; that is the same
+    /// tolerance the event loop always had ("events strictly before this
+    /// core's clock fire first"), and it is why the IO plane's window can
+    /// equal its base latency exactly.
+    pub fn runUntil(self: *Machine, horizon: u64) !?StopReason {
         while (true) {
             // The core furthest behind in virtual time that has work.
             var busy: ?*Core = null;
             for (self.cores) |*core| {
                 core.dispatch();
-                if (core.hasWork()) {
+                if (core.hasWork() and core.clock < horizon) {
                     if (busy == null or core.clock < busy.?.clock) busy = core;
                 }
             }
@@ -1408,14 +1508,18 @@ pub const Machine = struct {
                 continue;
             }
 
-            // No core has runnable work: advance virtual time to the next
-            // event, or stop.
-            if (next_ev) |due| {
-                for (self.cores) |*core| core.clock = @max(core.clock, due);
+            // No core has runnable work this side of the horizon: advance
+            // virtual time to the next event, pause, or stop.
+            if (next_ev != null and next_ev.? < horizon) {
+                for (self.cores) |*core| core.clock = @max(core.clock, next_ev.?);
                 const ev = self.events.remove();
                 try self.handleEvent(ev);
                 continue;
             }
+            for (self.cores) |*core| {
+                if (core.hasWork()) return null;
+            }
+            if (next_ev != null) return null;
             return self.stopReason();
         }
     }

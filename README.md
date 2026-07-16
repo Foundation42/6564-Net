@@ -4,7 +4,7 @@ Reference simulator for the **6564-Net** — a 64-bit silicon actor machine
 descended from the 6502: five registers, a 4 KB near page, hardware queue
 pairs, IPv6-native network addressing, and free-running concurrency.
 
-- Architecture: [docs/6564-net-architecture-v2.3.md](docs/6564-net-architecture-v2.3.md)
+- Architecture: [docs/6564-net-architecture-v2.4.md](docs/6564-net-architecture-v2.4.md)
 - Implementation record: [docs/simulator.md](docs/simulator.md)
 
 Built with **Zig 0.14.1**.
@@ -73,6 +73,14 @@ ENTROPY 33FB3C626C1F610A
 BLOCK OK
 CYCLES 0000000000003A51
 ```
+
+**dies** runs Armstrong's ring across up to 16 whole dies joined by the
+IO plane (spec §6.5) — each die a complete machine on its own host
+thread, exchanging datagrams at conservative-horizon barriers, **bit-
+identical to the sequential run at any thread count**. The ring program
+is byte-for-byte the single-die one: remoteness is one route byte in a
+PTT entry. `sim6564 dies 16 100 10 2000` keeps all 16 host threads hot
+with die-local rings (3.7× wall-clock over sequential in ReleaseFast).
 
 Everything decodes from one declarative ISA table (`src/isa.zig`): the
 simulator, the assembler, and the disassembly of intent. Adding an
