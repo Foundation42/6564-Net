@@ -661,3 +661,36 @@ test "SPWN of self or a nonexistent context faults the spawner" {
     try testing.expectEqual(machine.StopReason.faulted, try m.run());
     try testing.expectEqual(machine.Fault.bad_descriptor, m.cores[0].contexts[0].fault);
 }
+
+// ── Phase 3: pipeline dataflow ───────────────────────────────────────────
+
+test "pipeline: every item transformed, delivered, verified across a lossy fabric" {
+    const o = try @import("demo_pipeline.zig").simulate(testing.allocator, .{
+        .seed = 0x6564,
+        .loss_ppm4k = 1024,
+        .items = 12,
+        .stages = 2,
+    });
+    try testing.expectEqual(@as(u64, 13), o.consumed); // 12 items + DONE
+    try testing.expectEqual(@as(u64, 0), o.verify_errors);
+    try testing.expectEqual(o.expected_checksum, o.checksum);
+    try testing.expect(o.source_halted);
+    try testing.expect(o.stages_done);
+    // Quiesced, not timed out: the lame-duck shutdown converged.
+    try testing.expectEqual(machine.StopReason.deadlock, o.reason);
+    try testing.expect(o.stats.lost > 0); // the fabric really was hostile
+}
+
+test "pipeline: zero stages (source direct to sink)" {
+    const o = try @import("demo_pipeline.zig").simulate(testing.allocator, .{
+        .seed = 7,
+        .loss_ppm4k = 512,
+        .items = 8,
+        .stages = 0,
+    });
+    try testing.expectEqual(@as(u64, 9), o.consumed);
+    try testing.expectEqual(@as(u64, 0), o.verify_errors);
+    try testing.expectEqual(o.expected_checksum, o.checksum);
+    try testing.expect(o.source_halted);
+    try testing.expectEqual(machine.StopReason.deadlock, o.reason);
+}

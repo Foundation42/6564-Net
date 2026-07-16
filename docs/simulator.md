@@ -15,13 +15,14 @@ what building it taught us. Zig 0.14.1.
 | `src/machine.zig` | Contexts, cores, memory decode, the interpreter, the hardware scheduler, the discrete-event loop. |
 | `src/asm.zig` | Two-pass assembler driven by the same ISA table. |
 | `src/integration_tests.zig` | Assembled programs run end-to-end, §6 semantics exercised. |
-| `src/programs/*.asm` | The actual 6564 programs: ping/pong, supervisor/worker. |
-| `src/demo_pingpong.zig`, `src/demo_supervise.zig` | Demo harnesses (wiring, staging, reporting); also driven by the test suite. |
+| `src/programs/*.asm` | The actual 6564 programs: ping/pong, supervisor/worker, pipe_source/stage/sink. |
+| `src/demo_*.zig` | Demo harnesses (wiring, staging, reporting); also driven by the test suite. |
 | `src/main.zig` | CLI dispatcher over the demos. |
 
 `zig build test` runs everything. Demos:
-`sim6564 [pingpong] [seed] [loss_ppm4k] [rounds] [trace]` and
-`sim6564 supervise [trace]`.
+`sim6564 [pingpong] [seed] [loss_ppm4k] [rounds] [trace]`,
+`sim6564 supervise [trace]`, and
+`sim6564 pipeline [seed] [loss_ppm4k] [items] [stages] [trace]`.
 
 ## Concrete decisions (spec-compatible, but v0.1 chose)
 
@@ -146,6 +147,31 @@ one RAM address with per-actor config blocks passed via the spawn argument —
 shared read-only code pages in practice, which is the "stated position"
 spec open question 3 asks for.
 
+**Ack-on-ownership is the whole of pipeline flow control.** The pipeline
+demo's stages ack upstream the moment they take ownership of an item — not
+when it reaches the sink — which is what lets hops overlap. And the *absence*
+of an ack (HOLD full → drop silently) is complete backpressure: upstream's
+retransmission timer becomes the retry-with-delay loop for free. No credit
+protocol, no window negotiation; the whole discipline is "ack when you have
+room, stay silent when you don't."
+
+**Nothing with an upstream may die.** First pipeline shutdown design: a stage
+halts once its DONE forward is acked. Wrong — its own ack upstream can be
+lost, leaving upstream retransmitting at a corpse forever, hop after hop.
+The fix generalizes the immortal-sink insight: a finished stage goes **lame
+duck** — parked, serving re-acks, timer chain allowed to die — so the
+machine quiesces instead of being kept awake, and every straggler upstream
+still converges. Termination over an unreliable fabric is a *phase*, not an
+instruction.
+
+**Software memory maps are the sharp edge.** The pipeline's first wiring put
+CQ ring storage ($2000, 32×16 B) overlapping the RX descriptor staging at
+$2100; once the CQ wrapped, completion records silently overwrote the staged
+RX entries and every node wedged with honest-looking `no_buffer` rejects.
+Hardware validates tokens and rights but not ring-storage overlap — it
+can't; RAM layout is software's contract. Worth remembering when the OS
+layer arrives.
+
 **Duplicate reject acks race genuine ok acks.** When a duplicated datagram's
 second copy finds no buffer, its reject ack can overtake the first copy's ok
 ack; first-ack-wins means a sender can be told "no buffer" about a message
@@ -168,6 +194,9 @@ takes `trace` as its 4th CLI arg.
   loss/latency/reorder/duplication on off-chip paths (acks included —
   two-generals is live), deterministic replay verified by test.
 - **Phase 3 — actor workloads: in progress.** Ping-pong with end-to-end
-  reliability (`sim6564 pingpong`) and a one-for-one supervision tree with
+  reliability (`sim6564 pingpong`); a one-for-one supervision tree with
   exit links, SPWN restarts, per-child budgets, and watchdog-caught hangs
-  (`sim6564 supervise`). Pipelines and scatter-gather: next.
+  (`sim6564 supervise`); pipeline dataflow over N cores with per-hop
+  stop-and-wait, ack-on-ownership overlap, backpressure by silence, and
+  lame-duck shutdown — every item checksum-verified through 73% loss
+  (`sim6564 pipeline`). Scatter-gather: next.

@@ -18,6 +18,12 @@ const usage_text =
     \\      watchdog-caught hangs to the supervisor's CQ; SPWN restarts from
     \\      per-child budgets (programs/supervisor.asm, worker.asm).
     \\
+    \\  sim6564 pipeline [seed] [loss_ppm4k] [items] [stages] [trace]
+    \\      Dataflow across stages+2 cores: per-hop stop-and-wait on app acks,
+    \\      ack-on-ownership so hops overlap, backpressure by silence, and a
+    \\      poison-pill shutdown (programs/pipe_source.asm, pipe_stage.asm,
+    \\      pipe_sink.asm). Defaults: seed 0x6564, loss 1024, 16 items, 2 stages.
+    \\
     \\  sim6564 help | --help | -h
     \\
 ;
@@ -53,6 +59,16 @@ pub fn main() !void {
     if (std.mem.eql(u8, first, "supervise")) {
         const trace = if (args.next()) |s| std.mem.eql(u8, s, "trace") else false;
         return sim.demo_supervise.run(alloc, .{ .trace = trace });
+    }
+
+    if (std.mem.eql(u8, first, "pipeline")) {
+        var opts = sim.demo_pipeline.Options{};
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        if (args.next()) |s| opts.loss_ppm4k = @min(4096, parseOr(u16, s, "loss_ppm4k"));
+        if (args.next()) |s| opts.items = @min(200, parseOr(u64, s, "items"));
+        if (args.next()) |s| opts.stages = @min(8, parseOr(u16, s, "stages"));
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_pipeline.run(alloc, opts);
     }
 
     // Everything else is the ping-pong demo; a bare first argument is the

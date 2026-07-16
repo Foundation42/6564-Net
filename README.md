@@ -26,6 +26,12 @@ checking plus a retransmission timer built from the fabric itself (a send to
 an unroutable prefix is a guaranteed timeout completion, spec §6.3) — and
 completes its rounds at any loss rate below total.
 
+**pipeline** runs dataflow across `stages+2` cores (`sim6564 pipeline`):
+each hop is stop-and-wait on application acks with sequence dedup, stages
+ack on *ownership* so hops overlap, backpressure is the absence of an ack,
+and shutdown is a poison-pill item with lame-duck draining — every item
+arrives checksum-verified at any loss rate below total.
+
 **supervise** runs a one-for-one supervision tree on one core: exit links
 post a dead worker's obituary to the supervisor's completion queue as an
 ordinary completion record, and `SPWN` resurrects it with fresh registers
