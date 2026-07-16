@@ -55,23 +55,23 @@
         STA !$2A58
         RECV 3
         ; SQ 0: items to downstream (PTT 0)
-        LDA ##$FF00_0000_0000_0000
-        STA !$2400
-        LDA ##$2280
-        STA !$2408
-        LDA #16
-        STA !$2410
         LDA #1
-        STA !$2418
+        STA !$2400          ; op = send
+        LDA ##$FF00_0000_0000_0000
+        STA !$2408          ; target
+        LDA ##$2280
+        STA !$2410          ; buffer
+        LDA ##$1_0000_0010
+        STA !$2418          ; len 16 | cookie 1
         ; SQ 4: acks to upstream (PTT 2)
+        LDA #1
+        STA !$2440          ; op = send
         LDA ##$FF00_0200_0000_0000
-        STA !$2440
+        STA !$2448          ; target
         LDA ##$2260
-        STA !$2448
-        LDA #8
-        STA !$2450
-        LDA #2
-        STA !$2458
+        STA !$2450          ; buffer
+        LDA ##$2_0000_0008
+        STA !$2458          ; len 8 | cookie 2
         LDA #0
         TXR ($838),A        ; arm the timer chain
 main:   LDA $8A0

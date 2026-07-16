@@ -22,14 +22,14 @@
         STA !$2A18
         RECV 2
         ; stage the reply transmit descriptor (SQ 0 → PTT 0)
-        LDA ##$FF00_0000_0000_0000
-        STA !$2400
-        LDA ##$2280
-        STA !$2408
-        LDA #16
-        STA !$2410
         LDA #1
-        STA !$2418
+        STA !$2400          ; op = send
+        LDA ##$FF00_0000_0000_0000
+        STA !$2408          ; target
+        LDA ##$2280
+        STA !$2410          ; buffer
+        LDA ##$1_0000_0010
+        STA !$2418          ; len 16 | cookie 1
 serve:  LSTN 1
         CQPOP 1
         BEQ serve

@@ -14,15 +14,15 @@
         STA !$2110
         LDA #$BB
         STA !$2118
-        ; stage transmit descriptor for echoes
+        ; stage the echo transmit entry (SQE)
+        LDA #1
+        STA !$2400          ; op = send
         LDA ##$FF00_0000_0000_0000
-        STA !$2400
+        STA !$2408          ; target
         LDA ##$2500
-        STA !$2408
-        LDA #8
-        STA !$2410
-        LDA #2
-        STA !$2418
+        STA !$2410          ; buffer
+        LDA ##$2_0000_0008
+        STA !$2418          ; len 8 | cookie 2
 serve0: RECV 2
 serve:  LSTN 1
         CQPOP 1

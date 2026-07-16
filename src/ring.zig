@@ -83,6 +83,9 @@ pub const Tag = enum(u8) {
     exit = 4,
 };
 
+/// Ring-descriptor flags (word1 bits 56..64).
+pub const desc_flag_auto_repost: u8 = 0x01;
+
 pub const Desc = struct {
     base: u64,
     cap_log2: u5,
@@ -90,6 +93,9 @@ pub const Desc = struct {
     watermark: u16,
     /// CQ slot that receives this ring's completions (SQ and RX rings).
     companion_cq: u8,
+    /// Ring behavior flags: bit 0 = AUTO_REPOST (RX rings; on CQPOP of a
+    /// landed delivery, hardware re-enqueues the consumed landing buffer).
+    flags: u8 = 0,
     head: u32,
     tail: u32,
     token: u64,
@@ -123,6 +129,7 @@ pub const Desc = struct {
             .entry_size = @truncate((words[1] >> 8) & 0xFFFF),
             .watermark = @truncate((words[1] >> 32) & 0xFFFF),
             .companion_cq = @truncate((words[1] >> 48) & 0xFF),
+            .flags = @truncate(words[1] >> 56),
             .head = @truncate(words[2] & 0xFFFF_FFFF),
             .tail = @truncate(words[2] >> 32),
             .token = words[3],
@@ -135,17 +142,23 @@ pub const Desc = struct {
             @as(u64, self.cap_log2) |
                 (@as(u64, self.entry_size) << 8) |
                 (@as(u64, self.watermark) << 32) |
-                (@as(u64, self.companion_cq) << 48),
+                (@as(u64, self.companion_cq) << 48) |
+                (@as(u64, self.flags) << 56),
             @as(u64, self.head) | (@as(u64, self.tail) << 32),
             self.token,
         };
     }
 };
 
-/// A completion record, as packed into a CQ entry (§4.2).
+/// A completion record, as packed into a CQ entry (§4.2):
+///   word0 = tag[0..8) | status[8..16) | source ring slot[16..24) | count[32..64)
+/// The source-ring field says which descriptor slot the record pertains to —
+/// the RX ring for deliveries, the SQ for send completions (0 for ring-less
+/// operations like TXR register sends and their timeouts).
 pub const Completion = struct {
     tag: Tag,
     status: Status,
+    slot: u8 = 0,
     byte_count: u32,
     cookie: u64,
 
@@ -153,6 +166,7 @@ pub const Completion = struct {
     pub fn word0(self: Completion) u64 {
         return @as(u64, @intFromEnum(self.tag)) |
             (@as(u64, @intFromEnum(self.status)) << 8) |
+            (@as(u64, self.slot) << 16) |
             (@as(u64, self.byte_count) << 32);
     }
 
@@ -160,38 +174,66 @@ pub const Completion = struct {
         return .{
             .tag = @enumFromInt(@as(u8, @truncate(w0))),
             .status = @enumFromInt(@as(u8, @truncate(w0 >> 8))),
+            .slot = @truncate(w0 >> 16),
             .byte_count = @truncate(w0 >> 32),
             .cookie = cookie,
         };
     }
 };
 
-/// A transmit descriptor, as packed into an SQ entry (§6.2).
-pub const SqEntry = struct {
-    dst: u64,
-    src: u64,
-    len: u32,
-    owned: bool,
-    cookie: u64,
+/// Submission-queue entry operations. Non-exhaustive: unknown bytes decode
+/// to `_` and fault at execution, honestly.
+pub const SqOp = enum(u8) { nop = 0, send = 1, txr = 2, recv = 3, _ };
 
-    pub const owned_bit: u64 = 1 << 63;
+/// A submission entry, 32 bytes, per the MAC & chains sketch §2:
+///
+///   word0  op[0..8) | flags[8..16) | link[16..32) | status_hint[32..64)
+///   word1  target — window pointer (PTT-mapped)
+///   word2  buf (send: buffer base) or value (txr: the 8-byte immediate)
+///   word3  len[0..32) | cookie_lo[32..64)
+///
+/// The completion's cookie is cookie_lo in the low half with a hardware
+/// stamp in the high half: staging slot [32..48), incarnation [48..64) —
+/// records are self-identifying, and a restarted actor can't misattribute
+/// a dead life's completions. `link` is a near-page offset (0 = no chain).
+pub const SqEntry = struct {
+    op: SqOp,
+    flags: u8 = 0,
+    link: u16 = 0,
+    hint: u32 = 0,
+    target: u64,
+    buf: u64,
+    len: u32,
+    cookie_lo: u32,
+
+    /// The §6.2 ownership bit, set at accept, cleared when the completion
+    /// posts. Byte offset 1 of the entry, bit 7.
+    pub const flag_owned: u8 = 0x80;
+    /// Chain to the staged entry at `link` on ok completion (LINK, §3.1).
+    pub const flag_link: u8 = 0x01;
+    /// Resubmit this entry when it completes with timeout (AUTO_REARM, §3.2).
+    pub const flag_auto_rearm: u8 = 0x02;
 
     pub fn unpack(words: [4]u64) SqEntry {
         return .{
-            .dst = words[0],
-            .src = words[1],
-            .len = @truncate(words[2] & 0xFFFF_FFFF),
-            .owned = (words[2] & owned_bit) != 0,
-            .cookie = words[3],
+            .op = @enumFromInt(@as(u8, @truncate(words[0]))),
+            .flags = @truncate(words[0] >> 8),
+            .link = @truncate(words[0] >> 16),
+            .hint = @truncate(words[0] >> 32),
+            .target = words[1],
+            .buf = words[2],
+            .len = @truncate(words[3] & 0xFFFF_FFFF),
+            .cookie_lo = @truncate(words[3] >> 32),
         };
     }
 
     pub fn pack(self: SqEntry) [4]u64 {
         return .{
-            self.dst,
-            self.src,
-            @as(u64, self.len) | (if (self.owned) owned_bit else 0),
-            self.cookie,
+            @as(u64, @intFromEnum(self.op)) | (@as(u64, self.flags) << 8) |
+                (@as(u64, self.link) << 16) | (@as(u64, self.hint) << 32),
+            self.target,
+            self.buf,
+            @as(u64, self.len) | (@as(u64, self.cookie_lo) << 32),
         };
     }
 };
@@ -333,12 +375,49 @@ test "completion word0 packing" {
     try std.testing.expectEqualDeep(c, rt);
 }
 
-test "sq entry ownership bit" {
-    var sqe = SqEntry{ .dst = 1, .src = 2, .len = 3, .owned = false, .cookie = 4 };
-    sqe.owned = true;
+test "sq entry round-trip; OWNED lives in byte 1 bit 7" {
+    var sqe = SqEntry{
+        .op = .send,
+        .flags = SqEntry.flag_owned | SqEntry.flag_link,
+        .link = 0x8C0,
+        .target = 0xFF00_0000_0000_0000,
+        .buf = 0x2500,
+        .len = 16,
+        .cookie_lo = 0xABCD,
+    };
     const words = sqe.pack();
-    try std.testing.expect(words[2] & SqEntry.owned_bit != 0);
     try std.testing.expectEqualDeep(sqe, SqEntry.unpack(words));
+    // The OWNED bit is byte offset 1, bit 7 — clearable with one byte store.
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, words[0], .little);
+    try std.testing.expect(bytes[1] & SqEntry.flag_owned != 0);
+    bytes[1] &= ~SqEntry.flag_owned;
+    const cleared = SqEntry.unpack(.{ std.mem.readInt(u64, &bytes, .little), words[1], words[2], words[3] });
+    try std.testing.expect(cleared.flags & SqEntry.flag_owned == 0);
+}
+
+test "completion carries its source ring slot" {
+    const c = Completion{ .tag = .deliver, .status = .ok, .slot = 3, .byte_count = 16, .cookie = 7 };
+    const rt = Completion.fromWords(c.word0(), c.cookie);
+    try std.testing.expectEqual(@as(u8, 3), rt.slot);
+    try std.testing.expectEqualDeep(c, rt);
+}
+
+test "descriptor flags round-trip" {
+    var d = Desc{
+        .base = 0x2A00,
+        .cap_log2 = 1,
+        .entry_size = 32,
+        .watermark = 0,
+        .companion_cq = 1,
+        .flags = desc_flag_auto_repost,
+        .head = 0,
+        .tail = 0,
+        .token = 0x6564,
+    };
+    try std.testing.expectEqualDeep(d, Desc.unpack(d.pack()));
+    d.flags = 0;
+    try std.testing.expectEqualDeep(d, Desc.unpack(d.pack()));
 }
 
 test "window pointer fields" {

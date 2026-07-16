@@ -32,14 +32,14 @@
         STA !$2A18
         RECV 2
         ; SQ 4: acks to upstream (PTT 2)
+        LDA #1
+        STA !$2440          ; op = send
         LDA ##$FF00_0200_0000_0000
-        STA !$2440
+        STA !$2448          ; target
         LDA ##$2260
-        STA !$2448
-        LDA #8
-        STA !$2450
-        LDA #2
-        STA !$2458
+        STA !$2450          ; buffer
+        LDA ##$2_0000_0008
+        STA !$2458          ; len 8 | cookie 2
 wait:   LSTN 1
         CQPOP 1
         BEQ wait

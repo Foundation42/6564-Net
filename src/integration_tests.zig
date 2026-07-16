@@ -278,14 +278,14 @@ test "phase 2: SEND across a lossy link, retransmit from CQ feedback" {
         \\        LDA ##$6564_6564_6564_6564
         \\        STA !$2500
         \\        ; stage the transmit descriptor (§6.2)
-        \\        LDA ##$FF00_0000_0000_0000  ; dst: PTT slot 0
-        \\        STA !$2400                  ; word0: dst
+        \\        LDA #1
+        \\        STA !$2400                  ; word0: op = send
+        \\        LDA ##$FF00_0000_0000_0000
+        \\        STA !$2408                  ; word1: target (PTT slot 0)
         \\        LDA ##$2500
-        \\        STA !$2408                  ; word1: src buffer
-        \\        LDA #8
-        \\        STA !$2410                  ; word2: length (owned bit clear)
-        \\        LDA #$42
-        \\        STA !$2418                  ; word3: cookie
+        \\        STA !$2410                  ; word2: buffer
+        \\        LDA ##$42_0000_0008
+        \\        STA !$2418                  ; word3: len 8 | cookie $42
         \\retry:  SEND 0
         \\        LSTN 1
         \\        CQPOP 1
@@ -420,13 +420,13 @@ test "determinism: identical seeds produce identical runs" {
             \\        .org $1000
             \\        LDA ##$ABCD
             \\        STA !$2500
-            \\        LDA ##$FF00_0000_0000_0000
+            \\        LDA #1
             \\        STA !$2400
-            \\        LDA ##$2500
+            \\        LDA ##$FF00_0000_0000_0000
             \\        STA !$2408
-            \\        LDA #8
+            \\        LDA ##$2500
             \\        STA !$2410
-            \\        LDA #7
+            \\        LDA ##$7_0000_0008
             \\        STA !$2418
             \\retry:  SEND 0
             \\        LSTN 1

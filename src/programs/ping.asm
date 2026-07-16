@@ -26,15 +26,15 @@
         STA !$2110
         LDA #$AA
         STA !$2118
-        ; stage the transmit descriptor
-        LDA ##$FF00_0000_0000_0000
-        STA !$2400          ; dst: window, PTT slot 0
-        LDA ##$2500
-        STA !$2408          ; src buffer
-        LDA #8
-        STA !$2410          ; length
+        ; stage the transmit entry (SQE: op / target / buf / len+cookie)
         LDA #1
-        STA !$2418          ; cookie
+        STA !$2400          ; word0: op = send
+        LDA ##$FF00_0000_0000_0000
+        STA !$2408          ; word1: target (window, PTT slot 0)
+        LDA ##$2500
+        STA !$2410          ; word2: buffer
+        LDA ##$1_0000_0008
+        STA !$2418          ; word3: len 8 | cookie 1
         LDA #0
         STA !$2500          ; first message value
         TXR ($838),A        ; arm the retransmit timer chain

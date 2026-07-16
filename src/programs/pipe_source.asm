@@ -30,15 +30,15 @@
         LDA #$4C
         STA !$2A58
         RECV 3
-        ; stage the item transmit descriptor (SQ 0 → PTT 0)
-        LDA ##$FF00_0000_0000_0000
-        STA !$2400
-        LDA ##$2280
-        STA !$2408
-        LDA #16
-        STA !$2410          ; items are {seq, val}: 16 bytes
+        ; stage the item transmit entry (SQ 0 → PTT 0)
         LDA #1
-        STA !$2418
+        STA !$2400          ; op = send
+        LDA ##$FF00_0000_0000_0000
+        STA !$2408          ; target
+        LDA ##$2280
+        STA !$2410          ; buffer
+        LDA ##$1_0000_0010
+        STA !$2418          ; len 16 (items are {seq, val}) | cookie 1
         LDA #0
         TXR ($838),A        ; arm the timer chain
 main:   LDA $890

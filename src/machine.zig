@@ -436,6 +436,7 @@ pub const Machine = struct {
             self.cqPost(reply.core, reply.ctx, reply.cq_slot, .{
                 .tag = reply.tag,
                 .status = .reject_capability,
+                .slot = reply.src_slot,
                 .byte_count = 0,
                 .cookie = reply.cookie,
             });
@@ -553,6 +554,7 @@ pub const Machine = struct {
             self.cqPost(gram.dst_core, gram.dst_ctx, d.companion_cq, .{
                 .tag = .deliver,
                 .status = status,
+                .slot = gram.dst_slot,
                 .byte_count = count,
                 .cookie = landing_cookie,
             });
@@ -563,6 +565,7 @@ pub const Machine = struct {
             self.cqPost(gram.dst_core, gram.dst_ctx, d.companion_cq, .{
                 .tag = .deliver,
                 .status = status,
+                .slot = gram.dst_slot,
                 .byte_count = 0,
                 .cookie = gram.token,
             });
@@ -592,19 +595,19 @@ pub const Machine = struct {
         const kv = self.pending.fetchRemove(send_id) orelse return;
         const reply = kv.value.reply;
         if (status == .timeout) self.stats.timeouts += 1;
-        // Release the transmit buffer: clear the OWNED bit (§6.2). The
-        // completion record below is the release fence software observes.
+        // Release the transmit buffer: clear the OWNED bit (§6.2) — byte 1
+        // bit 7 of the staged entry, one byte store. The completion record
+        // below is the release fence software observes.
         if (reply.sqe_addr != 0) {
             const core = &self.cores[reply.core];
-            if (ramSlice(core, reply.sqe_addr + 16, 8)) |w2| {
-                var v = std.mem.readInt(u64, w2[0..8], .little);
-                v &= ~ring.SqEntry.owned_bit;
-                std.mem.writeInt(u64, w2[0..8], v, .little);
+            if (ramSlice(core, reply.sqe_addr + 1, 1)) |b| {
+                b[0] &= ~ring.SqEntry.flag_owned;
             } else |_| {}
         }
         self.cqPost(reply.core, reply.ctx, reply.cq_slot, .{
             .tag = reply.tag,
             .status = status,
+            .slot = reply.src_slot,
             .byte_count = byte_count,
             .cookie = reply.cookie,
         });
@@ -916,24 +919,39 @@ pub const Machine = struct {
                 const entry_mem = try ramSlice(core, sqe_addr, d.entry_size);
                 var words: [4]u64 = undefined;
                 for (&words, 0..) |*w, i| w.* = std.mem.readInt(u64, entry_mem[i * 8 ..][0..8], .little);
-                var sqe = ring.SqEntry.unpack(words);
-                if (!ring.isWindow(sqe.dst)) return error.NoCapability;
-                const src = try bytesAt(core, ctx, sqe.src, sqe.len);
-                // Accepted: hardware takes the buffer (§6.2).
-                sqe.owned = true;
-                std.mem.writeInt(u64, entry_mem[16..24], sqe.pack()[2], .little);
+                const sqe = ring.SqEntry.unpack(words);
+                if (!ring.isWindow(sqe.target)) return error.NoCapability;
+                // Payload by op: a block transfer, or an 8-byte immediate.
+                var txr_payload: [8]u8 = undefined;
+                const payload: []const u8 = switch (sqe.op) {
+                    .send => try bytesAt(core, ctx, sqe.buf, sqe.len),
+                    .txr => blk: {
+                        std.mem.writeInt(u64, &txr_payload, sqe.buf, .little);
+                        break :blk &txr_payload;
+                    },
+                    else => return error.BadDescriptor,
+                };
+                // Accepted: hardware takes the buffer (§6.2). OWNED is byte 1
+                // bit 7 of the staged entry.
+                entry_mem[1] |= ring.SqEntry.flag_owned;
                 d.tail +%= 1;
                 // The RBC drains submissions immediately in v0.1 (see docs),
                 // so head follows tail; the ring exists architecturally.
                 d.head = d.tail;
                 writeDesc(ctx, desc_slot, d);
-                try self.sendDatagram(core.id, ring.windowPtt(sqe.dst), ring.windowOffset(sqe.dst), src, .{
+                // The hardware cookie stamp: staging slot and incarnation in
+                // the high half, software's cookie_lo in the low half.
+                const cookie = @as(u64, sqe.cookie_lo) |
+                    (@as(u64, desc_slot) << 32) |
+                    (@as(u64, @as(u16, @truncate(ctx.gen))) << 48);
+                try self.sendDatagram(core.id, ring.windowPtt(sqe.target), ring.windowOffset(sqe.target), payload, .{
                     .core = core.id,
                     .ctx = ctx_idx,
                     .cq_slot = d.companion_cq,
-                    .tag = .send,
-                    .cookie = sqe.cookie,
+                    .tag = if (sqe.op == .txr) .txr else .send,
+                    .cookie = cookie,
                     .sqe_addr = sqe_addr,
+                    .src_slot = desc_slot,
                 });
             },
             .recv => {

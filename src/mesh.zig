@@ -44,6 +44,9 @@ pub const ReplyPath = struct {
     /// RAM address of the transmit descriptor whose OWNED bit must clear when
     /// the completion posts (0 = none, e.g. TXR register sends).
     sqe_addr: u64 = 0,
+    /// SQ descriptor slot the entry was staged in — the completion record's
+    /// source-ring field (0 for ring-less TXR register sends).
+    src_slot: u8 = 0,
 };
 
 /// A datagram in flight.

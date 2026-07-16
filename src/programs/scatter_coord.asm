@@ -21,13 +21,13 @@
         .org $1000
         LDA ##$FF00_0000_0000_0000
         STA $838            ; timer pointer (PTT 0)
-        ; task SQE constants; dst is rewritten per scatter
-        LDA ##$2280
-        STA !$2408
-        LDA #16
-        STA !$2410
+        ; task SQE constants; the target is rewritten per scatter
         LDA #1
-        STA !$2418
+        STA !$2400          ; op = send
+        LDA ##$2280
+        STA !$2410          ; buffer
+        LDA ##$1_0000_0010
+        STA !$2418          ; len 16 | cookie 1
         ; post all result landing buffers (entries pre-staged in RAM)
         LDX $8A8
 rposts: RECV 2
@@ -90,7 +90,7 @@ scatter:
 sloop:  LDA $900,X
         BNE snext           ; already answered
         LDA $A00,X
-        STA !$2400          ; SQE dst = this worker's window pointer
+        STA !$2408          ; SQE target = this worker's window pointer
         TXA
         LSR
         LSR
