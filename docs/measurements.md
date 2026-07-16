@@ -417,3 +417,33 @@ Null-cost trivially holds (the compiler is a new module; the frozen
 table doesn't move). 85 tests green. Next: convert the rest of the
 demo corpus, then item 4 — flip the bank-collapse convention in
 compiled output and read this same table.
+
+## The system block: deployment is data (2026-07-16)
+
+Christian's call, made before the second demo could demand a second
+harness: joe programs should not need a hand-written demo_*.zig each.
+What a harness actually does — place actors, wire capabilities, stage
+parameters, arm timers — is mechanical once the ABI is fixed, so it
+moved into the language as a declarative `system` block:
+
+    system {
+        pinger = Pinger(ponger, 8)
+        ponger = Ponger(pinger)
+    }
+
+Naming another instance as an argument IS the capability wiring: the
+loader (src/joe_run.zig) allocates a PTT slot in the sender's core,
+aims it at the target's RX ring, and stages the window value as the
+addr parameter — §7's "the loader binds it like wiring two actors,"
+automated. Placement is one instance per core unless `on N` says
+otherwise; instances sharing a core become contexts, each compiled
+into its own $1000 block (code, rings, buffers, stack), which is what
+made the compiler's Layout parameter necessary and is what the ring
+conversion will need at 200 contexts per core (test-guarded: both
+pingpong actors forced onto core 0 still complete).
+
+`sim6564 joe <file.joe>` now runs ANY system-bearing source. The
+migration is byte-identical: the loader-run pingpong reproduces the
+hand-harness numbers exactly (1,056 instructions / 11,125 cycles),
+and demo_joe.zig is deleted — the first harness was also the last.
+87 tests green.

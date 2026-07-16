@@ -46,21 +46,55 @@ pub const Diagnostic = struct {
 
 pub const Error = error{ Syntax, Semantics, Unsupported, OutOfMemory };
 
-// ── Runtime ABI constants ────────────────────────────────────────────────
+// ── Runtime ABI ──────────────────────────────────────────────────────────
+
+/// Where one compiled actor instance lives. Every RAM address the compiler
+/// emits derives from this, so any number of instances can share a core —
+/// the loader hands each context its own block. The defaults describe a
+/// lone actor in the classic demo shape (code $1000, data $2000).
+pub const Layout = struct {
+    origin: u64 = 0x1000,
+    data: u64 = 0x2000,
+    /// PTT slot of the black hole the `after` timer ticks against —
+    /// allocated by the loader, per core.
+    timer_ptt: u16 = 1,
+
+    pub fn cqBase(l: Layout) u64 {
+        return l.data; // 16 completion entries
+    }
+    pub fn rxBase(l: Layout) u64 {
+        return l.data + 0x100; // 2 landing entries, AUTO_REPOST
+    }
+    pub fn timerBase(l: Layout) u64 {
+        return l.data + 0x140;
+    }
+    pub fn sqBase(l: Layout) u64 {
+        return l.data + 0x160;
+    }
+    pub fn staging(l: Layout) u64 {
+        return l.data + 0x180; // outbound message image (64B)
+    }
+    pub fn land0(l: Layout) u64 {
+        return l.data + 0x200;
+    }
+    pub fn land1(l: Layout) u64 {
+        return l.data + 0x240;
+    }
+    pub fn timerWindow(l: Layout) u64 {
+        return (@as(u64, 0xFF) << 56) | (@as(u64, l.timer_ptt) << 40);
+    }
+};
 
 pub const abi = struct {
-    pub const sq_base: u64 = 0x2400;
-    pub const cq_base: u64 = 0x2000;
-    pub const rx_base: u64 = 0x2100;
-    pub const timer_base: u64 = 0x2480;
     pub const timer_desc: u8 = 5;
-    pub const land0: u64 = 0x2200;
-    pub const land1: u64 = 0x2240;
     pub const land_cap: u64 = 64;
-    pub const msg_staging: u64 = 0x2500;
     pub const param_base: u16 = 0x800;
     pub const timer_cookie: u64 = 0x77;
-    pub const timer_window: u64 = 0xFF00_0100_0000_0000; // PTT 1, the black hole
+    /// One instance block: code at +0, data at +$800, stack down from
+    /// +$1000. The loader places context c of a core at
+    /// ram_base + c * block_size.
+    pub const block_size: u64 = 0x1000;
+    pub const data_off: u64 = 0x800;
 };
 
 // ── AST ──────────────────────────────────────────────────────────────────
@@ -149,9 +183,26 @@ const Actor = struct {
     handlers: []Handler,
 };
 
+/// One line of a `system` block: `name = Actor(args) [on core]`.
+/// An argument that names another instance is a capability reference —
+/// the loader wires a PTT slot and stages the window value.
+pub const InstanceDecl = struct {
+    name: []const u8,
+    actor: []const u8,
+    args: []const Arg,
+    core: ?u16,
+    line: usize,
+
+    pub const Arg = union(enum) {
+        int: u64,
+        ref: []const u8,
+    };
+};
+
 const Program = struct {
     messages: []Message,
     actors: []Actor,
+    system: []InstanceDecl,
 };
 
 // ── Lexer ────────────────────────────────────────────────────────────────
@@ -339,15 +390,58 @@ const Parser = struct {
     fn parseProgram(self: *Parser) Error!Program {
         var msgs = std.ArrayList(Message).init(self.arena);
         var actors = std.ArrayList(Actor).init(self.arena);
+        var system = std.ArrayList(InstanceDecl).init(self.arena);
         try self.advance();
         while (self.tok.kind != .eof) {
             if (try self.eatKw("message")) {
                 try msgs.append(try self.parseMessage());
             } else if (try self.eatKw("actor")) {
                 try actors.append(try self.parseActor());
-            } else return self.fail("expected `message` or `actor`", Error.Syntax);
+            } else if (try self.eatKw("system")) {
+                _ = try self.expect(.lbrace, "{");
+                while (self.tok.kind != .rbrace) {
+                    try system.append(try self.parseInstance());
+                }
+                try self.advance(); // }
+            } else return self.fail("expected `message`, `actor` or `system`", Error.Syntax);
         }
-        return .{ .messages = try msgs.toOwnedSlice(), .actors = try actors.toOwnedSlice() };
+        return .{
+            .messages = try msgs.toOwnedSlice(),
+            .actors = try actors.toOwnedSlice(),
+            .system = try system.toOwnedSlice(),
+        };
+    }
+
+    /// `name = Actor(arg, …) [on N]` — args are ints or instance names.
+    fn parseInstance(self: *Parser) Error!InstanceDecl {
+        const line = self.tok.line;
+        const name = try self.expect(.ident, "instance name");
+        _ = try self.expect(.assign, "=");
+        const actor = try self.expect(.ident, "actor name");
+        _ = try self.expect(.lparen, "(");
+        var args = std.ArrayList(InstanceDecl.Arg).init(self.arena);
+        while (self.tok.kind != .rparen) {
+            switch (self.tok.kind) {
+                .int => try args.append(.{ .int = self.tok.value }),
+                .ident => try args.append(.{ .ref = self.tok.text }),
+                else => return self.fail("instance args are literals or instance names", Error.Syntax),
+            }
+            try self.advance();
+            if (self.tok.kind == .comma) try self.advance();
+        }
+        try self.advance(); // )
+        var core: ?u16 = null;
+        if (try self.eatKw("on")) {
+            const n = try self.expect(.int, "core number");
+            core = @intCast(n.value);
+        }
+        return .{
+            .name = name.text,
+            .actor = actor.text,
+            .args = try args.toOwnedSlice(),
+            .core = core,
+            .line = line,
+        };
     }
 
     fn parseType(self: *Parser) Error!Type {
@@ -628,6 +722,7 @@ const Gen = struct {
     out: std.ArrayList(u8),
     prog: *const Program,
     actor: *const Actor,
+    layout: Layout,
     diag: ?*Diagnostic,
 
     labels: usize = 0,
@@ -679,7 +774,7 @@ const Gen = struct {
         return std.fmt.allocPrint(self.arena, "##${X}", .{v}) catch return Error.OutOfMemory;
     }
 
-    fn layout(self: *Gen) Error!void {
+    fn layoutSlots(self: *Gen) Error!void {
         var off: u16 = abi.param_base;
         for (self.actor.params) |p| {
             try self.slots.put(p.name, off);
@@ -878,7 +973,7 @@ const Gen = struct {
             .halt => |h| {
                 if (self.uses_timer) {
                     try self.w("        LDA #2              ; disarm the timer", .{});
-                    try self.w("        STA !${X}", .{abi.timer_base});
+                    try self.w("        STA !${X}", .{self.layout.timerBase()});
                 }
                 try self.w("        {s}", .{if (h.ok) "HLT" else "BRK"});
             },
@@ -949,36 +1044,40 @@ const Gen = struct {
                 try self.w("        STA ${X}", .{self.off_acc});
             }
             try self.w("        LDA ${X}", .{self.off_acc});
-            try self.w("        STA !${X}", .{abi.msg_staging + word * 8});
+            try self.w("        STA !${X}", .{self.layout.staging() + word * 8});
         }
         try self.w("        LDA #1              ; SQE: op = send", .{});
-        try self.w("        STA !${X}", .{abi.sq_base});
+        try self.w("        STA !${X}", .{self.layout.sqBase()});
         try self.w("        LDA ${X}", .{tslot});
-        try self.w("        STA !${X}", .{abi.sq_base + 8});
-        try self.w("        LDA ##${X}", .{abi.msg_staging});
-        try self.w("        STA !${X}", .{abi.sq_base + 16});
+        try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
+        try self.w("        LDA ##${X}", .{self.layout.staging()});
+        try self.w("        STA !${X}", .{self.layout.sqBase() + 16});
         try self.w("        LDA ##${X}", .{@as(u64, 1) << 32 | msg.wire_size});
-        try self.w("        STA !${X}", .{abi.sq_base + 24});
+        try self.w("        STA !${X}", .{self.layout.sqBase() + 24});
         try self.w("        SEND 0", .{});
     }
 
     // ── The actor: prologue, body, serve loop ────────────────────────────
 
-    fn emit(self: *Gen, origin: u64) Error!void {
-        try self.layout();
+    fn emit(self: *Gen) Error!void {
+        try self.layoutSlots();
         try self.w("; joe v1 — actor {s} (compiled; do not edit)", .{self.actor.name});
-        try self.w("        .org ${X}", .{origin});
+        try self.w("        .org ${X}", .{self.layout.origin});
 
         // RX ring: two landing buffers, cookie = buffer address.
         try self.w("; landing buffers (cap-2 AUTO_REPOST ring)", .{});
-        inline for (.{ .{ abi.land0, 0 }, .{ abi.land1, 32 } }) |lb| {
-            try self.w("        LDA ##${X}", .{lb[0]});
-            try self.w("        STA !${X}", .{abi.rx_base + lb[1]});
-            try self.w("        STA !${X}", .{abi.rx_base + lb[1] + 24});
+        const lands = [2]struct { buf: u64, off: u64 }{
+            .{ .buf = self.layout.land0(), .off = 0 },
+            .{ .buf = self.layout.land1(), .off = 32 },
+        };
+        for (lands) |lb| {
+            try self.w("        LDA ##${X}", .{lb.buf});
+            try self.w("        STA !${X}", .{self.layout.rxBase() + lb.off});
+            try self.w("        STA !${X}", .{self.layout.rxBase() + lb.off + 24});
             try self.w("        LDA #{d}", .{abi.land_cap});
-            try self.w("        STA !${X}", .{abi.rx_base + lb[1] + 8});
+            try self.w("        STA !${X}", .{self.layout.rxBase() + lb.off + 8});
             try self.w("        LDA #0", .{});
-            try self.w("        STA !${X}", .{abi.rx_base + lb[1] + 16});
+            try self.w("        STA !${X}", .{self.layout.rxBase() + lb.off + 16});
         }
         try self.w("        RECV 2", .{});
         try self.w("        RECV 2", .{});
@@ -986,13 +1085,13 @@ const Gen = struct {
         if (self.uses_timer) {
             try self.w("; the after-timer: AUTO_REARM TXR into the black hole (spec §6.3)", .{});
             try self.w("        LDA ##$202", .{});
-            try self.w("        STA !${X}", .{abi.timer_base});
-            try self.w("        LDA ##${X}", .{abi.timer_window});
-            try self.w("        STA !${X}", .{abi.timer_base + 8});
+            try self.w("        STA !${X}", .{self.layout.timerBase()});
+            try self.w("        LDA ##${X}", .{self.layout.timerWindow()});
+            try self.w("        STA !${X}", .{self.layout.timerBase() + 8});
             try self.w("        LDA #0", .{});
-            try self.w("        STA !${X}", .{abi.timer_base + 16});
+            try self.w("        STA !${X}", .{self.layout.timerBase() + 16});
             try self.w("        LDA ##${X}", .{abi.timer_cookie << 32});
-            try self.w("        STA !${X}", .{abi.timer_base + 24});
+            try self.w("        STA !${X}", .{self.layout.timerBase() + 24});
             try self.w("        SEND {d}", .{abi.timer_desc});
         }
 
@@ -1076,7 +1175,7 @@ const Gen = struct {
 
 // ── Public interface ─────────────────────────────────────────────────────
 
-pub const Slot = struct { name: []const u8, off: u16 };
+pub const Slot = struct { name: []const u8, off: u16, addr: bool = false };
 
 pub const Result = struct {
     alloc: std.mem.Allocator,
@@ -1100,12 +1199,71 @@ pub const Result = struct {
     }
 };
 
+/// The deployment described by a source's `system` block, owned copy —
+/// everything a loader needs to place, wire and stage instances.
+pub const Plan = struct {
+    alloc: std.mem.Allocator,
+    instances: []PlanInstance,
+
+    pub const PlanInstance = struct {
+        name: []const u8,
+        actor: []const u8,
+        args: []InstanceDecl.Arg,
+        core: ?u16,
+        line: usize,
+    };
+
+    pub fn deinit(self: *Plan) void {
+        for (self.instances) |inst| {
+            self.alloc.free(inst.name);
+            self.alloc.free(inst.actor);
+            for (inst.args) |a| {
+                if (a == .ref) self.alloc.free(a.ref);
+            }
+            self.alloc.free(inst.args);
+        }
+        self.alloc.free(self.instances);
+    }
+};
+
+/// Parse a source's `system` block into a deployment plan.
+pub fn plan(alloc: std.mem.Allocator, source: []const u8, diag: ?*Diagnostic) Error!Plan {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var parser = Parser{
+        .arena = arena_state.allocator(),
+        .lex = .{ .src = source },
+        .tok = undefined,
+        .diag = diag,
+    };
+    const prog = try parser.parseProgram();
+    var out = std.ArrayList(Plan.PlanInstance).init(alloc);
+    errdefer out.deinit();
+    for (prog.system) |inst| {
+        var args = std.ArrayList(InstanceDecl.Arg).init(alloc);
+        for (inst.args) |a| {
+            try args.append(switch (a) {
+                .int => |v| .{ .int = v },
+                .ref => |r| .{ .ref = try alloc.dupe(u8, r) },
+            });
+        }
+        try out.append(.{
+            .name = try alloc.dupe(u8, inst.name),
+            .actor = try alloc.dupe(u8, inst.actor),
+            .args = try args.toOwnedSlice(),
+            .core = inst.core,
+            .line = inst.line,
+        });
+    }
+    return .{ .alloc = alloc, .instances = try out.toOwnedSlice() };
+}
+
 /// Compile one actor out of a .joe source file to 6564 assembly.
 pub fn compile(
     alloc: std.mem.Allocator,
     source: []const u8,
     actor_name: []const u8,
-    origin: u64,
+    layout: Layout,
     diag: ?*Diagnostic,
 ) Error!Result {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1150,18 +1308,23 @@ pub fn compile(
         .out = std.ArrayList(u8).init(alloc),
         .prog = &prog,
         .actor = actor,
+        .layout = layout,
         .diag = diag,
         .slots = std.StringHashMap(u16).init(arena),
     };
     errdefer gen.out.deinit();
-    try gen.emit(origin);
+    try gen.emit();
 
     var params = std.ArrayList(Slot).init(alloc);
     errdefer params.deinit();
     var vars = std.ArrayList(Slot).init(alloc);
     errdefer vars.deinit();
     for (actor.params) |p| {
-        try params.append(.{ .name = try alloc.dupe(u8, p.name), .off = gen.slots.get(p.name).? });
+        try params.append(.{
+            .name = try alloc.dupe(u8, p.name),
+            .off = gen.slots.get(p.name).?,
+            .addr = p.ty == .addr,
+        });
     }
     for (actor.vars) |v| {
         try vars.append(.{ .name = try alloc.dupe(u8, v.name), .off = gen.slots.get(v.name).? });
@@ -1185,7 +1348,7 @@ test "joe: pingpong compiles and assembles" {
     const asm6564 = @import("asm.zig");
     inline for (.{ "Pinger", "Ponger" }) |name| {
         var diag = Diagnostic{};
-        var r = compile(testing.allocator, src, name, 0x1000, &diag) catch |err| {
+        var r = compile(testing.allocator, src, name, .{}, &diag) catch |err| {
             std.debug.print("joe {s}: line {d}: {s}\n", .{ name, diag.line, diag.message });
             return err;
         };
@@ -1210,6 +1373,18 @@ test "joe: v1 refuses what it cannot yet say, honestly" {
     var diag = Diagnostic{};
     try testing.expectError(
         Error.Unsupported,
-        compile(testing.allocator, src, "A", 0x1000, &diag),
+        compile(testing.allocator, src, "A", .{}, &diag),
     );
+}
+
+test "joe: the system block parses into a plan" {
+    const src = @embedFile("programs/pingpong.joe");
+    var p = try plan(testing.allocator, src, null);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 2), p.instances.len);
+    try testing.expectEqualStrings("pinger", p.instances[0].name);
+    try testing.expectEqualStrings("Pinger", p.instances[0].actor);
+    try testing.expectEqual(@as(usize, 2), p.instances[0].args.len);
+    try testing.expectEqualStrings("ponger", p.instances[0].args[0].ref);
+    try testing.expectEqual(@as(u64, 8), p.instances[0].args[1].int);
 }

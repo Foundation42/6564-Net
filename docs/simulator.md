@@ -441,10 +441,18 @@ matter for extending it:
 
 - **The runtime ABI is ping.asm's wiring, verbatim** (desc 0/1/2 =
   SQ/CQ/RX, timer SQ at slot 5, landing buffers with cookie = buffer
-  address, AUTO_REARM black-hole timer with reserved cookie $77). A
-  compiled actor drops into any harness that speaks that shape;
-  `demo_joe.zig` is the reference loader — staging params into the
-  near page is all a loader is.
+  address, AUTO_REARM black-hole timer with reserved cookie $77) —
+  but parameterized: the compiler takes a `Layout` (origin, data base,
+  timer PTT slot) so any number of instances can share a core, each in
+  its own $1000 block.
+- **Deployment is data: the `system` block.** `name = Actor(args) [on
+  core]` in the source; an argument naming another instance is a
+  capability, and the loader (`src/joe_run.zig`) allocates the PTT
+  slot, aims it at the target's RX ring, and stages the window value
+  as the addr param. `sim6564 joe <file.joe>` runs any system-bearing
+  source — there are no per-program joe harnesses, by design. The
+  loader also translates the machine's stop reason into system terms:
+  every instance halted-or-parked with no faults is *quiescence*.
 - **Wire format**: word0 low 16 bits = tag (declaration order,
   1-based), fields packed at their own alignment so none straddles a
   word; ≤ 8 bytes total rides TXR (one register datagram), larger

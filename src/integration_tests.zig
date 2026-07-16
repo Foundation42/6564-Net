@@ -788,28 +788,54 @@ test "Tier 0 FP: FP32 narrows on store, widens on load — rounding is visible o
     try testing.expectEqual(@as(u64, 0x3FF8000000000000), resultAt(&m, 0x22A0));
 }
 
-test "joe: compiled pingpong survives the hostile fabric, sequence-checked" {
-    const demo_joe = @import("demo_joe.zig");
+test "joe: the loader runs pingpong.joe from its system block, sequence-checked" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/pingpong.joe");
     // The same gauntlet the hand-written protocol runs: 25% loss with
     // duplication, and then deep loss. joe cannot say "transport ack" —
     // the end-to-end protocol the compiler emits must carry it anyway.
     for ([_]u16{ 1024, 3000 }) |loss| {
-        const o = try demo_joe.simulate(testing.allocator, .{
-            .loss_ppm4k = loss,
-            .rounds = 8,
-        });
-        try testing.expect(o.ping_halted);
-        try testing.expectEqual(@as(u64, 8), o.seq);
+        var o = try joe_run.simulate(testing.allocator, src, .{ .loss_ppm4k = loss });
+        defer o.deinit();
+        try testing.expectEqual(machine.CtxState.halted, o.instance("pinger").?.state);
+        try testing.expectEqual(machine.CtxState.parked, o.instance("ponger").?.state);
+        try testing.expectEqual(@as(u64, 8), o.varOf("pinger", "seq").?);
     }
 }
 
-test "joe: compiled pingpong is deterministic, seed for seed" {
-    const demo_joe = @import("demo_joe.zig");
-    const a = try demo_joe.simulate(testing.allocator, .{ .seed = 0xBEEF, .rounds = 6 });
-    const b = try demo_joe.simulate(testing.allocator, .{ .seed = 0xBEEF, .rounds = 6 });
+test "joe: the loader is deterministic, seed for seed" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/pingpong.joe");
+    var a = try joe_run.simulate(testing.allocator, src, .{ .seed = 0xBEEF });
+    defer a.deinit();
+    var b = try joe_run.simulate(testing.allocator, src, .{ .seed = 0xBEEF });
+    defer b.deinit();
     try testing.expectEqual(a.cycles, b.cycles);
     try testing.expectEqual(a.stats.instructions, b.stats.instructions);
     try testing.expectEqual(a.stats.lost, b.stats.lost);
+}
+
+test "joe: two instances share a core in separate blocks — placement is data" {
+    const joe_run = @import("joe_run.zig");
+    // Same program, both actors forced onto core 0 as two contexts:
+    // the loader gives each its own $1000 block, so nothing collides
+    // and the protocol still completes.
+    const base = @embedFile("programs/pingpong.joe");
+    const src = try std.mem.concat(testing.allocator, u8, &.{
+        base[0 .. std.mem.indexOf(u8, base, "system {").?],
+        \\system {
+        \\    pinger = Pinger(ponger, 8) on 0
+        \\    ponger = Ponger(pinger) on 0
+        \\}
+        ,
+    });
+    defer testing.allocator.free(src);
+    var o = try joe_run.simulate(testing.allocator, src, .{});
+    defer o.deinit();
+    try testing.expectEqual(machine.CtxState.halted, o.instance("pinger").?.state);
+    try testing.expectEqual(@as(u64, 8), o.varOf("pinger", "seq").?);
+    try testing.expectEqual(@as(u8, 0), o.instance("pinger").?.ctx);
+    try testing.expectEqual(@as(u8, 1), o.instance("ponger").?.ctx);
 }
 
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {

@@ -35,3 +35,12 @@ actor Ponger(peer addr) {
             send peer, Pong{p.seq}
     }
 }
+
+// The deployment is part of the program: naming another instance as an
+// argument IS the capability wiring — the loader allocates a PTT slot
+// in the sender's core, aims it at the target's RX ring, and stages
+// the window value as the addr parameter.
+system {
+    pinger = Pinger(ponger, 8)
+    ponger = Ponger(pinger)
+}
