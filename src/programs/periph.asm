@@ -188,14 +188,7 @@ rq1:    LSTN 1
         CMP #1
         BNE rq1
         LDA $880
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         BNE fail            ; a device said no: loud, not wedged
         RTS
@@ -238,14 +231,7 @@ pc1:    LSTN 1
         CMP #2
         BNE pc1
         LDA $888
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         BNE fail
         RTS
@@ -275,10 +261,7 @@ hx1:    LDA $860
         AND #$0F
         STA ($878)
         LDA $860
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #4
         STA $860
         CLC
         LDA $878

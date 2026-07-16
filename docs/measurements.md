@@ -289,3 +289,25 @@ win for the V-cache CCD exactly in the band where 96 MB holds what
 32 MB cannot, narrowing again once both overflow to DRAM (96 MB still
 catches ~3/4 of a 128 MB set). Placement changes seconds, never bits —
 verified counts and cycle totals are identical under every policy.
+
+## Counted shifts landed (2026-07-16, spec v2.5 §8)
+
+`ASL/LSR/ROL/ROR #n` in the $?B column — 2 cycles at any count (a
+barrel shifter is constant-time silicon). 186 single-bit shift lines
+across 17 programs collapsed to counted forms. The frozen table moves,
+for the best reason:
+
+| demo | code bytes | instructions | cycles | ctx switches | verified |
+|---|---:|---:|---:|---:|---|
+| pingpong (0x6564/1024/8) | 606 | 688 | 11022 | 38 | yes |
+| supervise (fixed) | 168 | 1376 | 4043 | 0 | yes |
+| pipeline (0x6564/1024/16/2) | 1402 | 7410 | 66703 | 339 | yes |
+| scatter (0x6564/1024/6) | 573 | 1318 | 10621 | 35 | yes |
+| ring (64x100) | 71 | 160320 | 386884 | 12863 | yes |
+| **total** | 2820 | 171112 | 479273 | 13275 | yes |
+
+vs the v2.2 frozen table: instructions 217,341 → 171,112 (**-21%**),
+cycles 524,034 → 479,273 (-8.5%), code 2877 → 2820. Benchmarks of
+record: Armstrong ring 66 → **60 cy/pass** (200x1000 steady state);
+Big Brother 61 → **55 cy/absorbed message** at 10,000 senders. This
+table is the new frozen baseline for future null-cost checks.

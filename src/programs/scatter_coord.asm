@@ -52,22 +52,13 @@ wait:   LSTN 1
 timer:  JSR scatter         ; nudge whoever hasn't answered
         BRA wait
 del:    TYA                 ; a delivery: clean?
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE wait            ; rejected: nothing landed
         STX $8E0            ; cookie = the landing buffer's address
         LDA ($8E0)          ; word0: worker id
-        ASL
-        ASL
-        ASL
+        ASL #3
         TAX                 ; X = id·8
         LDA $900,X
         BNE dup             ; already gathered: a stale duplicate
@@ -98,9 +89,7 @@ sloop:  LDA $900,X
         LDA $A00,X
         STA !$2408          ; SQE target = this worker's window pointer
         TXA
-        LSR
-        LSR
-        LSR
+        LSR #3
         STA !$2380          ; task word0: worker id
         LDA $B00,X
         STA !$2388          ; task word1: the value to square

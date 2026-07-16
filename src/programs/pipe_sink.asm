@@ -56,14 +56,7 @@ wait:   LSTN 1
         CMP #3
         BNE wait            ; our ack sends' transport acks: ignore
         TYA
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE wait            ; rejected: nothing landed

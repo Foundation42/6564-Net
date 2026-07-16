@@ -45,14 +45,7 @@ serve:  LSTN 1
         CMP #3
         BNE serve           ; send-acks et al: keep listening
         TYA
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE serve           ; rejected dup / noise: just listen

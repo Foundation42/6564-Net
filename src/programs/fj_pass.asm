@@ -25,28 +25,14 @@ serve:  LSTN 1
         CMP #1
         BNE serve           ; (nothing else visits this CQ)
         TYA                 ; our pass resolved: how?
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BEQ fin             ; passed on: our part is done
         SEND 0              ; rejected or timed out: offer it again
         BRA serve
 got:    TYA
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE serve

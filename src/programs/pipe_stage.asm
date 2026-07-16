@@ -136,14 +136,7 @@ timer:  LDA $8A0
         SEND 0
         BRA wait
 del:    TYA                 ; clean delivery? which ring?
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE wait            ; rejected: nothing landed

@@ -21,12 +21,7 @@ sweep:  LDA #1
         LDA $868
         STA $870            ; touches remaining this sweep
 line:   LDA $858            ; addr = base + idx * 64
-        ASL
-        ASL
-        ASL
-        ASL
-        ASL
-        ASL
+        ASL #6
         CLC
         ADC $840
         STA $860

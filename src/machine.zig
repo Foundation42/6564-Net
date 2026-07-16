@@ -1121,27 +1121,45 @@ pub const Machine = struct {
             .cmp => compare(ctx, ctx.a, try self.loadOperand(core, ctx, enc.mode, imm, ea)),
             .cpx => compare(ctx, ctx.x, try self.loadOperand(core, ctx, enc.mode, imm, ea)),
             .cpy => compare(ctx, ctx.y, try self.loadOperand(core, ctx, enc.mode, imm, ea)),
+            // Shifts: bare = one bit; `#n` = a barrel shift (count mod 64,
+            // 0 = no-op, flags untouched). Carry is the last bit shifted
+            // out — identical to n single-bit shifts, at constant cost.
             .asl => {
-                ctx.p.c = (ctx.a >> 63) != 0;
-                ctx.a <<= 1;
-                ctx.p.setNZ(ctx.a);
+                const n: u6 = if (enc.mode == .imm8) @truncate(imm) else 1;
+                if (n != 0) {
+                    const sh: u6 = @intCast(64 - @as(u7, n));
+                    ctx.p.c = (ctx.a >> sh) & 1 != 0;
+                    ctx.a <<= n;
+                    ctx.p.setNZ(ctx.a);
+                }
             },
             .lsr => {
-                ctx.p.c = (ctx.a & 1) != 0;
-                ctx.a >>= 1;
-                ctx.p.setNZ(ctx.a);
+                const n: u6 = if (enc.mode == .imm8) @truncate(imm) else 1;
+                if (n != 0) {
+                    ctx.p.c = (ctx.a >> (n - 1)) & 1 != 0;
+                    ctx.a >>= n;
+                    ctx.p.setNZ(ctx.a);
+                }
             },
             .rol => {
-                const cin: u64 = @intFromBool(ctx.p.c);
-                ctx.p.c = (ctx.a >> 63) != 0;
-                ctx.a = (ctx.a << 1) | cin;
-                ctx.p.setNZ(ctx.a);
+                const n: u6 = if (enc.mode == .imm8) @truncate(imm) else 1;
+                var i: u7 = 0;
+                while (i < n) : (i += 1) {
+                    const cin: u64 = @intFromBool(ctx.p.c);
+                    ctx.p.c = (ctx.a >> 63) != 0;
+                    ctx.a = (ctx.a << 1) | cin;
+                    ctx.p.setNZ(ctx.a);
+                }
             },
             .ror => {
-                const cin: u64 = @intFromBool(ctx.p.c);
-                ctx.p.c = (ctx.a & 1) != 0;
-                ctx.a = (ctx.a >> 1) | (cin << 63);
-                ctx.p.setNZ(ctx.a);
+                const n: u6 = if (enc.mode == .imm8) @truncate(imm) else 1;
+                var i: u7 = 0;
+                while (i < n) : (i += 1) {
+                    const cin: u64 = @intFromBool(ctx.p.c);
+                    ctx.p.c = (ctx.a & 1) != 0;
+                    ctx.a = (ctx.a >> 1) | (cin << 63);
+                    ctx.p.setNZ(ctx.a);
+                }
             },
             .inc => if (enc.mode == .acc) {
                 ctx.a +%= 1;

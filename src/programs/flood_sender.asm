@@ -27,14 +27,7 @@ wait:   LSTN 1
         CMP #2
         BNE wait
         TYA                 ; our send resolved: how?
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BEQ done            ; landed: we are heard

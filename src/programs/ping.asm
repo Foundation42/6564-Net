@@ -70,14 +70,7 @@ wait:   LSTN 1
 timer:  INC $818            ; count a retransmission
         BRA send            ; resend; AUTO_REARM keeps the clock ticking
 got:    TYA                 ; a delivery completion: clean?
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE wait            ; rejected inbound (dup noise): keep waiting

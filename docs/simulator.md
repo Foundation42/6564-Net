@@ -29,7 +29,8 @@ what building it taught us. Zig 0.14.1.
 **Opcode numbering.** Inherited 6502/65C02 instructions keep their classic
 opcode bytes (`LDA #imm` = `A9`, the 65C02 zp-indirect column becomes
 near-indirect, `HLT` sits in STP's `DB`). New I/O/concurrency ops occupy the
-`0x?7` column NMOS never defined; imm64 variants sit in `0x?3`.
+`0x?7` column NMOS never defined; imm64 variants sit in `0x?3`; counted
+shifts (`LSR #n` etc., v2.5) sit in `0x?B` at 2 cycles flat.
 
 **Near page: 4 KB, of which the bottom 2 KB is the descriptor table** — 64
 slots × 32 bytes. Slots 0/1/2 are architecturally the context's SQ/CQ/default
@@ -426,7 +427,7 @@ takes `trace` as its 4th CLI arg.
   unmodified program bytes. Null cost verified again.
 - **Measured claims** (`sim6564 ring` — Joe Armstrong's N-processes-in-a-ring
   challenge from Programming Erlang ch. 12, run as N banked contexts on one
-  core passing a single-register TXR): **66 cycles per message pass** at
+  core passing a single-register TXR): **60 cycles per message pass** at
   steady state, receive-to-forward, scheduler and completion handling
   included, flat from 64×100 to 200×1000 passes. A "process" costs one
   41-byte register bank plus its near page; 200 of them fit on a core with

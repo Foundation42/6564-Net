@@ -220,6 +220,12 @@ pub const table = [_]Encoding{
     // ── Shifts (accumulator) ─────────────────────────────────────────────
     e(.asl, .acc, 0x0A, 1),    e(.lsr, .acc, 0x4A, 1),
     e(.rol, .acc, 0x2A, 1),    e(.ror, .acc, 0x6A, 1),
+    // Counted shifts (v2.5): `LSR #n` etc. — a barrel shifter is
+    // constant-time silicon, so any count costs 2 cycles. Count is taken
+    // mod 64; 0 is a no-op that leaves the flags alone. Carry = the last
+    // bit shifted out, exactly as n single-bit shifts would leave it.
+    e(.asl, .imm8, 0x0B, 2),   e(.lsr, .imm8, 0x4B, 2),
+    e(.rol, .imm8, 0x2B, 2),   e(.ror, .imm8, 0x6B, 2),
     // ── Increment / decrement ────────────────────────────────────────────
     e(.inc, .acc, 0x1A, 1),    e(.inc, .near, 0xE6, 4),
     e(.inc, .abs, 0xEE, 5),    e(.dec, .acc, 0x3A, 1),

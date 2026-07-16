@@ -35,14 +35,7 @@ serve:  LSTN 1
         CMP #3
         BNE serve           ; our own TXR's transport ack: ignore
         TYA
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE serve           ; rejected: nothing landed

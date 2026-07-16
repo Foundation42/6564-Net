@@ -28,14 +28,7 @@ wait:   LSTN 1
         CMP #2              ; our send's completion?
         BNE wait
         TYA                 ; …with what verdict?
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         BNE send            ; no confirmation: say it again
         HLT

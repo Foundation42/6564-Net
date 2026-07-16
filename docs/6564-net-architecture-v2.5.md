@@ -13,6 +13,12 @@
 > world is the one device that does not replay — everything on our side
 > of the socket still does. §10 gains the capstone: `http_get.asm`
 > speaks HTTP/1.1 through the net device and fetches a real web page.
+> Also: **counted shifts** — `ASL/LSR/ROL/ROR #n` in the `$?B` column
+> (§8): a barrel shifter is constant-time silicon, so any count costs 2
+> cycles; count mod 64, count 0 a flag-preserving no-op, carry = the
+> last bit shifted out. Field-extraction idioms shrink from eight-line
+> shift ladders to one instruction; the corpus retires 21% fewer
+> instructions, and the ring pass drops from 66 to **60 cycles**.
 
 > **Changes from v2.3** *(carried forward)*: **§6.5 — Leaving the Die: the IO Plane**.
 > Multi-die machines become architectural: the PTT entry's routing hint is
@@ -60,7 +66,7 @@ Modern architectures pay enormous taxes that are invisible only because they are
 
 The result is a **silicon actor machine**: each hardware context is an actor with a mailbox (its receive ring), an address (its IPv6-mapped window), asynchronous message semantics, and — as of this revision — hardware-enforced supervision and fault isolation. The 6564-Net is the native substrate for actor-model operating systems: it executes in hardware what systems like MiOS implement in software, and what Erlang/OTP proved in production.
 
-These claims are no longer only claims. The reference simulator implements every phase of §10, and the measured cost of a full receive-to-forward message pass between hardware actors is **66 cycles** (§2.2).
+These claims are no longer only claims. The reference simulator implements every phase of §10, and the measured cost of a full receive-to-forward message pass between hardware actors is **60 cycles** (§2.2).
 
 ---
 
@@ -94,7 +100,7 @@ This is the load-bearing insight of the architecture. Total architectural state 
 
 This is the XMOS xCORE / barrel-processor lineage, and it is what makes the rest of the architecture honest. When an I/O instruction says "the core proceeds immediately to the next runnable continuation," that is a literal single-cycle bank switch, not a euphemism for a scheduler invocation.
 
-**Measured.** The reference simulator runs Armstrong's N-processes-in-a-ring challenge (*Programming Erlang*, ch. 12) as N banked contexts on one core passing a single-register `TXR`: **66 cycles per message pass** at steady state, receive-to-forward, scheduler and completion handling included, flat from 64 contexts × 100 passes to 200 × 1000. A "process" costs one 41-byte register bank plus its near page; 200 fit on a core with room to spare. The figure is guarded by a <100-cycle regression test.
+**Measured.** The reference simulator runs Armstrong's N-processes-in-a-ring challenge (*Programming Erlang*, ch. 12) as N banked contexts on one core passing a single-register `TXR`: **60 cycles per message pass** at steady state, receive-to-forward, scheduler and completion handling included, flat from 64 contexts × 100 passes to 200 × 1000. A "process" costs one 41-byte register bank plus its near page; 200 fit on a core with room to spare. The figure is guarded by a <100-cycle regression test.
 
 ---
 
@@ -374,6 +380,8 @@ Descriptor operands (`desc`) are one-byte near-page offsets. The general-purpose
 
 Instructions remain byte-granular and variable-length in the 6502 tradition: one-byte opcodes, with operands sized by addressing mode. Inherited 6502/65C02 instructions retain their classic opcode bytes; new I/O and concurrency operations occupy columns NMOS never defined. Near-page modes keep the hot path (queue ops, continuation ops) at 2–3 bytes per instruction. Code density is a stated goal: instruction fetch is a bandwidth consumer like any other, and a message-passing machine should not spend its bandwidth describing itself.
 
+**Counted shifts (v2.5).** `ASL/LSR/ROL/ROR #n` occupy the `$?B` column: a 64-bit machine extracts fields, and eight-line single-bit shift ladders were instruction burn with no silicon justification — a barrel shifter is constant-time, so any count costs 2 cycles. Count is taken mod 64; count 0 is a no-op that preserves the flags; carry is the last bit shifted out, exactly as n single-bit shifts would leave it. The bare single-bit forms keep their classic bytes and behavior.
+
 ---
 
 ## 9. Prior Art and Positioning
@@ -416,7 +424,7 @@ The three representative workloads all run, built entirely from CQ feedback and 
 
 ### Measured Claims
 
-- **66 cycles per message pass** on Armstrong's ring (§2.2), flat across two orders of magnitude of scale, regression-guarded.
+- **60 cycles per message pass** on Armstrong's ring (§2.2), flat across two orders of magnitude of scale, regression-guarded.
 - 200 complete actors (register bank + near page) on one core, with room to spare.
 - Zero-cycle context switch exercised on every park and yield in every test.
 
@@ -471,4 +479,4 @@ Recorded honestly, for future revisions. Two of v2's questions are resolved; the
 
 ---
 
-*The 6502 proved that a small, honest machine could carry a revolution. The 6564-Net is a wager that the same virtues — tiny state, predictable behavior, semantics that never lie — are exactly what a planet-scale mesh of communicating actors has been waiting for. The wager now has its first receipts: sixty-six cycles, two hundred actors to a core, every lesson the fabric taught folded back into the page you are reading — and, as of this revision, `HELLO, WORLD` in the machine's own voice.*
+*The 6502 proved that a small, honest machine could carry a revolution. The 6564-Net is a wager that the same virtues — tiny state, predictable behavior, semantics that never lie — are exactly what a planet-scale mesh of communicating actors has been waiting for. The wager now has its first receipts: sixty cycles, two hundred actors to a core, every lesson the fabric taught folded back into the page you are reading — and, as of this revision, `HELLO, WORLD` in the machine's own voice.*

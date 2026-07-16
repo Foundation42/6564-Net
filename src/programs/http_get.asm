@@ -52,14 +52,7 @@
         JSR req
         JSR getrx           ; A = connection id
         STA $858
-        ASL
-        ASL
-        ASL
-        ASL
-        ASL
-        ASL
-        ASL
-        ASL
+        ASL #8
         STA $868            ; conn << 8, ready to OR with ops
 
         ; ── send the GET ──
@@ -107,14 +100,7 @@ rwait:  LSTN 1
         CMP #1
         BNE rwait
         LDA $880
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         BEQ rok             ; accepted: bytes (or an empty try-again) follow
         CMP #3
@@ -128,38 +114,7 @@ rstash: STX $8C8
         BRA rwait
 rok:    JSR getrx           ; wait the reply; $8C0 = its completion word0
         LDA $8C0            ; count = bits 32.. of the delivery record
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #32
         AND ##$FF_FFFF
         BEQ pump            ; empty: nothing yet, ask again
         ORA ##$1_0000_0000  ; len | cookie 1
@@ -205,14 +160,7 @@ rq1:    LSTN 1
         CMP #1
         BNE rq1
         LDA $880
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         BNE fail
         RTS

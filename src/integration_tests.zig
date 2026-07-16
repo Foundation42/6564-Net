@@ -1698,3 +1698,41 @@ test "net device: http_get.asm fetches from a real (local) TCP server" {
     try testing.expect(std.mem.indexOf(u8, o.text, "HELLO FROM THE OUTSIDE") != null);
     try testing.expect(o.stats.dev_replies >= 2); // the open reply + data
 }
+
+test "counted shifts: LSR #n / ASL #n match n single-bit shifts" {
+    const src =
+        \\        .org $1000
+        \\        LDA ##$1234_5678_9ABC_DEF0
+        \\        LSR #32
+        \\        STA !$2280          ; high half
+        \\        LDA ##$8000_0000_0000_0001
+        \\        ASL #1
+        \\        STA !$2288          ; carry out, bit gone
+        \\        LDA #1
+        \\        ASL #63
+        \\        STA !$2290          ; 1 << 63
+        \\        LDA ##$FF
+        \\        LSR #0
+        \\        STA !$2298          ; count 0: untouched
+        \\        HLT
+    ;
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x8000,
+    });
+    defer m.deinit();
+    try assembleInto(&m, 0, src);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    const ram = m.cores[0].ram;
+    const word = struct {
+        fn at(r: []u8, addr: u64) u64 {
+            return std.mem.readInt(u64, r[addr - machine.ram_base ..][0..8], .little);
+        }
+    }.at;
+    try testing.expectEqual(@as(u64, 0x1234_5678), word(ram, 0x2280));
+    try testing.expectEqual(@as(u64, 2), word(ram, 0x2288));
+    try testing.expectEqual(@as(u64, 1) << 63, word(ram, 0x2290));
+    try testing.expectEqual(@as(u64, 0xFF), word(ram, 0x2298));
+}

@@ -89,14 +89,7 @@ timer:  LDA $890
         SEND 0
         BRA wait
 del:    TYA                 ; a delivery: clean, and on the ack ring?
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE wait            ; rejected: nothing landed

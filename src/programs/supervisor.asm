@@ -26,14 +26,7 @@ loop:   LSTN 1
         CMP #4              ; exit notification?
         BNE loop            ; anything else is not our business
         TYA                 ; status = (word0 >> 8) & $FF
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #5              ; fault?
         BEQ crashed
@@ -43,9 +36,7 @@ gone:   DEC $860            ; a child has departed (clean, or abandoned)
 crashed:
         TXA                 ; X = cookie = child id | incarnation<<32
         AND ##$FF           ; keep the id; the incarnation half is for
-        ASL                 ; supervisors that track lives (we restart
-        ASL                 ; unconditionally, so any obituary counts)
-        ASL                 ; ×8: stride into the budget table
+        ASL #3        ; supervisors that track lives (we restart
         TAX
         LDA $A00,X          ; this child's remaining restart budget
         BEQ gone            ; spent: abandon it
@@ -54,8 +45,7 @@ crashed:
         STA $A00,X
         INC !$2780          ; count the restart, visibly
         TXA                 ; A = 8 × child id
-        ASL
-        ASL                 ; ×32: stride into the spawn-block table
+        ASL #2        ; ×32: stride into the spawn-block table
         TAX
         SPWN $900,X         ; rise again, little actor
         BRA loop

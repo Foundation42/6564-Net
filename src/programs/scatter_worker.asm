@@ -46,14 +46,7 @@ serve:  LSTN 1
         CMP #3
         BNE serve           ; transport acks: ignore
         TYA
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
-        LSR
+        LSR #8
         AND #$FF
         CMP #0
         BNE serve           ; rejected: nothing landed

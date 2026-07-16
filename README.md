@@ -41,11 +41,11 @@ on timer ticks, and idempotent workers make duplicates harmless.
 **ring** is Joe Armstrong's challenge (Programming Erlang, ch. 12): N
 processes in a ring, a message around M times (`sim6564 ring 200 1000` =
 200,000 passes). Processes are banked contexts, the message is one TXR
-register-datagram, and a pass costs **66 cycles** at steady state —
+register-datagram, and a pass costs **60 cycles** at steady state —
 scheduler, completion queue, and zero-cycle context switch included.
 
 **bigbrother** floods one actor from 10,000 senders (`sim6564
-bigbrother`): 61 cycles per absorbed message, every voice heard exactly
+bigbrother`): 55 cycles per absorbed message, every voice heard exactly
 once, zero completion records lost — saturation is backpressure, not
 corruption. **forkjoin** forks one message to 1,000 workers through a
 LINK-chain-plus-hierarchy tree, relays it, and joins it back to one
@@ -71,7 +71,7 @@ disk sector with verification, and prints its own cycle bill:
 6564 PERIPHERAL BUS CHECK
 ENTROPY 33FB3C626C1F610A
 BLOCK OK
-CYCLES 0000000000003A51
+CYCLES 00000000000039A7
 ```
 
 **dies** runs Armstrong's ring across up to 16 whole dies joined by the
