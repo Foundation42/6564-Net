@@ -1,6 +1,6 @@
 # sim6564 — Reference Simulator, v0.1 Implementation Record
 
-Companion to [6564-net-architecture-v2.md](6564-net-architecture-v2.md). The
+Companion to [6564-net-architecture-v2.1.md](6564-net-architecture-v2.1.md). The
 spec says what the machine *is*; this records what v0.1 of the simulator
 *decided* where the spec left latitude, what it deliberately simplifies, and
 what building it taught us. Zig 0.14.1.
@@ -66,7 +66,9 @@ index / event sequence number → bit-identical replay from a seed.
 
 **Supervision (Phase 3, spec §5.4).** Exit links are per-context
 `(supervisor ctx, CQ slot)` pairs set by the harness (`linkSupervisor`); on
-halt/fault the machine posts the exit completion. `SPWN` resets the target's
+halt/fault the machine posts the exit completion, cookie = context id |
+incarnation << 32, so supervisors can discard obituaries from lives they
+already replaced. `SPWN` resets the target's
 registers, bumps its incarnation counter, and queues its continuation; the
 near page and exit link survive. Run-queue entries carry the incarnation
 number, so a dead life's continuations are skipped at dispatch. `SPWN` of

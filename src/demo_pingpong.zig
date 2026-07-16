@@ -50,7 +50,18 @@ fn wire(m: *machine.Machine, core: u16) void {
     });
 }
 
-pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
+pub const Outcome = struct {
+    reason: machine.StopReason,
+    final: u64,
+    retransmissions: u64,
+    served: u64,
+    ping_halted: bool,
+    cycles: u64,
+    stats: machine.Stats,
+};
+
+/// Build, run, and measure — shared by the CLI demo and the test suite.
+pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
     var m = try machine.Machine.init(alloc, .{
         .cores = 2,
         .contexts_per_core = 1,
@@ -110,6 +121,24 @@ pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
 
     const reason = try m.run();
 
+    const ping = &m.cores[0].contexts[0];
+    const pong = &m.cores[1].contexts[0];
+    var max_clock: u64 = 0;
+    for (m.cores) |*c| max_clock = @max(max_clock, c.clock);
+    return .{
+        .reason = reason,
+        .final = std.mem.readInt(u64, m.cores[0].ram[0x2280 - machine.ram_base ..][0..8], .little),
+        .retransmissions = std.mem.readInt(u64, ping.near[0x818..][0..8], .little),
+        .served = std.mem.readInt(u64, pong.near[0x820..][0..8], .little),
+        .ping_halted = ping.state == .halted,
+        .cycles = max_clock,
+        .stats = m.stats,
+    };
+}
+
+pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
+    const o = try simulate(alloc, opts);
+
     const stdout = std.io.getStdOut().writer();
     try stdout.print(
         \\sim6564 — ping-pong across a hostile fabric
@@ -122,14 +151,8 @@ pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
         opts.rounds,
     });
 
-    const ping = &m.cores[0].contexts[0];
-    const pong = &m.cores[1].contexts[0];
-    const final = std.mem.readInt(u64, m.cores[0].ram[0x2280 - machine.ram_base ..][0..8], .little);
-    const retries = std.mem.readInt(u64, ping.near[0x818..][0..8], .little);
-    const served = std.mem.readInt(u64, pong.near[0x820..][0..8], .little);
-
-    const verdict = switch (reason) {
-        .deadlock => if (ping.state == .halted)
+    const verdict = switch (o.reason) {
+        .deadlock => if (o.ping_halted)
             "ping completed; pong still parked listening — machine quiesced"
         else
             "DEADLOCK: ping did not finish",
@@ -149,14 +172,14 @@ pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
         \\          {d} context switches
         \\
     , .{
-        verdict,                  final,
-        retries,                  served,
-        m.cores[0].clock,         m.cores[1].clock,
-        m.stats.instructions,     m.stats.sends,
-        m.stats.unroutable,       m.stats.delivered,
-        m.stats.lost,             m.stats.duplicated,
-        m.stats.timeouts,         m.stats.rejects,
-        m.stats.context_switches,
+        verdict,                  o.final,
+        o.retransmissions,        o.served,
+        o.cycles,                 o.cycles,
+        o.stats.instructions,     o.stats.sends,
+        o.stats.unroutable,       o.stats.delivered,
+        o.stats.lost,             o.stats.duplicated,
+        o.stats.timeouts,         o.stats.rejects,
+        o.stats.context_switches,
     });
-    if (opts.rounds > 0 and ping.state != .halted) std.process.exit(1);
+    if (opts.rounds > 0 and !o.ping_halted) std.process.exit(1);
 }

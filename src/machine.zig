@@ -671,19 +671,21 @@ pub const Machine = struct {
         }
     }
 
-    /// Fire the exit link, if any (§5): a completion record is the one and
+    /// Fire the exit link, if any (§5.4): a completion record is the one and
     /// only obituary — status ok for a clean HLT, fault (with the fault code
-    /// in byte_count) for a crash; cookie = the child's context id.
+    /// in byte_count) for a crash. The cookie identifies the deceased
+    /// precisely: context id in the low half, incarnation in the high half,
+    /// so a supervisor can discard obituaries from lives it already replaced.
     fn notifyExit(self: *Machine, core: *Core, ctx_idx: u8, ctx: *Context) void {
         const link = ctx.sup_link orelse return;
-        self.trace("c{d}x{d} @{d} exit ({s}) → supervisor x{d}", .{
-            core.id, ctx_idx, core.clock, @tagName(ctx.state), link.ctx,
+        self.trace("c{d}x{d} @{d} exit ({s}, gen{d}) → supervisor x{d}", .{
+            core.id, ctx_idx, core.clock, @tagName(ctx.state), ctx.gen, link.ctx,
         });
         self.cqPost(core.id, link.ctx, link.cq_slot, .{
             .tag = .exit,
             .status = if (ctx.state == .faulted) .fault else .ok,
             .byte_count = @intFromEnum(ctx.fault),
-            .cookie = ctx_idx,
+            .cookie = @as(u64, ctx_idx) | (@as(u64, ctx.gen) << 32),
         });
     }
 

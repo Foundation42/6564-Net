@@ -34,6 +34,11 @@ const usage_text =
     \\      around M times — N·M passes, timed in cycles per pass. All N
     \\      processes are banked contexts on one core (programs/ring_node.asm).
     \\
+    \\  sim6564 measure
+    \\      Run every demo at its frozen baseline config and emit the
+    \\      instructions / cycles / code-bytes table (the MAC & chains
+    \\      go/no-go data; see docs/6564-mac-and-chains-sketch.md §6).
+    \\
     \\  sim6564 help | --help | -h
     \\
 ;
@@ -79,6 +84,9 @@ pub fn main() !void {
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
         return sim.demo_scatter.run(alloc, opts);
     }
+
+    if (std.mem.eql(u8, first, "measure"))
+        return sim.measure.run(alloc);
 
     if (std.mem.eql(u8, first, "ring")) {
         var opts = sim.demo_ring.Options{};

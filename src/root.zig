@@ -1,5 +1,5 @@
 //! sim6564 — reference simulator for the 6564-Net architecture.
-//! See docs/6564-net-architecture-v2.md and docs/simulator.md.
+//! See docs/6564-net-architecture-v2.1.md and docs/simulator.md.
 
 pub const isa = @import("isa.zig");
 pub const ring = @import("ring.zig");
@@ -11,6 +11,7 @@ pub const demo_supervise = @import("demo_supervise.zig");
 pub const demo_pipeline = @import("demo_pipeline.zig");
 pub const demo_scatter = @import("demo_scatter.zig");
 pub const demo_ring = @import("demo_ring.zig");
+pub const measure = @import("measure.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

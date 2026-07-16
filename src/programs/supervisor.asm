@@ -41,9 +41,10 @@ gone:   DEC $860            ; a child has departed (clean, or abandoned)
         BNE loop
         HLT                 ; all children accounted for: our work is done
 crashed:
-        TXA                 ; X = cookie = child context id
-        ASL
-        ASL
+        TXA                 ; X = cookie = child id | incarnation<<32
+        AND ##$FF           ; keep the id; the incarnation half is for
+        ASL                 ; supervisors that track lives (we restart
+        ASL                 ; unconditionally, so any obituary counts)
         ASL                 ; ×8: stride into the budget table
         TAX
         LDA $A00,X          ; this child's remaining restart budget
