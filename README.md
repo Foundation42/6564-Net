@@ -83,9 +83,13 @@ assembly (`sim6564 joec src/programs/pingpong.joe Pinger` to read it)
 and completes its rounds at 73% packet loss, sequence-checked, at
 +10% code and +1% wall clock against the hand-written ping.asm.
 Deployment is data: a `system` block in the source names instances
-and their wiring, and the loader places them, allocates PTT
-capabilities, stages parameters and arms timers — any `.joe` file
-runs without a harness.
+and their wiring — `ws = Worker[1000](ls)` declares a thousand
+replicas, aligned to their lieutenants by the loader — and placement,
+PTT capabilities, parameter staging and timers are all loader work:
+any `.joe` file runs without a harness. The capstone is
+`src/programs/forkjoin.joe`: a 1,009-actor fork-join tree, every hop
+acked through the tree because joe cannot see transport verdicts,
+joining to the exact sum at 25% packet loss.
 
 **mandel** renders the Mandelbrot set in IEEE 754 double precision on
 a 6502 descendant (`sim6564 mandel`): Tier 0 scalar FP lives on the
