@@ -926,6 +926,114 @@ test "joe: hello — the console is just another name in the system block" {
     try testing.expectEqualStrings("HELLO, WORLD - JOE SPEAKS.\n", o.console.?);
 }
 
+test "joe: fork-join — replication, groups, for; the tree is the reliability" {
+    const joe_run = @import("joe_run.zig");
+    // The shipped forkjoin.joe runs 8x125 (sim6564 joe src/programs/
+    // forkjoin.joe); the suite runs the same shape at 2x20 so Debug
+    // stays quick. Every hop acks through the tree — workers retry
+    // Results until acked, lieutenants retry Done, the root lame-ducks
+    // instead of halting so no straggler is ever stranded.
+    const src =
+        \\message Task { v u32, j u32 }
+        \\message Result { k u32, v u64 }
+        \\message Ok { k u32 }
+        \\message Done { k u32, v u64 }
+        \\message OkD { k u32 }
+        \\actor Root(ls []addr, task u32, quota u32) {
+        \\    var got [16]u64
+        \\    var n u64 = 0
+        \\    var sum u64 = 0
+        \\    for (k, l) in ls { send l, Task{task, k} }
+        \\    serve {
+        \\        case Done(d):
+        \\            send ls[d.k], OkD{d.k}
+        \\            if got[d.k] == 0 {
+        \\                got[d.k] = 1
+        \\                n += 1
+        \\                sum += d.v
+        \\                if n == quota { quiesce }
+        \\            }
+        \\        after 700:
+        \\            for (k, l) in ls { if got[k] == 0 { send l, Task{task, k} } }
+        \\    }
+        \\    quiesce {
+        \\        case Done(d): send ls[d.k], OkD{d.k}
+        \\    }
+        \\}
+        \\actor Lieutenant(ws []addr, root addr, quota u32) {
+        \\    var got [32]u64
+        \\    var n u64 = 0
+        \\    var sum u64 = 0
+        \\    var fired u64 = 0
+        \\    var myk u64 = 0
+        \\    var task u64 = 0
+        \\    serve {
+        \\        case Task(t) where fired == 0:
+        \\            fired = 1
+        \\            myk = t.j
+        \\            task = t.v
+        \\            for (j, w) in ws { send w, Task{t.v, j} }
+        \\        case Task(_):
+        \\            for (j, w) in ws { if got[j] == 0 { send w, Task{task, j} } }
+        \\        case Result(r):
+        \\            send ws[r.k], Ok{r.k}
+        \\            if got[r.k] == 0 {
+        \\                got[r.k] = 1
+        \\                n += 1
+        \\                sum += r.v
+        \\                if n == quota { send root, Done{myk, sum} }
+        \\            }
+        \\        case OkD(_):
+        \\            quiesce
+        \\        after 700:
+        \\            if n == quota { send root, Done{myk, sum} }
+        \\    }
+        \\    quiesce {
+        \\        case Result(r): send ws[r.k], Ok{r.k}
+        \\    }
+        \\}
+        \\actor Worker(lt addr) {
+        \\    var j u64 = 0
+        \\    var val u64 = 0
+        \\    var need u64 = 0
+        \\    serve {
+        \\        case Task(t):
+        \\            j = t.j
+        \\            val = t.v + 1
+        \\            need = 1
+        \\            send lt, Result{t.j, val}
+        \\        case Ok(o) where o.k == j:
+        \\            quiesce
+        \\        case Ok(_):
+        \\        after 700:
+        \\            if need == 1 { send lt, Result{j, val} }
+        \\    }
+        \\}
+        \\system {
+        \\    root = Root(ls, 500, 2) on 0
+        \\    ls = Lieutenant[2](ws, root, 20)
+        \\    ws = Worker[40](ls)
+        \\}
+    ;
+    for ([_]u16{ 0, 1024 }) |loss| {
+        var o = try joe_run.simulate(testing.allocator, src, .{
+            .loss_ppm4k = loss,
+            .dup_ppm4k = if (loss == 0) 0 else 128,
+        });
+        defer o.deinit();
+        try testing.expectEqual(@as(u64, 2), o.varOf("root", "n").?);
+        try testing.expectEqual(@as(u64, 40 * 501), o.varOf("root", "sum").?);
+        try testing.expectEqual(machine.CtxState.parked, o.instance("root").?.state);
+        try testing.expectEqual(@as(u64, 20 * 501), o.varOf("ls[0]", "sum").?);
+        try testing.expectEqual(@as(u64, 20 * 501), o.varOf("ls[1]", "sum").?);
+        // Total quiescence: every worker got its ack and stopped its
+        // clock, or the machine would have run to max_cycles.
+        for (o.instances) |inst| {
+            try testing.expect(inst.state == .parked);
+        }
+    }
+}
+
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {
     // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
     // FSUB/FCMP results, every one of which must round exactly as the

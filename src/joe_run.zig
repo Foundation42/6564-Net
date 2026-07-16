@@ -4,27 +4,30 @@
 //! once the ABI is fixed:
 //!
 //!   placement    one instance per core unless `on N` says otherwise;
-//!                instances sharing a core become contexts, each in its
-//!                own $1000 block (code, rings, buffers, stack). An
-//!                actor's `spawn`s become further contexts on its core.
+//!                `Actor[N]` replicas pack onto fresh cores (bounded by
+//!                contexts AND a conservative PTT budget), each context
+//!                in its own $2000 block. An actor's `spawn`s become
+//!                further contexts on its core.
 //!   wiring       an instance name as an argument = a capability: a PTT
-//!                slot in the sender's core, aimed at the target's RX
-//!                ring — the loader binds it like wiring two actors
-//!   staging      params written into the near page; addr params get
-//!                the window value of their allocated slot. Ring
-//!                descriptors are NOT loader business: compiled init
-//!                self-stages them, so respawn re-runs init cleanly.
+//!                slot aimed at the target's RX ring, deduplicated per
+//!                (core, target). Group references align: same size →
+//!                counterpart; larger → each replica takes its slice
+//!                (a []addr param); smaller → replicas share (plain
+//!                addr). `index` hands each replica its own number.
+//!   staging      params into the near page; group windows into the
+//!                block's RAM array area. Ring descriptors are NOT
+//!                loader business: compiled init self-stages them, so
+//!                respawn re-runs init cleanly.
 //!   supervision  per spawn: the child's watchdog + WDEX ceiling, the
-//!                exit link to the spawner's CQ, and the spawn record
-//!                in the spawner's near page ({ctx, entry, sp, arg} for
-//!                SPWN, +32 the child's timer-SQE address so the exit
-//!                runtime can stop a dead child's clock)
-//!   timers       one black-hole PTT slot per user; the `after N`
-//!                period becomes the fabric's send_timeout (per-send
-//!                timeouts are still an open spec item, §10)
+//!                exit link, and the spawn record in the spawner's
+//!                near page.
+//!   timers       PTT 255 = the black hole, fixed by the ABI, one per
+//!                core; the `after N` period becomes the fabric's
+//!                send_timeout (per-send timeouts: open item, §10).
 //!
-//! The outcome reports every context by name — spawned children as
-//! `parent/Actor#k` — with state, fault, and `var` values read back.
+//! The outcome reports every context by name — replicas as `ws[k]`,
+//! spawned children as `parent/Actor#k` — with state, fault, and
+//! `var` values read back.
 
 const std = @import("std");
 const ring = @import("ring.zig");
@@ -40,6 +43,10 @@ const joe = @import("joe.zig");
 const device_table = [_]struct { name: []const u8, coord: u16 }{
     .{ .name = "Console", .coord = 0xFF00 },
 };
+
+/// Replica-packing limits per core.
+const max_ctx_per_core: u8 = 200;
+const ptt_budget: u16 = 240; // capability slots; 255 is the black hole
 
 pub const Options = struct {
     seed: u64 = 0x6564,
@@ -106,13 +113,17 @@ const Placed = struct {
     args: []const joe.InstanceDecl.Arg,
     core: u16,
     ctx: u8,
-    ref_slots: [8]u16 = @splat(0),
-    timer_ptt: u16 = 0,
+    /// Replica index and count within this instance's group (0 of 1 for
+    /// singletons) — alignment and `index` derive from these.
+    gi: usize = 0,
+    gn: usize = 1,
     /// Set for spawned children: index of the spawning instance.
     parent: ?usize = null,
     rec_off: u16 = 0,
     watchdog: u64 = 0,
 };
+
+const Group = struct { first: usize, count: usize };
 
 fn fail(comptime fmt: []const u8, args: anytype) error{Deploy} {
     std.debug.print("joe run: " ++ fmt ++ "\n", args);
@@ -137,53 +148,98 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     if (pl.instances.len == 0)
         return fail("this source has no `system` block to run", .{});
 
-    // ── Place the declared instances: explicit `on N` wins; the rest
-    //    fill fresh cores. ──
-    var all = std.ArrayList(Placed).init(scratch);
+    // ── Pre-pass: group sizes and devices, so placement can budget PTT
+    //    and references can look forward. ──
+    var group_sizes = std.StringHashMap(usize).init(scratch);
     var devices = std.ArrayList(struct { name: []const u8, coord: u16 }).init(scratch);
-    var next_core: u16 = 0;
-    var ctx_count = std.AutoHashMap(u16, u8).init(scratch);
     for (pl.instances) |inst| {
-        if (inst.args.len > 8) return fail("more than 8 instance args", .{});
         const coord: ?u16 = for (device_table) |d| {
             if (std.mem.eql(u8, d.name, inst.actor)) break d.coord;
         } else null;
         if (coord) |c| {
-            if (inst.args.len != 0)
-                return fail("{s}: a device takes no arguments", .{inst.name});
+            if (inst.args.len != 0 or inst.replicas != 1)
+                return fail("{s}: a device takes no arguments and no replicas", .{inst.name});
             try devices.append(.{ .name = inst.name, .coord = c });
-            continue;
+        } else {
+            try group_sizes.put(inst.name, inst.replicas);
         }
-        const core = inst.core orelse blk: {
-            while (ctx_count.contains(next_core)) next_core += 1;
-            break :blk next_core;
-        };
-        const n = ctx_count.get(core) orelse 0;
-        try ctx_count.put(core, n + 1);
-        try all.append(.{
-            .name = inst.name,
-            .actor = inst.actor,
-            .args = inst.args,
-            .core = core,
-            .ctx = n,
-        });
     }
+
+    // Conservative PTT need of one replica: its share of every group it
+    // references, one for each singleton ref, one for the black hole.
+    const pttNeed = struct {
+        fn of(inst: *const joe.Plan.PlanInstance, sizes: *std.StringHashMap(usize)) u16 {
+            var need: u16 = 1;
+            for (inst.args) |a| {
+                if (a != .ref) continue;
+                const m = sizes.get(a.ref) orelse 1;
+                const n: usize = @intCast(inst.replicas);
+                need += @intCast(if (m > n) m / n else 1);
+            }
+            return need;
+        }
+    }.of;
+
+    // ── Place: explicit `on N` wins; singletons take fresh cores;
+    //    replicas pack fresh cores under the context and PTT budgets. ──
+    var all = std.ArrayList(Placed).init(scratch);
+    var ctx_count = std.AutoHashMap(u16, u8).init(scratch);
+    var ptt_est = std.AutoHashMap(u16, u16).init(scratch);
+    // A core belongs to ONE instance declaration: replicas pack among
+    // themselves, never onto someone else's core. Mixing tiers starves
+    // the minority — an aggregator co-resident with its own flood gets
+    // 1/Nth of the pipeline while N-1 senders refill its ring.
+    var core_owner = std.AutoHashMap(u16, usize).init(scratch);
+    var groups = std.StringHashMap(Group).init(scratch);
+    var next_core: u16 = 0;
+    for (pl.instances, 0..) |*inst, decl_i| {
+        if (for (device_table) |d| {
+            if (std.mem.eql(u8, d.name, inst.actor)) break true;
+        } else false) continue;
+        if (inst.args.len > 8) return fail("more than 8 instance args", .{});
+        const n: usize = @intCast(inst.replicas);
+        const need = pttNeed(inst, &group_sizes);
+        if (n > 1) try groups.put(inst.name, .{ .first = all.items.len, .count = n });
+        for (0..n) |ri| {
+            const core: u16 = inst.core orelse blk: {
+                while (true) {
+                    const used = ctx_count.get(next_core) orelse 0;
+                    const ptt = ptt_est.get(next_core) orelse 0;
+                    const owner = core_owner.get(next_core);
+                    const mine = owner == null or owner.? == decl_i;
+                    const fits = if (n > 1)
+                        mine and used < max_ctx_per_core and ptt + need <= ptt_budget
+                    else
+                        used == 0;
+                    if (fits) break :blk next_core;
+                    next_core += 1;
+                }
+            };
+            try core_owner.put(core, decl_i);
+            const used = ctx_count.get(core) orelse 0;
+            if (used == 255) return fail("{s}: core {d} is out of contexts", .{ inst.name, core });
+            try ctx_count.put(core, used + 1);
+            try ptt_est.put(core, (ptt_est.get(core) orelse 0) + need);
+            try all.append(.{
+                .name = if (n > 1)
+                    try std.fmt.allocPrint(scratch, "{s}[{d}]", .{ inst.name, ri })
+                else
+                    inst.name,
+                .actor = inst.actor,
+                .args = inst.args,
+                .core = core,
+                .ctx = used,
+                .gi = ri,
+                .gn = n,
+            });
+        }
+    }
+    if (all.items.len == 0)
+        return fail("a system of only devices has nothing to run", .{});
     var cores: u16 = 0;
     {
         var it = ctx_count.iterator();
         while (it.next()) |e| cores = @max(cores, e.key_ptr.* + 1);
-    }
-
-    // ── PTT slots: capability refs first, in instance order. ──
-    var ptt_next = try scratch.alloc(u16, cores);
-    @memset(ptt_next, 0);
-    for (all.items) |*p| {
-        for (p.args, 0..) |a, k| {
-            if (a == .ref) {
-                p.ref_slots[k] = ptt_next[p.core];
-                ptt_next[p.core] += 1;
-            }
-        }
     }
 
     // ── Compile everything — the list grows as spawns add children. ──
@@ -204,15 +260,12 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         var r = joe.compile(alloc, source, pc.actor, .{
             .origin = block,
             .data = block + joe.abi.data_off,
-            .timer_ptt = ptt_next[pc.core], // consumed below iff used
         }, &diag) catch |err| {
             std.debug.print("joe {s}: line {d}: {s}\n", .{ pc.actor, diag.line, diag.message });
             return err;
         };
         errdefer r.deinit();
         if (r.uses_timer) {
-            all.items[i].timer_ptt = ptt_next[pc.core];
-            ptt_next[pc.core] += 1;
             if (timer_period != 0 and timer_period != r.timer_period)
                 return fail("two different `after` periods in one system (open spec item, §10)", .{});
             timer_period = r.timer_period;
@@ -224,6 +277,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         for (r.spawns, 0..) |s, k| {
             const core = pc.core; // SPWN is core-local: children live with the spawner
             const cctx = ctx_count.get(core) orelse 0;
+            if (cctx == 255) return fail("{s}: core {d} is out of contexts", .{ pc.name, core });
             try ctx_count.put(core, cctx + 1);
             const cargs = try scratch.alloc(joe.InstanceDecl.Arg, s.args.len);
             for (s.args, 0..) |v, j| cargs[j] = .{ .int = v };
@@ -252,9 +306,6 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         while (it.next()) |e| max_ctx = @max(max_ctx, e.value_ptr.*);
     }
 
-    if (all.items.len == 0)
-        return fail("a system of only devices has nothing to run", .{});
-
     // ── The machine. ──
     var m = try machine.Machine.init(alloc, .{
         .cores = cores,
@@ -278,51 +329,116 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         try m.attachDevice(d.coord, joe.abi.token, .{ .console = dev.Console.init(alloc) });
     }
 
-    // ── Wire capabilities and black holes (rings are self-staged). ──
-    for (all.items, compiled.items) |*p, *c| {
-        for (p.args, 0..) |a, k| {
-            if (a != .ref) continue;
-            if (!c.r.params[k].addr)
-                return fail("{s}: arg {d} names an instance but the param is not addr", .{ p.name, k });
-            const lo: u64 = for (all.items) |*t| {
-                if (t.parent == null and std.mem.eql(u8, t.name, a.ref))
-                    break ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx);
-            } else for (devices.items) |*d| {
-                if (std.mem.eql(u8, d.name, a.ref))
-                    break ring.PttEntry.loFrom(d.coord, 0, 0);
-            } else return fail("{s}: no instance named {s}", .{ p.name, a.ref });
-            m.setPtt(p.core, p.ref_slots[k], .{
+    // ── Wire, load and stage, instance by instance. Capability slots
+    //    allocate on demand, deduplicated per (core, target). ──
+    const ptt_next = try scratch.alloc(u16, cores);
+    @memset(ptt_next, 0);
+    const PttKey = struct { core: u16, lo: u64 };
+    var ptt_map = std.AutoHashMap(PttKey, u16).init(scratch);
+    const pttFor = struct {
+        fn of(
+            mach: *machine.Machine,
+            map: *std.AutoHashMap(PttKey, u16),
+            nexts: []u16,
+            core: u16,
+            lo: u64,
+        ) !u16 {
+            const key = PttKey{ .core = core, .lo = lo };
+            if (map.get(key)) |s| return s;
+            if (nexts[core] >= ptt_budget)
+                return fail("core {d} is out of capability slots", .{core});
+            const slot = nexts[core];
+            nexts[core] += 1;
+            try map.put(key, slot);
+            mach.setPtt(core, slot, .{
                 .prefix_hi = 0xfd65_6400_0000_0000,
                 .prefix_lo = lo,
                 .rights = .{ .send = true },
                 .token = joe.abi.token,
             });
+            return slot;
+        }
+    }.of;
+
+    for (all.items, compiled.items) |*p, *c| {
+        m.load(p.core, c.out.origin, c.out.code);
+        const block = blockOf(p.ctx);
+        const near = &m.cores[p.core].contexts[p.ctx].near;
+        for (p.args, c.r.params, 0..) |a, prm, k| {
+            switch (a) {
+                .int => |v| {
+                    if (prm.addr or prm.group)
+                        return fail("{s}: param {s} wants a capability, got a number", .{ p.name, prm.name });
+                    std.mem.writeInt(u64, near[prm.off..][0..8], v, .little);
+                },
+                .index => std.mem.writeInt(u64, near[prm.off..][0..8], p.gi, .little),
+                .ref => |rname| {
+                    // A device, a singleton, or a group — aligned to this
+                    // replica: same size pairs off, larger slices, smaller
+                    // shares.
+                    if (for (devices.items) |*d| {
+                        if (std.mem.eql(u8, d.name, rname)) break d;
+                    } else null) |d| {
+                        if (!prm.addr)
+                            return fail("{s}: {s} is a device; param {s} must be addr", .{ p.name, rname, prm.name });
+                        const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(d.coord, 0, 0));
+                        std.mem.writeInt(u64, near[prm.off..][0..8], ring.windowAddr(slot, 0), .little);
+                        continue;
+                    }
+                    if (groups.get(rname)) |g| {
+                        const mcount = g.count;
+                        const n = p.gn;
+                        if (mcount > n) {
+                            // slice: this replica owns mcount/n members
+                            if (!prm.group)
+                                return fail("{s}: param {s} must be []addr for a slice of {s}", .{ p.name, prm.name, rname });
+                            if (mcount % n != 0)
+                                return fail("{s}: {d} members of {s} do not divide over {d} replicas", .{ p.name, mcount, rname, n });
+                            const slice = mcount / n;
+                            if (slice > joe.abi.group_cap)
+                                return fail("{s}: slice of {d} exceeds the group cap {d}", .{ p.name, slice, joe.abi.group_cap });
+                            std.mem.writeInt(u64, near[prm.off..][0..8], slice, .little);
+                            const start = g.first + p.gi * slice;
+                            for (0..slice) |j| {
+                                const t = &all.items[start + j];
+                                const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx));
+                                const at = block + prm.area + j * 8 - machine.ram_base;
+                                std.mem.writeInt(u64, m.cores[p.core].ram[@intCast(at)..][0..8], ring.windowAddr(slot, 0), .little);
+                            }
+                            continue;
+                        }
+                        // pick: n >= mcount — replica gi maps to member gi*m/n
+                        if (!prm.addr)
+                            return fail("{s}: param {s} must be addr (each replica gets one of {s})", .{ p.name, prm.name, rname });
+                        if (n % mcount != 0)
+                            return fail("{s}: {d} replicas do not divide over {d} members of {s}", .{ p.name, n, mcount, rname });
+                        const t = &all.items[g.first + (p.gi * mcount) / n];
+                        const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx));
+                        std.mem.writeInt(u64, near[prm.off..][0..8], ring.windowAddr(slot, 0), .little);
+                        continue;
+                    }
+                    const t = for (all.items) |*t2| {
+                        if (t2.parent == null and t2.gn == 1 and std.mem.eql(u8, t2.name, rname)) break t2;
+                    } else return fail("{s}: no instance named {s}", .{ p.name, rname });
+                    if (!prm.addr)
+                        return fail("{s}: arg {d} names an instance but the param is not addr", .{ p.name, k });
+                    const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx));
+                    std.mem.writeInt(u64, near[prm.off..][0..8], ring.windowAddr(slot, 0), .little);
+                },
+            }
         }
         if (c.r.uses_timer) {
-            m.setPtt(p.core, p.timer_ptt, .{
+            m.setPtt(p.core, 255, .{
                 .prefix_lo = ring.PttEntry.loFrom(0xFFFF, 0, ring.slot_rx),
                 .rights = .{ .send = true },
                 .token = 0,
             });
         }
-    }
-
-    // ── Load code, stage params and supervision. ──
-    for (all.items, compiled.items) |*p, *c| {
-        m.load(p.core, c.out.origin, c.out.code);
-        const near = &m.cores[p.core].contexts[p.ctx].near;
-        for (p.args, c.r.params, 0..) |a, prm, k| {
-            const value: u64 = switch (a) {
-                .int => |v| v,
-                .ref => ring.windowAddr(p.ref_slots[k], 0),
-            };
-            std.mem.writeInt(u64, near[prm.off..][0..8], value, .little);
-        }
         if (p.parent) |pi| {
             const parent = all.items[pi];
-            const layout = joe.Layout{ .origin = blockOf(p.ctx), .data = blockOf(p.ctx) + joe.abi.data_off };
+            const layout = joe.Layout{ .origin = block, .data = block + joe.abi.data_off };
             const pnear = &m.cores[parent.core].contexts[parent.ctx].near;
-            const rec = [_]u64{ p.ctx, blockOf(p.ctx), blockOf(p.ctx) + joe.abi.block_size, 0, layout.timerBase() };
+            const rec = [_]u64{ p.ctx, block, block + joe.abi.block_size, 0, layout.timerBase() };
             for (rec, 0..) |wv, j| {
                 std.mem.writeInt(u64, pnear[p.rec_off + j * 8 ..][0..8], wv, .little);
             }
@@ -393,14 +509,9 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
     // Translate the machine's stop reason into system terms: it stops
     // when the fabric goes quiet, and quiet-with-corpses can be exactly
     // what supervision intended — abandoned workers stay dead.
-    var parked: usize = 0;
     var running: usize = 0;
     for (o.instances) |inst| {
-        switch (inst.state) {
-            .parked => parked += 1,
-            .ready => running += 1,
-            else => {},
-        }
+        if (inst.state == .ready) running += 1;
     }
     const verdict = switch (o.reason) {
         .deadlock => if (running == 0)
@@ -425,7 +536,8 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
         opts.dup_ppm4k,
         verdict,
     });
-    for (o.instances) |inst| {
+    const shown = @min(o.instances.len, 12);
+    for (o.instances[0..shown]) |inst| {
         try stdout.print("  {s} = {s} @ core {d}.{d}: {s}", .{
             inst.name, inst.actor, inst.core, inst.ctx, @tagName(inst.state),
         });
@@ -434,6 +546,22 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
         try stdout.print(" [{d} B]", .{inst.code_bytes});
         for (inst.vars) |v| try stdout.print("  {s}={d}", .{ v.name, v.value });
         try stdout.print("\n", .{});
+    }
+    if (o.instances.len > shown) {
+        var halted: usize = 0;
+        var parked: usize = 0;
+        var faulted: usize = 0;
+        for (o.instances[shown..]) |inst| {
+            switch (inst.state) {
+                .halted => halted += 1,
+                .parked => parked += 1,
+                .faulted => faulted += 1,
+                else => {},
+            }
+        }
+        try stdout.print("  … and {d} more: {d} parked, {d} halted, {d} faulted\n", .{
+            o.instances.len - shown, parked, halted, faulted,
+        });
     }
     if (o.console) |text| {
         try stdout.print("\n  the console heard:\n\n", .{});

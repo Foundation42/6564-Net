@@ -544,3 +544,55 @@ hello ✓ — six of the demo suite's protocols now compile from joe.
 92 tests green; frozen table intact (2820 / 171,112 / 479,273).
 Next: item 4 — park-point liveness and the bank collapse, measured
 against ring.joe's 110 cy/pass.
+
+## forkjoin.joe: a thousand-actor tree from ninety lines (2026-07-16)
+
+The last protocol conversion, and the biggest feature drop since joe
+drew breath: `for (k, w) in group` and `for i in a..b`, `[]addr` group
+parameters (count in the near page, windows in the block's RAM array
+area), `var x [N]u64` arrays (ditto), and system-block replication —
+
+    root = Root(ls, 500, 8) on 0
+    ls = Lieutenant[8](ws, root, 125)
+    ws = Worker[1000](ls)
+
+Group references ALIGN: same size pairs off, larger slices (each
+Lieutenant gets its 125 workers as a []addr), smaller shares (each
+Worker gets the one lieutenant that owns it). `index` hands a replica
+its number. PTT slots deduplicate per (core, target); the black hole
+is fixed at slot 255 by the ABI.
+
+**The tree is the reliability architecture.** joe cannot see transport
+verdicts, and a thousand-wide fan-in cannot hold a thousand
+capabilities anyway (a PTT has 256 slots) — so every hop acks THROUGH
+the tree, where both ends hold each other's capabilities: workers
+retry Results until acked, lieutenants dedup by index, aggregate, and
+retry Done; the root dedups lieutenants. 1,009 instances, end-to-end
+reliable, **sum exact at 25% loss + duplication** (501,000, every
+lieutenant 62,625), fully quiescent in 1.26M cycles. The suite runs
+the same shape at 2×20.
+
+Two findings paid for in debugging, both now structural:
+
+1. **Co-residency of an aggregator with its own flood is starvation.**
+   The first 2×20 run packed everything on one core: the lieutenant
+   got 1/43rd of the pipeline while 42 senders refilled its ring —
+   livelock, n=0 forever. The loader now gives each instance
+   declaration its own cores; replicas pack only among themselves.
+2. **Nobody says goodbye last.** A root that HALTS on its final Done
+   strands any lieutenant whose last ack was rejected in the crush —
+   it retries into a corpse forever. The root now `quiesce`s instead,
+   lame-ducking re-acks until everyone stops needing to talk. The
+   pipeline's termination-as-a-phase lesson, rediscovered at scale.
+
+**bigbrother stays hand-written, honestly.** Its senders retry off
+TRANSPORT verdicts — the exact thing joe cannot say, by design. The
+flood test lives below the language's floor; fan-in at joe's level is
+the tree above. Also deferred with Christian: device sends over a
+duplicating fabric want an annotation (default exactly-once framing,
+relax by declaration) — the doubled HELLO is recorded, not papered.
+
+Corpus: pingpong, ring, supervise, scatter, pipeline, hello, forkjoin
+— **seven of eight protocols compile from joe** (bigbrother
+inexpressible by design, documented). 93 tests green; frozen table
+intact. Next: item 4, park-point liveness, against ring.joe's 110.

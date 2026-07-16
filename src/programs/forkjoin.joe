@@ -1,0 +1,121 @@
+// forkjoin.joe — one message forks to a thousand workers and joins
+// back to one, through a lieutenant tier.
+//
+// The tree is not just topology, it is the RELIABILITY architecture:
+// joe cannot see transport verdicts, and a thousand-wide fan-in cannot
+// hold a thousand capabilities anyway (a PTT has 256 slots) — so every
+// hop acks THROUGH the tree, where both sides hold each other's
+// capabilities. Workers retry Results until their lieutenant acks;
+// lieutenants dedup by worker index, aggregate, and retry Done until
+// the root acks; the root dedups lieutenants. Idempotence everywhere,
+// end to end, no transport visibility anywhere.
+
+message Task { v u32, j u32 }
+message Result { k u32, v u64 }
+message Ok { k u32 }
+message Done { k u32, v u64 }
+message OkD { k u32 }
+
+actor Root(ls []addr, task u32, quota u32) {
+    var got [16]u64
+    var n u64 = 0
+    var sum u64 = 0
+
+    for (k, l) in ls { send l, Task{task, k} }
+
+    serve {
+        case Done(d):
+            send ls[d.k], OkD{d.k}
+            if got[d.k] == 0 {
+                got[d.k] = 1
+                n += 1
+                sum += d.v
+                if n == quota { quiesce }
+            }
+
+        after 700:
+            for (k, l) in ls {
+                if got[k] == 0 { send l, Task{task, k} }
+            }
+    }
+
+    // The join is complete, but a halted root would strand any
+    // lieutenant whose final ack was rejected in the crush — so nobody
+    // says goodbye last: the root lame-ducks, re-acking stragglers
+    // until everyone simply stops needing to talk.
+    quiesce {
+        case Done(d):
+            send ls[d.k], OkD{d.k}
+    }
+}
+
+actor Lieutenant(ws []addr, root addr, quota u32) {
+    var got [128]u64
+    var n u64 = 0
+    var sum u64 = 0
+    var fired u64 = 0
+    var myk u64 = 0
+    var task u64 = 0
+
+    serve {
+        case Task(t) where fired == 0:
+            fired = 1
+            myk = t.j
+            task = t.v
+            for (j, w) in ws { send w, Task{t.v, j} }
+
+        case Task(_):
+            // the root is worried: re-fork only the unfinished
+            for (j, w) in ws {
+                if got[j] == 0 { send w, Task{task, j} }
+            }
+
+        case Result(r):
+            send ws[r.k], Ok{r.k}
+            if got[r.k] == 0 {
+                got[r.k] = 1
+                n += 1
+                sum += r.v
+                if n == quota { send root, Done{myk, sum} }
+            }
+
+        case OkD(_):
+            quiesce
+
+        after 700:
+            if n == quota { send root, Done{myk, sum} }
+    }
+
+    quiesce {
+        case Result(r):
+            send ws[r.k], Ok{r.k}      // a lame duck still soothes stragglers
+    }
+}
+
+actor Worker(lt addr) {
+    var j u64 = 0
+    var val u64 = 0
+    var need u64 = 0
+
+    serve {
+        case Task(t):
+            j = t.j
+            val = t.v + 1
+            need = 1
+            send lt, Result{t.j, val}
+
+        case Ok(o) where o.k == j:
+            quiesce
+
+        case Ok(_):
+
+        after 700:
+            if need == 1 { send lt, Result{j, val} }
+    }
+}
+
+system {
+    root = Root(ls, 500, 8) on 0
+    ls = Lieutenant[8](ws, root, 125)
+    ws = Worker[1000](ls)
+}

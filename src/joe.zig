@@ -57,9 +57,11 @@ pub const Error = error{ Syntax, Semantics, Unsupported, OutOfMemory };
 pub const Layout = struct {
     origin: u64 = 0x1000,
     data: u64 = 0x2000,
-    /// PTT slot of the black hole the `after` timer ticks against —
-    /// allocated by the loader, per core.
-    timer_ptt: u16 = 1,
+    /// PTT slot of the black hole the `after` timer ticks against.
+    /// Fixed at 255 by the v1 ABI: every actor on a core shares the one
+    /// black hole, and capability slots grow from 0 without ever
+    /// colliding with it.
+    timer_ptt: u16 = 255,
 
     pub fn cqBase(l: Layout) u64 {
         return l.data; // 16 completion entries
@@ -95,11 +97,16 @@ pub const abi = struct {
     pub const token: u64 = 0x6564;
     pub const param_base: u16 = 0x800;
     pub const timer_cookie: u64 = 0x77;
-    /// One instance block: code at +0, data at +$800, stack down from
-    /// +$1000. The loader places context c of a core at
-    /// ram_base + c * block_size.
-    pub const block_size: u64 = 0x1000;
+    /// One instance block: code at +0, data at +$800 (rings, buffers,
+    /// staging, then the array area), stack down from +$2000. The loader
+    /// places context c of a core at ram_base + c * block_size.
+    pub const block_size: u64 = 0x2000;
     pub const data_off: u64 = 0x800;
+    /// Arrays (group params and `var x [N]u64`) live in RAM from this
+    /// offset within the data region — the near page is too small.
+    pub const array_off: u64 = 0x280;
+    /// Group parameters hold up to this many windows.
+    pub const group_cap: u16 = 128;
 };
 
 // ── AST ──────────────────────────────────────────────────────────────────
@@ -110,13 +117,16 @@ const Type = enum {
     u32_,
     u64_,
     addr,
+    /// `[]addr` — a group parameter: the count lives in the near-page
+    /// slot, the windows in a RAM array the loader stages.
+    addr_slice,
 
     fn size(self: Type) u16 {
         return switch (self) {
             .u8_ => 1,
             .u16_ => 2,
             .u32_ => 4,
-            .u64_, .addr => 8,
+            .u64_, .addr, .addr_slice => 8,
         };
     }
 
@@ -152,14 +162,17 @@ const Expr = union(enum) {
     int: u64,
     ident: []const u8,
     field: struct { base: []const u8, name: []const u8 },
+    index: struct { base: []const u8, idx: *Expr },
     bin: struct { op: BinOp, l: *Expr, r: *Expr },
 };
 
 const AssignOp = enum { set, add, sub };
 
 const Stmt = union(enum) {
-    assign: struct { name: []const u8, op: AssignOp, expr: *Expr },
-    send: struct { target: []const u8, msg: []const u8, args: []*Expr, line: usize },
+    assign: struct { name: []const u8, idx: ?*Expr, op: AssignOp, expr: *Expr },
+    send: struct { target: []const u8, target_idx: ?*Expr, msg: []const u8, args: []*Expr, line: usize },
+    for_range: struct { name: []const u8, from: *Expr, to: *Expr, body: []Stmt },
+    for_group: struct { idx: []const u8, elem: []const u8, group: []const u8, body: []Stmt, line: usize },
     /// `send tty, "TEXT"` — raw bytes to a device: no tag, no fields,
     /// just the payload a teletype expects.
     send_str: struct { target: []const u8, text: []const u8, line: usize },
@@ -200,7 +213,9 @@ const Handler = union(enum) {
 
 const Param = struct { name: []const u8, ty: Type };
 
-const VarDecl = struct { name: []const u8, ty: Type, init: ?*Expr };
+/// `array` > 0 makes this a u64 array of that many elements, living in
+/// the instance block's RAM (the near page is too small for them).
+const VarDecl = struct { name: []const u8, ty: Type, init: ?*Expr, array: u16 = 0 };
 
 const Actor = struct {
     name: []const u8,
@@ -222,11 +237,15 @@ pub const InstanceDecl = struct {
     actor: []const u8,
     args: []const Arg,
     core: ?u16,
+    /// `name = Actor[N](args)` declares N replicas; each is a context.
+    replicas: u64 = 1,
     line: usize,
 
     pub const Arg = union(enum) {
         int: u64,
         ref: []const u8,
+        /// The literal `index`: each replica receives its own index.
+        index,
     };
 };
 
@@ -246,9 +265,12 @@ const TokKind = enum {
     rbrace,
     lparen,
     rparen,
+    lbracket,
+    rbracket,
     comma,
     colon,
     dot,
+    dotdot,
     underscore,
     assign, // =
     plus_eq,
@@ -312,7 +334,7 @@ const Lexer = struct {
             .{ "==", TokKind.eq_eq },   .{ "!=", TokKind.bang_eq },
             .{ "<=", TokKind.le },      .{ ">=", TokKind.ge },
             .{ "<<", TokKind.shl },     .{ ">>", TokKind.shr },
-            .{ "&&", TokKind.and_and },
+            .{ "&&", TokKind.and_and }, .{ "..", TokKind.dotdot },
         };
         inline for (twos) |t| {
             if (std.mem.eql(u8, two, t[0])) {
@@ -321,10 +343,11 @@ const Lexer = struct {
             }
         }
         const ones = .{
-            .{ '{', TokKind.lbrace }, .{ '}', TokKind.rbrace },
-            .{ '(', TokKind.lparen }, .{ ')', TokKind.rparen },
-            .{ ',', TokKind.comma },  .{ ':', TokKind.colon },
-            .{ '.', TokKind.dot },    .{ '=', TokKind.assign },
+            .{ '{', TokKind.lbrace },   .{ '}', TokKind.rbrace },
+            .{ '(', TokKind.lparen },   .{ ')', TokKind.rparen },
+            .{ '[', TokKind.lbracket }, .{ ']', TokKind.rbracket },
+            .{ ',', TokKind.comma },    .{ ':', TokKind.colon },
+            .{ '.', TokKind.dot },      .{ '=', TokKind.assign },
             .{ '<', TokKind.lt },     .{ '>', TokKind.gt },
             .{ '+', TokKind.plus },   .{ '-', TokKind.minus },
             .{ '&', TokKind.amp },    .{ '|', TokKind.pipe },
@@ -462,13 +485,27 @@ const Parser = struct {
         const name = try self.expect(.ident, "instance name");
         _ = try self.expect(.assign, "=");
         const actor = try self.expect(.ident, "actor name");
+        var replicas: u64 = 1;
+        if (self.tok.kind == .lbracket) {
+            try self.advance();
+            const n = try self.expect(.int, "replica count");
+            _ = try self.expect(.rbracket, "]");
+            if (n.value == 0) return self.fail("zero replicas", Error.Semantics);
+            replicas = n.value;
+        }
         _ = try self.expect(.lparen, "(");
         var args = std.ArrayList(InstanceDecl.Arg).init(self.arena);
         while (self.tok.kind != .rparen) {
             switch (self.tok.kind) {
                 .int => try args.append(.{ .int = self.tok.value }),
-                .ident => try args.append(.{ .ref = self.tok.text }),
-                else => return self.fail("instance args are literals or instance names", Error.Syntax),
+                .ident => {
+                    if (std.mem.eql(u8, self.tok.text, "index")) {
+                        try args.append(.index);
+                    } else {
+                        try args.append(.{ .ref = self.tok.text });
+                    }
+                },
+                else => return self.fail("instance args are literals, names or `index`", Error.Syntax),
             }
             try self.advance();
             if (self.tok.kind == .comma) try self.advance();
@@ -484,14 +521,23 @@ const Parser = struct {
             .actor = actor.text,
             .args = try args.toOwnedSlice(),
             .core = core,
+            .replicas = replicas,
             .line = line,
         };
     }
 
     fn parseType(self: *Parser) Error!Type {
+        if (self.tok.kind == .lbracket) {
+            try self.advance();
+            _ = try self.expect(.rbracket, "]");
+            const t = try self.expect(.ident, "addr");
+            if (!std.mem.eql(u8, t.text, "addr"))
+                return self.fail("v1 slices are []addr only", Error.Unsupported);
+            return .addr_slice;
+        }
         const t = try self.expect(.ident, "a type");
         return Type.named(t.text) orelse
-            self.fail("unknown type (v1 speaks u8..u64 and addr)", Error.Unsupported);
+            self.fail("unknown type (v1 speaks u8..u64, addr and []addr)", Error.Unsupported);
     }
 
     fn parseMessage(self: *Parser) Error!Message {
@@ -501,6 +547,8 @@ const Parser = struct {
         while (self.tok.kind != .rbrace) {
             const fname = try self.expect(.ident, "field name");
             const ty = try self.parseType();
+            if (ty == .addr_slice)
+                return self.fail("a message cannot carry a slice", Error.Semantics);
             try fields.append(.{ .name = fname.text, .ty = ty });
             if (self.tok.kind == .comma) try self.advance();
         }
@@ -525,7 +573,23 @@ const Parser = struct {
         while (self.isKw("var")) {
             try self.advance();
             const vname = try self.expect(.ident, "var name");
+            if (self.tok.kind == .lbracket) {
+                // `var got [128]u64` — a RAM array; zeroed at load, not
+                // at respawn (it lives outside the near page).
+                try self.advance();
+                const n = try self.expect(.int, "array length");
+                _ = try self.expect(.rbracket, "]");
+                const t = try self.expect(.ident, "u64");
+                if (!std.mem.eql(u8, t.text, "u64"))
+                    return self.fail("v1 arrays are u64 only", Error.Unsupported);
+                if (n.value == 0 or n.value > 256)
+                    return self.fail("array length is 1..256 in v1", Error.Semantics);
+                try vlist.append(.{ .name = vname.text, .ty = .u64_, .init = null, .array = @intCast(n.value) });
+                continue;
+            }
             const ty = try self.parseType();
+            if (ty == .addr_slice)
+                return self.fail("[]addr is a parameter type", Error.Semantics);
             var init_expr: ?*Expr = null;
             if (self.tok.kind == .assign) {
                 try self.advance();
@@ -650,8 +714,16 @@ const Parser = struct {
         const line = self.tok.line;
         if (try self.eatKw("send")) {
             const target = try self.expect(.ident, "target");
+            var target_idx: ?*Expr = null;
+            if (self.tok.kind == .lbracket) {
+                try self.advance();
+                target_idx = try self.parseExpr();
+                _ = try self.expect(.rbracket, "]");
+            }
             _ = try self.expect(.comma, ",");
             if (self.tok.kind == .string) {
+                if (target_idx != null)
+                    return self.fail("a string send goes to one device", Error.Semantics);
                 // decode escapes into the arena
                 var text = std.ArrayList(u8).init(self.arena);
                 var j: usize = 0;
@@ -683,9 +755,40 @@ const Parser = struct {
             try self.advance(); // }
             return .{ .send = .{
                 .target = target.text,
+                .target_idx = target_idx,
                 .msg = msg.text,
                 .args = try args.toOwnedSlice(),
                 .line = line,
+            } };
+        }
+        if (try self.eatKw("for")) {
+            if (self.tok.kind == .lparen) {
+                // `for (k, w) in group { … }`
+                try self.advance();
+                const iname = try self.expect(.ident, "index binding");
+                _ = try self.expect(.comma, ",");
+                const ename = try self.expect(.ident, "element binding");
+                _ = try self.expect(.rparen, ")");
+                if (!try self.eatKw("in")) return self.fail("expected `in`", Error.Syntax);
+                const gname = try self.expect(.ident, "a []addr parameter");
+                return .{ .for_group = .{
+                    .idx = iname.text,
+                    .elem = ename.text,
+                    .group = gname.text,
+                    .body = try self.parseBlock(),
+                    .line = line,
+                } };
+            }
+            const vname = try self.expect(.ident, "loop variable");
+            if (!try self.eatKw("in")) return self.fail("expected `in`", Error.Syntax);
+            const from = try self.parseExpr();
+            _ = try self.expect(.dotdot, "..");
+            const to = try self.parseExpr();
+            return .{ .for_range = .{
+                .name = vname.text,
+                .from = from,
+                .to = to,
+                .body = try self.parseBlock(),
             } };
         }
         if (try self.eatKw("if")) {
@@ -727,12 +830,18 @@ const Parser = struct {
             } };
         }
         if (try self.eatKw("quiesce")) return .quiesce;
-        inline for (.{ "chain", "for", "let", "region", "grant", "log" }) |kw| {
+        inline for (.{ "chain", "let", "region", "grant", "log" }) |kw| {
             if (self.isKw(kw))
                 return self.fail("`" ++ kw ++ "` is not in v1 yet", Error.Unsupported);
         }
-        // assignment: ident (=|+=|-=) expr
+        // assignment: ident[idx]? (=|+=|-=) expr
         const name = try self.expect(.ident, "a statement");
+        var idx: ?*Expr = null;
+        if (self.tok.kind == .lbracket) {
+            try self.advance();
+            idx = try self.parseExpr();
+            _ = try self.expect(.rbracket, "]");
+        }
         const op: AssignOp = switch (self.tok.kind) {
             .assign => .set,
             .plus_eq => .add,
@@ -740,7 +849,7 @@ const Parser = struct {
             else => return self.fail("expected `=`, `+=` or `-=`", Error.Syntax),
         };
         try self.advance();
-        return .{ .assign = .{ .name = name.text, .op = op, .expr = try self.parseExpr() } };
+        return .{ .assign = .{ .name = name.text, .idx = idx, .op = op, .expr = try self.parseExpr() } };
     }
 
     fn mkExpr(self: *Parser, e: Expr) Error!*Expr {
@@ -836,6 +945,12 @@ const Parser = struct {
                     const f = try self.expect(.ident, "field name");
                     return self.mkExpr(.{ .field = .{ .base = name, .name = f.text } });
                 }
+                if (self.tok.kind == .lbracket) {
+                    try self.advance();
+                    const idx = try self.parseExpr();
+                    _ = try self.expect(.rbracket, "]");
+                    return self.mkExpr(.{ .index = .{ .base = name, .idx = idx } });
+                }
                 return self.mkExpr(.{ .ident = name });
             },
             else => return self.fail("expected an expression", Error.Syntax),
@@ -883,6 +998,13 @@ const Gen = struct {
     off_elife: u16 = 0,
     off_ecode: u16 = 0,
     off_tarmed: u16 = 0,
+    off_elem: u16 = 0,
+    /// First free near slot after the fixed layout — loop variables and
+    /// bindings are handed out from here.
+    next_slot: u16 = 0,
+    /// RAM arrays: name → near slot holding the base pointer. Group
+    /// params and array vars both land here.
+    arrays: std.StringHashMap(struct { ptr_slot: u16, area: u64, len: u16 }),
     /// Spawn records live after the internals: 48 bytes each —
     /// {ctx, entry, sp, arg} (the SPWN block, loader-staged), +32 the
     /// child's timer-SQE address (for disarm-on-death), +40 the restart
@@ -924,11 +1046,15 @@ const Gen = struct {
 
     fn layoutSlots(self: *Gen) Error!void {
         var off: u16 = abi.param_base;
+        var area: u64 = 0;
         for (self.actor.params) |p| {
+            // A slice param's near slot holds the COUNT; its windows go
+            // to the RAM array area, base pointer staged below.
             try self.slots.put(p.name, off);
             off += 8;
         }
         for (self.actor.vars) |v| {
+            if (v.array > 0) continue; // RAM arrays get pointers, not slots
             try self.slots.put(v.name, off);
             off += 8;
         }
@@ -941,7 +1067,8 @@ const Gen = struct {
         self.off_elife = off + 48;
         self.off_ecode = off + 56;
         self.off_tarmed = off + 64;
-        self.spawn_base = off + 72;
+        self.off_elem = off + 72;
+        self.spawn_base = off + 80;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
@@ -951,6 +1078,24 @@ const Gen = struct {
         for (self.actor.body) |s| {
             if (s == .spawn) self.spawn_count += 1;
         }
+        // Arrays after the spawn records: a near slot for each base
+        // pointer; the elements in the block's RAM array area.
+        var aoff: u16 = self.spawn_base + self.spawn_count * 48;
+        for (self.actor.params) |p| {
+            if (p.ty != .addr_slice) continue;
+            try self.arrays.put(p.name, .{ .ptr_slot = aoff, .area = area, .len = abi.group_cap });
+            aoff += 8;
+            area += @as(u64, abi.group_cap) * 8;
+        }
+        for (self.actor.vars) |v| {
+            if (v.array == 0) continue;
+            try self.arrays.put(v.name, .{ .ptr_slot = aoff, .area = area, .len = v.array });
+            aoff += 8;
+            area += @as(u64, v.array) * 8;
+        }
+        self.next_slot = aoff;
+        if (abi.array_off + area > abi.block_size - abi.data_off - 0x400)
+            return self.fail(0, "arrays overflow the instance block", Error.Semantics);
         self.has_quiesce = self.actor.quiesce.len > 0 or anyQuiesce(self.actor.body) or blk: {
             for (self.actor.handlers) |h| {
                 const body = switch (h) {
@@ -980,6 +1125,18 @@ const Gen = struct {
         return self.spawn_base + k * 48;
     }
 
+    /// Loop variables and bindings get near slots on demand; the same
+    /// name reuses its slot (a shadowed loop variable is the same cell).
+    fn getOrAddSlot(self: *Gen, name: []const u8) Error!u16 {
+        if (self.slots.get(name)) |s| return s;
+        const s = self.next_slot;
+        if (@as(u32, s) + 8 > isa.mactab_base)
+            return self.fail(0, "near page exhausted", Error.Semantics);
+        try self.slots.put(name, s);
+        self.next_slot += 8;
+        return s;
+    }
+
     // ── Expressions: result in A ─────────────────────────────────────────
 
     fn evalInto(self: *Gen, e: *const Expr) Error!void {
@@ -1002,6 +1159,14 @@ const Gen = struct {
                     return self.fail(0, "unknown name", Error.Semantics);
                 };
                 try self.w("        LDA ${X}", .{slot});
+            },
+            .index => |ix| {
+                const arr = self.arrays.get(ix.base) orelse
+                    return self.fail(0, "not an array or group", Error.Semantics);
+                try self.evalInto(ix.idx);
+                try self.w("        ASL #3", .{});
+                try self.w("        TAY", .{});
+                try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
             },
             .field => |f| {
                 if (self.exit_bind != null and std.mem.eql(u8, self.exit_bind.?, f.base)) {
@@ -1130,6 +1295,21 @@ const Gen = struct {
     fn stmt(self: *Gen, s: *const Stmt) Error!void {
         switch (s.*) {
             .assign => |a| {
+                if (a.idx) |ix| {
+                    // arr[e] = v — evaluate v first (it may clobber Y).
+                    const arr = self.arrays.get(a.name) orelse
+                        return self.fail(0, "not an array", Error.Semantics);
+                    if (a.op != .set)
+                        return self.fail(0, "v1 array assignment is `=` only", Error.Unsupported);
+                    try self.evalInto(a.expr);
+                    try self.w("        PHA", .{});
+                    try self.evalInto(ix);
+                    try self.w("        ASL #3", .{});
+                    try self.w("        TAY", .{});
+                    try self.w("        PLA", .{});
+                    try self.w("        STA (${X}),Y", .{arr.ptr_slot});
+                    return;
+                }
                 const slot = self.slots.get(a.name) orelse
                     return self.fail(0, "unknown variable", Error.Semantics);
                 switch (a.op) {
@@ -1198,6 +1378,48 @@ const Gen = struct {
                 try self.w("        WDEX ##{d}", .{b.n});
                 try self.stmts(b.body);
             },
+            .for_range => |f| {
+                const kslot = try self.getOrAddSlot(f.name);
+                const l_top = self.label();
+                const l_end = self.label();
+                try self.evalInto(f.from);
+                try self.w("        STA ${X}", .{kslot});
+                try self.w("L{d}:", .{l_top});
+                try self.evalInto(f.to);
+                try self.w("        STA ${X}", .{self.off_t});
+                try self.w("        LDA ${X}", .{kslot});
+                try self.w("        CMP ${X}", .{self.off_t});
+                try self.w("        BCS L{d}", .{l_end});
+                try self.stmts(f.body);
+                try self.w("        INC ${X}", .{kslot});
+                try self.w("        BRA L{d}", .{l_top});
+                try self.w("L{d}:", .{l_end});
+            },
+            .for_group => |f| {
+                // for (k, w) in ws — count from the param slot, elements
+                // fetched through the group's base pointer each lap.
+                const arr = self.arrays.get(f.group) orelse
+                    return self.fail(f.line, "not a []addr parameter", Error.Semantics);
+                const count_slot = self.slots.get(f.group) orelse
+                    return self.fail(f.line, "unknown group", Error.Semantics);
+                const kslot = try self.getOrAddSlot(f.idx);
+                const eslot = try self.getOrAddSlot(f.elem);
+                const l_top = self.label();
+                const l_end = self.label();
+                try self.w("        LDA #0", .{});
+                try self.w("        STA ${X}", .{kslot});
+                try self.w("L{d}:   LDA ${X}", .{ l_top, kslot });
+                try self.w("        CMP ${X}", .{count_slot});
+                try self.w("        BCS L{d}", .{l_end});
+                try self.w("        ASL #3", .{});
+                try self.w("        TAY", .{});
+                try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
+                try self.w("        STA ${X}", .{eslot});
+                try self.stmts(f.body);
+                try self.w("        INC ${X}", .{kslot});
+                try self.w("        BRA L{d}", .{l_top});
+                try self.w("L{d}:", .{l_end});
+            },
             .quiesce => {
                 // Termination is a phase: kill the clock, cross into the
                 // lame-duck case set, never come back.
@@ -1229,7 +1451,18 @@ const Gen = struct {
             return self.fail(sd.line, "unknown message", Error.Semantics);
         if (sd.args.len != msg.fields.len)
             return self.fail(sd.line, "wrong number of message fields", Error.Semantics);
-        const tslot = self.slots.get(sd.target) orelse
+        const tslot: u16 = if (sd.target_idx) |ix| blk: {
+            // send group[e], … — fetch the element window first; the
+            // message build below never touches Y or the elem slot.
+            const arr = self.arrays.get(sd.target) orelse
+                return self.fail(sd.line, "not a []addr parameter", Error.Semantics);
+            try self.evalInto(ix);
+            try self.w("        ASL #3", .{});
+            try self.w("        TAY", .{});
+            try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
+            try self.w("        STA ${X}", .{self.off_elem});
+            break :blk self.off_elem;
+        } else self.slots.get(sd.target) orelse
             return self.fail(sd.line, "unknown send target", Error.Semantics);
 
         if (msg.wire_size <= 8) {
@@ -1328,6 +1561,17 @@ const Gen = struct {
             try self.store(d.cfg, off + 8);
             try self.store(0, off + 16); // head = tail = 0
             try self.store(d.token, off + 24);
+        }
+
+        if (self.arrays.count() > 0) {
+            try self.w("; array base pointers (elements live in the block's RAM)", .{});
+            var ait = self.arrays.iterator();
+            while (ait.next()) |e| {
+                try self.store(
+                    self.layout.data + abi.array_off + e.value_ptr.area,
+                    e.value_ptr.ptr_slot,
+                );
+            }
         }
 
         // RX ring: two landing buffers, cookie = buffer address.
@@ -1606,7 +1850,15 @@ const Gen = struct {
 
 // ── Public interface ─────────────────────────────────────────────────────
 
-pub const Slot = struct { name: []const u8, off: u16, addr: bool = false };
+pub const Slot = struct {
+    name: []const u8,
+    off: u16,
+    addr: bool = false,
+    /// A []addr parameter: `off` holds the count; the windows go to RAM
+    /// at block + `area` (group_cap entries reserved).
+    group: bool = false,
+    area: u64 = 0,
+};
 
 /// One `spawn` in the actor body, exported for the loader: it places the
 /// child, wires watchdog + exit link, and stages the spawn record at
@@ -1659,6 +1911,7 @@ pub const Plan = struct {
         actor: []const u8,
         args: []InstanceDecl.Arg,
         core: ?u16,
+        replicas: u64,
         line: usize,
     };
 
@@ -1694,6 +1947,7 @@ pub fn plan(alloc: std.mem.Allocator, source: []const u8, diag: ?*Diagnostic) Er
             try args.append(switch (a) {
                 .int => |v| .{ .int = v },
                 .ref => |r| .{ .ref = try alloc.dupe(u8, r) },
+                .index => .index,
             });
         }
         try out.append(.{
@@ -1701,6 +1955,7 @@ pub fn plan(alloc: std.mem.Allocator, source: []const u8, diag: ?*Diagnostic) Er
             .actor = try alloc.dupe(u8, inst.actor),
             .args = try args.toOwnedSlice(),
             .core = inst.core,
+            .replicas = inst.replicas,
             .line = inst.line,
         });
     }
@@ -1761,6 +2016,7 @@ pub fn compile(
         .diag = diag,
         .slots = std.StringHashMap(u16).init(arena),
         .strings = .init(arena),
+        .arrays = .init(arena),
     };
     errdefer gen.out.deinit();
     try gen.emit();
@@ -1774,9 +2030,15 @@ pub fn compile(
             .name = try alloc.dupe(u8, p.name),
             .off = gen.slots.get(p.name).?,
             .addr = p.ty == .addr,
+            .group = p.ty == .addr_slice,
+            .area = if (p.ty == .addr_slice)
+                abi.data_off + abi.array_off + gen.arrays.get(p.name).?.area
+            else
+                0,
         });
     }
     for (actor.vars) |v| {
+        if (v.array > 0) continue; // RAM arrays aren't read back by name
         try vars.append(.{ .name = try alloc.dupe(u8, v.name), .off = gen.slots.get(v.name).? });
     }
     var spawns = std.ArrayList(SpawnOut).init(alloc);
