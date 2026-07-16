@@ -858,6 +858,31 @@ test "joe: the ring turns — 8 instances from one system block, token comes hom
     try testing.expect(cy_per_pass < 130);
 }
 
+test "joe: supervision — spawn, respawn, hung, abandoned, all from the system block" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/supervise.joe");
+    var o = try joe_run.simulate(testing.allocator, src, .{});
+    defer o.deinit();
+    // The Boss observed exactly the policy it declared: the Griefer
+    // crashed on each of its 3 lives (2 respawns + the abandonment),
+    // the Sleeper's dishonest `bounded` hung once and was respawned,
+    // then abandoned. Budgets ran out; the Boss halted cleanly.
+    const boss = o.instance("boss").?;
+    try testing.expectEqual(machine.CtxState.halted, boss.state);
+    try testing.expectEqual(@as(u64, 2), o.varOf("boss", "crashes").?);
+    try testing.expectEqual(@as(u64, 1), o.varOf("boss", "hangs").?);
+    try testing.expectEqual(@as(u64, 2), o.varOf("boss", "lost").?);
+    // The dead lie where they fell, each with its honest fault code —
+    // and their timers were disarmed, or the machine would never have
+    // gone quiet (this test would hang at max_cycles).
+    const griefer = o.instance("boss/Griefer#0").?;
+    try testing.expectEqual(machine.CtxState.faulted, griefer.state);
+    try testing.expectEqual(machine.Fault.brk, griefer.fault);
+    const sleeper = o.instance("boss/Sleeper#1").?;
+    try testing.expectEqual(machine.CtxState.faulted, sleeper.state);
+    try testing.expectEqual(machine.Fault.watchdog, sleeper.fault);
+}
+
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {
     // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
     // FSUB/FCMP results, every one of which must round exactly as the

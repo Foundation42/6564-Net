@@ -469,3 +469,41 @@ work item 4 is for — and now it's measured, not guessed. A regression
 guard sits at 130 cy/pass without blessing the current cost.
 
 88 tests green.
+
+## supervise.joe: death is a message, policy is not code (2026-07-16)
+
+The third conversion brings `spawn … restarts R watchdog W` and
+`case exit(w, crash(code) | hung | abandoned)` into joe. The sketch's
+§2.2 rule — "restarts 3 is policy, not code" — is now literal: the
+compiler emits a supervision runtime into the serve loop (match the
+obituary to a spawn record, decrement the budget, SPWN or abandon,
+classify hung by the watchdog fault code), and the user's cases just
+observe. The loader wires each child: a context on the spawner's core,
+watchdog + WDEX ceiling, exit link, and a spawn record in the
+spawner's near page.
+
+Three design decisions worth the ledger:
+
+1. **Init is idempotent because respawn re-runs it.** Compiled actors
+   now self-stage their ring descriptors (head = tail = 0) every life —
+   a respawned incarnation starts clean, vars reset "as they should"
+   (sketch §1), and the loader got out of the setRing business
+   entirely. Migration byte-identical for pingpong/ring.
+2. **Timer chains outlive incarnations.** The AUTO_REARM chain is
+   address-based, so it keeps ticking across a respawn; an armed-flag
+   in the near page (which survives SPWN) stops re-arming from
+   doubling the tick rate at every death. `halt ok` disarms; `halt
+   err` does not — crashes never clean up, THAT IS WHAT SUPERVISORS
+   ARE FOR: the exit runtime stops a dead child's clock only when it
+   will stay dead (clean exit or abandoned).
+3. **The only hang joe can express is a broken promise.** joe has no
+   unbounded loop, so supervise.joe's Sleeper hangs by declaring
+   `bounded 40` over a body that costs more — WDEX (handoff item 1)
+   makes the lie an ordinary watchdog fault, and `hung` is just its
+   fault code. Two items from the same handoff met in the middle.
+
+Run: boss halted with crashes=2, hangs=1, lost=2 — the exact budget
+arithmetic (3 Griefer lives, 2 Sleeper lives). The dead lie where they
+fell (brk, watchdog), their clocks stopped, and the machine went
+quiet in 5,368 cycles — quiescence is the proof the disarm logic
+works. 89 tests green; frozen table intact.

@@ -1,0 +1,60 @@
+// supervise.joe — the sketch's §2.2: death is a message.
+//
+// `restarts N` is policy, not code: the compiled runtime wires the exit
+// link, respawns on death up to the budget, and the obituaries still
+// arrive at the Boss's cases so it can OBSERVE what it no longer has
+// to DO. A respawn re-runs init: vars reset (a restart clears them, as
+// it should) while the near page's ring wiring rebuilds itself.
+//
+// The Griefer crashes on its third tick, every life, until its budget
+// runs out. The Sleeper demonstrates the only hang joe can express:
+// a `bounded` declaration its own body fails to honor — the watchdog
+// makes the lie an ordinary fault, and `hung` is just its fault code.
+
+actor Boss() {
+    var crashes u64 = 0
+    var hangs u64 = 0
+    var lost u64 = 0
+
+    spawn Griefer() restarts 2 watchdog 0
+    spawn Sleeper() restarts 1 watchdog 400
+
+    serve {
+        case exit(w, crash(code)):
+            crashes += 1
+
+        case exit(w, hung):
+            hangs += 1
+
+        case exit(w, abandoned):
+            lost += 1
+            if lost == 2 { halt ok }
+    }
+}
+
+actor Griefer() {
+    var ticks u64 = 0
+    serve {
+        after 500:
+            ticks += 1
+            if ticks >= 3 { halt err }
+    }
+}
+
+actor Sleeper() {
+    var acc u64 = 0
+    serve {
+        after 500:
+            bounded 40 {
+                acc += 1
+                acc += 2
+                acc += 3
+                acc += 4
+                acc += 5
+            }
+    }
+}
+
+system {
+    boss = Boss() on 0
+}

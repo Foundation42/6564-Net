@@ -5,18 +5,26 @@
 //!
 //!   placement    one instance per core unless `on N` says otherwise;
 //!                instances sharing a core become contexts, each in its
-//!                own $1000 block (code, rings, buffers, stack)
+//!                own $1000 block (code, rings, buffers, stack). An
+//!                actor's `spawn`s become further contexts on its core.
 //!   wiring       an instance name as an argument = a capability: a PTT
 //!                slot in the sender's core, aimed at the target's RX
 //!                ring — the loader binds it like wiring two actors
 //!   staging      params written into the near page; addr params get
-//!                the window value of their allocated slot
-//!   timers       one black-hole PTT slot per core that needs one; the
-//!                `after N` period becomes the fabric's send_timeout
-//!                (per-send timeouts are still an open spec item, §10)
+//!                the window value of their allocated slot. Ring
+//!                descriptors are NOT loader business: compiled init
+//!                self-stages them, so respawn re-runs init cleanly.
+//!   supervision  per spawn: the child's watchdog + WDEX ceiling, the
+//!                exit link to the spawner's CQ, and the spawn record
+//!                in the spawner's near page ({ctx, entry, sp, arg} for
+//!                SPWN, +32 the child's timer-SQE address so the exit
+//!                runtime can stop a dead child's clock)
+//!   timers       one black-hole PTT slot per user; the `after N`
+//!                period becomes the fabric's send_timeout (per-send
+//!                timeouts are still an open spec item, §10)
 //!
-//! The outcome reports every instance by name: state, fault if any, and
-//! its `var` values read back from the near page.
+//! The outcome reports every context by name — spawned children as
+//! `parent/Actor#k` — with state, fault, and `var` values read back.
 
 const std = @import("std");
 const ring = @import("ring.zig");
@@ -81,12 +89,17 @@ pub const Outcome = struct {
 };
 
 const Placed = struct {
-    decl: joe.Plan.PlanInstance,
+    name: []const u8,
+    actor: []const u8,
+    args: []const joe.InstanceDecl.Arg,
     core: u16,
     ctx: u8,
-    /// PTT slots allocated for this instance's ref args, in arg order.
     ref_slots: [8]u16 = @splat(0),
     timer_ptt: u16 = 0,
+    /// Set for spawned children: index of the spawning instance.
+    parent: ?usize = null,
+    rec_off: u16 = 0,
+    watchdog: u64 = 0,
 };
 
 fn fail(comptime fmt: []const u8, args: anytype) error{Deploy} {
@@ -94,7 +107,15 @@ fn fail(comptime fmt: []const u8, args: anytype) error{Deploy} {
     return error.Deploy;
 }
 
+fn blockOf(ctx: u8) u64 {
+    return machine.ram_base + @as(u64, ctx) * joe.abi.block_size;
+}
+
 pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Outcome {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
     var diag = joe.Diagnostic{};
     var pl = joe.plan(alloc, source, &diag) catch |err| {
         std.debug.print("joe: line {d}: {s}\n", .{ diag.line, diag.message });
@@ -104,13 +125,12 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     if (pl.instances.len == 0)
         return fail("this source has no `system` block to run", .{});
 
-    // ── Place: explicit `on N` wins; the rest fill fresh cores. ──
-    var placed = try alloc.alloc(Placed, pl.instances.len);
-    defer alloc.free(placed);
+    // ── Place the declared instances: explicit `on N` wins; the rest
+    //    fill fresh cores. ──
+    var all = std.ArrayList(Placed).init(scratch);
     var next_core: u16 = 0;
-    var ctx_count = std.AutoHashMap(u16, u8).init(alloc);
-    defer ctx_count.deinit();
-    for (pl.instances, 0..) |inst, i| {
+    var ctx_count = std.AutoHashMap(u16, u8).init(scratch);
+    for (pl.instances) |inst| {
         if (inst.args.len > 8) return fail("more than 8 instance args", .{});
         const core = inst.core orelse blk: {
             while (ctx_count.contains(next_core)) next_core += 1;
@@ -118,23 +138,25 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         };
         const n = ctx_count.get(core) orelse 0;
         try ctx_count.put(core, n + 1);
-        placed[i] = .{ .decl = inst, .core = core, .ctx = n };
+        try all.append(.{
+            .name = inst.name,
+            .actor = inst.actor,
+            .args = inst.args,
+            .core = core,
+            .ctx = n,
+        });
     }
     var cores: u16 = 0;
-    var max_ctx: u8 = 1;
-    var it = ctx_count.iterator();
-    while (it.next()) |e| {
-        cores = @max(cores, e.key_ptr.* + 1);
-        max_ctx = @max(max_ctx, e.value_ptr.*);
+    {
+        var it = ctx_count.iterator();
+        while (it.next()) |e| cores = @max(cores, e.key_ptr.* + 1);
     }
 
-    // ── Allocate PTT slots per core: refs in instance order, then one
-    //    black hole per core that hosts a timer. ──
-    var ptt_next = try alloc.alloc(u16, cores);
-    defer alloc.free(ptt_next);
+    // ── PTT slots: capability refs first, in instance order. ──
+    var ptt_next = try scratch.alloc(u16, cores);
     @memset(ptt_next, 0);
-    for (placed) |*p| {
-        for (p.decl.args, 0..) |a, k| {
+    for (all.items) |*p| {
+        for (p.args, 0..) |a, k| {
             if (a == .ref) {
                 p.ref_slots[k] = ptt_next[p.core];
                 ptt_next[p.core] += 1;
@@ -142,7 +164,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         }
     }
 
-    // ── Compile every instance in its own block. ──
+    // ── Compile everything — the list grows as spawns add children. ──
     const Compiled = struct { r: joe.Result, out: asm6564.Output };
     var compiled = std.ArrayList(Compiled).init(alloc);
     defer {
@@ -153,38 +175,59 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         compiled.deinit();
     }
     var timer_period: u64 = 0;
-    for (placed) |*p| {
-        const block = machine.ram_base + @as(u64, p.ctx) * joe.abi.block_size;
-        // The timer slot is per-core; allocate lazily on first need.
-        var r = joe.compile(alloc, source, p.decl.actor, .{
+    var i: usize = 0;
+    while (i < all.items.len) : (i += 1) {
+        const pc = all.items[i];
+        const block = blockOf(pc.ctx);
+        var r = joe.compile(alloc, source, pc.actor, .{
             .origin = block,
             .data = block + joe.abi.data_off,
-            .timer_ptt = ptt_next[p.core], // valid only if the actor uses it
+            .timer_ptt = ptt_next[pc.core], // consumed below iff used
         }, &diag) catch |err| {
-            std.debug.print("joe {s}: line {d}: {s}\n", .{ p.decl.actor, diag.line, diag.message });
+            std.debug.print("joe {s}: line {d}: {s}\n", .{ pc.actor, diag.line, diag.message });
             return err;
         };
+        errdefer r.deinit();
         if (r.uses_timer) {
-            p.timer_ptt = ptt_next[p.core];
-            ptt_next[p.core] += 1;
-            if (timer_period != 0 and timer_period != r.timer_period) {
-                r.deinit();
+            all.items[i].timer_ptt = ptt_next[pc.core];
+            ptt_next[pc.core] += 1;
+            if (timer_period != 0 and timer_period != r.timer_period)
                 return fail("two different `after` periods in one system (open spec item, §10)", .{});
-            }
             timer_period = r.timer_period;
         }
-        if (r.params.len != p.decl.args.len) {
-            std.debug.print("joe {s}: {d} args for {d} params\n", .{ p.decl.name, p.decl.args.len, r.params.len });
-            r.deinit();
-            return error.Deploy;
+        if (r.params.len != pc.args.len)
+            return fail("{s}: {d} args for {d} params", .{ pc.name, pc.args.len, r.params.len });
+        if (r.spawns.len > 0 and pc.parent != null)
+            return fail("{s}: v1 supervises one level deep", .{pc.name});
+        for (r.spawns, 0..) |s, k| {
+            const core = pc.core; // SPWN is core-local: children live with the spawner
+            const cctx = ctx_count.get(core) orelse 0;
+            try ctx_count.put(core, cctx + 1);
+            const cargs = try scratch.alloc(joe.InstanceDecl.Arg, s.args.len);
+            for (s.args, 0..) |v, j| cargs[j] = .{ .int = v };
+            try all.append(.{
+                .name = try std.fmt.allocPrint(scratch, "{s}/{s}#{d}", .{ pc.name, s.actor, k }),
+                .actor = s.actor,
+                .args = cargs,
+                .core = core,
+                .ctx = cctx,
+                .parent = i,
+                .rec_off = s.rec_off,
+                .watchdog = s.watchdog,
+            });
         }
         var adiag = asm6564.Diagnostic{};
         const out = asm6564.assemble(alloc, r.asm_text, &adiag) catch |err| {
-            std.debug.print("joe {s}: asm line {d}: {s}\n", .{ p.decl.actor, adiag.line, adiag.message });
-            r.deinit();
+            std.debug.print("joe {s}: asm line {d}: {s}\n", .{ pc.actor, adiag.line, adiag.message });
             return err;
         };
         try compiled.append(.{ .r = r, .out = out });
+    }
+
+    var max_ctx: u8 = 1;
+    {
+        var it = ctx_count.iterator();
+        while (it.next()) |e| max_ctx = @max(max_ctx, e.value_ptr.*);
     }
 
     // ── The machine. ──
@@ -205,66 +248,20 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     });
     defer m.deinit();
 
-    // ── Wire: rings for every context, PTT capabilities, black holes. ──
-    for (placed, compiled.items) |*p, *c| {
-        const layout = joe.Layout{
-            .origin = machine.ram_base + @as(u64, p.ctx) * joe.abi.block_size,
-            .data = machine.ram_base + @as(u64, p.ctx) * joe.abi.block_size + joe.abi.data_off,
-        };
-        m.setRing(p.core, p.ctx, ring.slot_sq, .{
-            .base = layout.sqBase(),
-            .cap_log2 = 0,
-            .entry_size = ring.sq_entry_size,
-            .watermark = 0,
-            .companion_cq = ring.slot_cq,
-            .head = 0,
-            .tail = 0,
-            .token = 0,
-        });
-        m.setRing(p.core, p.ctx, ring.slot_cq, .{
-            .base = layout.cqBase(),
-            .cap_log2 = 4,
-            .entry_size = ring.cq_entry_size,
-            .watermark = 0,
-            .companion_cq = ring.slot_cq,
-            .head = 0,
-            .tail = 0,
-            .token = 0,
-        });
-        m.setRing(p.core, p.ctx, joe.abi.timer_desc, .{
-            .base = layout.timerBase(),
-            .cap_log2 = 0,
-            .entry_size = ring.sq_entry_size,
-            .watermark = 0,
-            .companion_cq = ring.slot_cq,
-            .head = 0,
-            .tail = 0,
-            .token = 0,
-        });
-        m.setRing(p.core, p.ctx, ring.slot_rx, .{
-            .base = layout.rxBase(),
-            .cap_log2 = 1,
-            .entry_size = ring.rx_entry_size,
-            .watermark = 0,
-            .companion_cq = ring.slot_cq,
-            .flags = ring.desc_flag_auto_repost,
-            .head = 0,
-            .tail = 0,
-            .token = 0x6564,
-        });
-        // Capabilities: each ref arg gets its slot aimed at the target.
-        for (p.decl.args, 0..) |a, k| {
+    // ── Wire capabilities and black holes (rings are self-staged). ──
+    for (all.items, compiled.items) |*p, *c| {
+        for (p.args, 0..) |a, k| {
             if (a != .ref) continue;
             if (!c.r.params[k].addr)
-                return fail("{s}: arg {d} names an instance but the param is not addr", .{ p.decl.name, k });
-            const target = for (placed) |*t| {
-                if (std.mem.eql(u8, t.decl.name, a.ref)) break t;
-            } else return fail("{s}: no instance named {s}", .{ p.decl.name, a.ref });
+                return fail("{s}: arg {d} names an instance but the param is not addr", .{ p.name, k });
+            const target = for (all.items) |*t| {
+                if (t.parent == null and std.mem.eql(u8, t.name, a.ref)) break t;
+            } else return fail("{s}: no instance named {s}", .{ p.name, a.ref });
             m.setPtt(p.core, p.ref_slots[k], .{
                 .prefix_hi = 0xfd65_6400_0000_0000,
                 .prefix_lo = ring.PttEntry.loFrom(target.core, target.ctx, ring.slot_rx),
                 .rights = .{ .send = true },
-                .token = 0x6564,
+                .token = joe.abi.token,
             });
         }
         if (c.r.uses_timer) {
@@ -276,29 +273,39 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         }
     }
 
-    // ── Load, stage, spawn — last declared spawns first, so servers
-    //    declared later in the block are listening before openers move.
-    for (placed, compiled.items) |*p, *c| {
+    // ── Load code, stage params and supervision. ──
+    for (all.items, compiled.items) |*p, *c| {
         m.load(p.core, c.out.origin, c.out.code);
-        for (p.decl.args, c.r.params, 0..) |a, prm, k| {
+        const near = &m.cores[p.core].contexts[p.ctx].near;
+        for (p.args, c.r.params, 0..) |a, prm, k| {
             const value: u64 = switch (a) {
                 .int => |v| v,
                 .ref => ring.windowAddr(p.ref_slots[k], 0),
             };
-            std.mem.writeInt(
-                u64,
-                m.cores[p.core].contexts[p.ctx].near[prm.off..][0..8],
-                value,
-                .little,
-            );
+            std.mem.writeInt(u64, near[prm.off..][0..8], value, .little);
+        }
+        if (p.parent) |pi| {
+            const parent = all.items[pi];
+            const layout = joe.Layout{ .origin = blockOf(p.ctx), .data = blockOf(p.ctx) + joe.abi.data_off };
+            const pnear = &m.cores[parent.core].contexts[parent.ctx].near;
+            const rec = [_]u64{ p.ctx, blockOf(p.ctx), blockOf(p.ctx) + joe.abi.block_size, 0, layout.timerBase() };
+            for (rec, 0..) |wv, j| {
+                std.mem.writeInt(u64, pnear[p.rec_off + j * 8 ..][0..8], wv, .little);
+            }
+            m.setWatchdog(p.core, p.ctx, p.watchdog);
+            m.setWdexCeiling(p.core, p.ctx, p.watchdog);
+            m.linkSupervisor(p.core, p.ctx, parent.ctx, ring.slot_cq);
         }
     }
-    var i: usize = placed.len;
-    while (i > 0) {
-        i -= 1;
-        const p = &placed[i];
-        const block = machine.ram_base + @as(u64, p.ctx) * joe.abi.block_size;
-        try m.spawn(p.core, p.ctx, block, block + joe.abi.block_size, 0);
+
+    // ── Spawn declared instances, last first, so servers declared later
+    //    are listening before openers move. Children start via SPWN. ──
+    var s = all.items.len;
+    while (s > 0) {
+        s -= 1;
+        const p = &all.items[s];
+        if (p.parent != null) continue;
+        try m.spawn(p.core, p.ctx, blockOf(p.ctx), blockOf(p.ctx) + joe.abi.block_size, 0);
     }
 
     const reason = try m.run();
@@ -308,7 +315,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     errdefer insts.deinit();
     var max_clock: u64 = 0;
     for (m.cores) |*core| max_clock = @max(max_clock, core.clock);
-    for (placed, compiled.items) |*p, *c| {
+    for (all.items, compiled.items) |*p, *c| {
         const ctx = &m.cores[p.core].contexts[p.ctx];
         var vars = std.ArrayList(VarOut).init(alloc);
         for (c.r.vars) |v| {
@@ -318,8 +325,8 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             });
         }
         try insts.append(.{
-            .name = try alloc.dupe(u8, p.decl.name),
-            .actor = try alloc.dupe(u8, p.decl.actor),
+            .name = try alloc.dupe(u8, p.name),
+            .actor = try alloc.dupe(u8, p.actor),
             .core = p.core,
             .ctx = p.ctx,
             .state = ctx.state,
@@ -341,29 +348,26 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
     var o = try simulate(alloc, source, opts);
     defer o.deinit();
     const stdout = std.io.getStdOut().writer();
-    // Translate the machine's stop reason into system terms: a "deadlock"
-    // where every instance is halted or parked serving is quiescence —
-    // the system went quiet, which is what finishing looks like when
-    // some actors serve forever.
-    var halted: usize = 0;
+    // Translate the machine's stop reason into system terms: it stops
+    // when the fabric goes quiet, and quiet-with-corpses can be exactly
+    // what supervision intended — abandoned workers stay dead.
     var parked: usize = 0;
-    var faulted: usize = 0;
+    var running: usize = 0;
     for (o.instances) |inst| {
         switch (inst.state) {
-            .halted => halted += 1,
             .parked => parked += 1,
-            .faulted => faulted += 1,
+            .ready => running += 1,
             else => {},
         }
     }
     const verdict = switch (o.reason) {
-        .deadlock => if (faulted == 0 and halted + parked == o.instances.len)
+        .deadlock => if (running == 0)
             "quiescent — the work is done, the servers are parked"
         else
             "DEADLOCK: something is stuck",
         .all_halted => "all instances halted",
-        .faulted => "an instance FAULTED",
-        .max_cycles => "hit max_cycles",
+        .faulted => "quiescent, with the dead left where they fell (supervision may intend this)",
+        .max_cycles => "hit max_cycles — something never went quiet",
     };
     try stdout.print(
         \\sim6564 — joe: system of {d} instance(s)
@@ -406,7 +410,5 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
         o.stats.timeouts,
         o.stats.rejects,
     });
-    for (o.instances) |inst| {
-        if (inst.state == .faulted) std.process.exit(1);
-    }
+    if (o.reason == .max_cycles) std.process.exit(1);
 }

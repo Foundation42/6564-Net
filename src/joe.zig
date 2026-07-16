@@ -38,6 +38,8 @@
 
 const std = @import("std");
 const isa = @import("isa.zig");
+const ring = @import("ring.zig");
+const machine = @import("machine.zig");
 
 pub const Diagnostic = struct {
     line: usize = 0,
@@ -88,6 +90,9 @@ pub const Layout = struct {
 pub const abi = struct {
     pub const timer_desc: u8 = 5;
     pub const land_cap: u64 = 64;
+    /// The one capability token of the v1 ABI: RX rings require it, the
+    /// loader's PTT entries present it.
+    pub const token: u64 = 0x6564;
     pub const param_base: u16 = 0x800;
     pub const timer_cookie: u64 = 0x77;
     /// One instance block: code at +0, data at +$800, stack down from
@@ -158,7 +163,16 @@ const Stmt = union(enum) {
     if_: struct { cond: *Expr, then: []Stmt, els: []Stmt },
     halt: struct { ok: bool },
     bounded: struct { n: u64, body: []Stmt },
+    spawn: struct {
+        actor: []const u8,
+        args: []u64, // v1: literal args only
+        restarts: u64,
+        watchdog: u64,
+        line: usize,
+    },
 };
+
+const ExitCause = enum { crash, hung, abandoned };
 
 const Handler = union(enum) {
     case: struct {
@@ -169,6 +183,13 @@ const Handler = union(enum) {
         line: usize,
     },
     after: struct { n: u64, body: []Stmt },
+    exit_case: struct {
+        bind: []const u8,
+        cause: ExitCause,
+        code_bind: ?[]const u8,
+        body: []Stmt,
+        line: usize,
+    },
 };
 
 const Param = struct { name: []const u8, ty: Type };
@@ -518,6 +539,34 @@ const Parser = struct {
         if (try self.eatKw("case")) {
             const line = self.tok.line;
             const msg = try self.expect(.ident, "message name");
+            if (std.mem.eql(u8, msg.text, "exit")) {
+                // `case exit(w, crash(code) | hung | abandoned):`
+                _ = try self.expect(.lparen, "(");
+                const bind = try self.expect(.ident, "worker binding");
+                _ = try self.expect(.comma, ",");
+                const cause_t = try self.expect(.ident, "a cause");
+                var cause: ExitCause = undefined;
+                var code_bind: ?[]const u8 = null;
+                if (std.mem.eql(u8, cause_t.text, "crash")) {
+                    cause = .crash;
+                    _ = try self.expect(.lparen, "(");
+                    code_bind = (try self.expect(.ident, "code binding")).text;
+                    _ = try self.expect(.rparen, ")");
+                } else if (std.mem.eql(u8, cause_t.text, "hung")) {
+                    cause = .hung;
+                } else if (std.mem.eql(u8, cause_t.text, "abandoned")) {
+                    cause = .abandoned;
+                } else return self.fail("cause is crash(code), hung or abandoned", Error.Syntax);
+                _ = try self.expect(.rparen, ")");
+                _ = try self.expect(.colon, ":");
+                return .{ .exit_case = .{
+                    .bind = bind.text,
+                    .cause = cause,
+                    .code_bind = code_bind,
+                    .body = try self.parseHandlerBody(),
+                    .line = line,
+                } };
+            }
             _ = try self.expect(.lparen, "(");
             var bind: ?[]const u8 = null;
             if (self.tok.kind == .underscore) {
@@ -599,7 +648,29 @@ const Parser = struct {
             const n = try self.expect(.int, "cycle count");
             return .{ .bounded = .{ .n = n.value, .body = try self.parseBlock() } };
         }
-        inline for (.{ "spawn", "chain", "for", "let", "quiesce", "region", "grant", "log" }) |kw| {
+        if (try self.eatKw("spawn")) {
+            const actor = try self.expect(.ident, "actor name");
+            _ = try self.expect(.lparen, "(");
+            var args = std.ArrayList(u64).init(self.arena);
+            while (self.tok.kind != .rparen) {
+                const v = try self.expect(.int, "a literal arg (v1)");
+                try args.append(v.value);
+                if (self.tok.kind == .comma) try self.advance();
+            }
+            try self.advance(); // )
+            var restarts: u64 = 0;
+            var watchdog: u64 = 0;
+            if (try self.eatKw("restarts")) restarts = (try self.expect(.int, "restart budget")).value;
+            if (try self.eatKw("watchdog")) watchdog = (try self.expect(.int, "watchdog budget")).value;
+            return .{ .spawn = .{
+                .actor = actor.text,
+                .args = try args.toOwnedSlice(),
+                .restarts = restarts,
+                .watchdog = watchdog,
+                .line = line,
+            } };
+        }
+        inline for (.{ "chain", "for", "let", "quiesce", "region", "grant", "log" }) |kw| {
             if (self.isKw(kw))
                 return self.fail("`" ++ kw ++ "` is not in v1 yet", Error.Unsupported);
         }
@@ -730,8 +801,14 @@ const Gen = struct {
     /// Current case binding: name → the landing pointer internal.
     bind: ?[]const u8 = null,
     bind_msg: ?*const Message = null,
+    /// Current exit-case bindings: worker (fields id/life) and fault code.
+    exit_bind: ?[]const u8 = null,
+    exit_code_bind: ?[]const u8 = null,
+    in_handler: bool = false,
     uses_timer: bool = false,
     timer_period: u64 = 0,
+    spawn_count: u16 = 0,
+    spawn_seen: u16 = 0,
 
     // Near-page slot offsets, assigned in layout().
     slots: std.StringHashMap(u16),
@@ -740,6 +817,15 @@ const Gen = struct {
     off_t: u16 = 0,
     off_acc: u16 = 0,
     off_fp: u16 = 0,
+    off_ectx: u16 = 0,
+    off_elife: u16 = 0,
+    off_ecode: u16 = 0,
+    off_tarmed: u16 = 0,
+    /// Spawn records live after the internals: 48 bytes each —
+    /// {ctx, entry, sp, arg} (the SPWN block, loader-staged), +32 the
+    /// child's timer-SQE address (for disarm-on-death), +40 the restart
+    /// budget (init-staged from the `restarts` literal).
+    spawn_base: u16 = 0,
 
     fn fail(self: *Gen, line: usize, comptime msg: []const u8, err: Error) Error {
         if (self.diag) |d| {
@@ -789,12 +875,24 @@ const Gen = struct {
         self.off_t = off + 16;
         self.off_acc = off + 24;
         self.off_fp = off + 32;
+        self.off_ectx = off + 40;
+        self.off_elife = off + 48;
+        self.off_ecode = off + 56;
+        self.off_tarmed = off + 64;
+        self.spawn_base = off + 72;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
                 self.timer_period = h.after.n;
             }
         }
+        for (self.actor.body) |s| {
+            if (s == .spawn) self.spawn_count += 1;
+        }
+    }
+
+    fn spawnRec(self: *Gen, k: u16) u16 {
+        return self.spawn_base + k * 48;
     }
 
     // ── Expressions: result in A ─────────────────────────────────────────
@@ -809,6 +907,10 @@ const Gen = struct {
                 }
             },
             .ident => |name| {
+                if (self.exit_code_bind != null and std.mem.eql(u8, self.exit_code_bind.?, name)) {
+                    try self.w("        LDA ${X}", .{self.off_ecode});
+                    return;
+                }
                 const slot = self.slots.get(name) orelse {
                     if (self.bind != null and std.mem.eql(u8, self.bind.?, name))
                         return self.fail(0, "a message binding needs a field access", Error.Semantics);
@@ -817,6 +919,16 @@ const Gen = struct {
                 try self.w("        LDA ${X}", .{slot});
             },
             .field => |f| {
+                if (self.exit_bind != null and std.mem.eql(u8, self.exit_bind.?, f.base)) {
+                    // w.id = the dead worker's context id; w.life = the
+                    // incarnation that died (both from the exit cookie).
+                    if (std.mem.eql(u8, f.name, "id")) {
+                        try self.w("        LDA ${X}", .{self.off_ectx});
+                    } else if (std.mem.eql(u8, f.name, "life")) {
+                        try self.w("        LDA ${X}", .{self.off_elife});
+                    } else return self.fail(0, "a worker binding has .id and .life", Error.Semantics);
+                    return;
+                }
                 const bind = self.bind orelse
                     return self.fail(0, "field access outside a case", Error.Semantics);
                 if (!std.mem.eql(u8, bind, f.base))
@@ -971,7 +1083,12 @@ const Gen = struct {
                 }
             },
             .halt => |h| {
-                if (self.uses_timer) {
+                // `halt ok` is a clean shutdown and cleans up its timer.
+                // `halt err` is a crash, and crashes never clean up —
+                // that is precisely what supervisors are for: the exit
+                // runtime disarms a dead child's timer when (and only
+                // when) it will stay dead.
+                if (h.ok and self.uses_timer) {
                     try self.w("        LDA #2              ; disarm the timer", .{});
                     try self.w("        STA !${X}", .{self.layout.timerBase()});
                 }
@@ -980,6 +1097,16 @@ const Gen = struct {
             .bounded => |b| {
                 try self.w("        WDEX ##{d}", .{b.n});
                 try self.stmts(b.body);
+            },
+            .spawn => |sp| {
+                if (self.in_handler)
+                    return self.fail(sp.line, "v1: spawn lives in the actor body, before serve", Error.Unsupported);
+                const rec = self.spawnRec(self.spawn_seen);
+                self.spawn_seen += 1;
+                try self.w("; spawn {s} restarts {d} watchdog {d}", .{ sp.actor, sp.restarts, sp.watchdog });
+                try self.w("        LDA {s}", .{try self.imm(sp.restarts)});
+                try self.w("        STA ${X}", .{rec + 40});
+                try self.w("        SPWN ${X}", .{rec});
             },
         }
     }
@@ -1059,10 +1186,40 @@ const Gen = struct {
 
     // ── The actor: prologue, body, serve loop ────────────────────────────
 
+    /// Emit a store of `v` to near offset `off` (via A).
+    fn store(self: *Gen, v: u64, off: u64) Error!void {
+        try self.w("        LDA {s}", .{try self.imm(v)});
+        try self.w("        STA ${X}", .{off});
+    }
+
     fn emit(self: *Gen) Error!void {
         try self.layoutSlots();
         try self.w("; joe v1 — actor {s} (compiled; do not edit)", .{self.actor.name});
         try self.w("        .org ${X}", .{self.layout.origin});
+
+        // Ring descriptors, self-staged — head = tail = 0 every life, so
+        // init is idempotent and a respawned incarnation starts clean.
+        // Word layout is ring.Desc.pack's.
+        try self.w("; ring descriptors (self-staged: init must survive respawn)", .{});
+        const w1 = struct {
+            fn of(cap_log2: u64, entry: u64, flags: u64) u64 {
+                return cap_log2 | (entry << 8) |
+                    (@as(u64, ring.slot_cq) << 48) | (flags << 56);
+            }
+        }.of;
+        const descs = [4]struct { slot: u16, base: u64, cfg: u64, token: u64 }{
+            .{ .slot = ring.slot_sq, .base = self.layout.sqBase(), .cfg = w1(0, ring.sq_entry_size, 0), .token = 0 },
+            .{ .slot = ring.slot_cq, .base = self.layout.cqBase(), .cfg = w1(4, ring.cq_entry_size, 0), .token = 0 },
+            .{ .slot = ring.slot_rx, .base = self.layout.rxBase(), .cfg = w1(1, ring.rx_entry_size, ring.desc_flag_auto_repost), .token = abi.token },
+            .{ .slot = abi.timer_desc, .base = self.layout.timerBase(), .cfg = w1(0, ring.sq_entry_size, 0), .token = 0 },
+        };
+        for (descs) |d| {
+            const off = @as(u64, d.slot) * ring.desc_size;
+            try self.store(d.base, off);
+            try self.store(d.cfg, off + 8);
+            try self.store(0, off + 16); // head = tail = 0
+            try self.store(d.token, off + 24);
+        }
 
         // RX ring: two landing buffers, cookie = buffer address.
         try self.w("; landing buffers (cap-2 AUTO_REPOST ring)", .{});
@@ -1083,7 +1240,17 @@ const Gen = struct {
         try self.w("        RECV 2", .{});
 
         if (self.uses_timer) {
+            // The chain is address-based, not incarnation-based: it keeps
+            // ticking across a supervised respawn. The armed flag lives in
+            // the near page (which survives SPWN), so only the first life
+            // lights the fire — re-arming under a live chain would double
+            // the tick rate every death.
+            const l_armed = self.label();
             try self.w("; the after-timer: AUTO_REARM TXR into the black hole (spec §6.3)", .{});
+            try self.w("        LDA ${X}", .{self.off_tarmed});
+            try self.w("        BNE L{d}", .{l_armed});
+            try self.w("        LDA #1", .{});
+            try self.w("        STA ${X}", .{self.off_tarmed});
             try self.w("        LDA ##$202", .{});
             try self.w("        STA !${X}", .{self.layout.timerBase()});
             try self.w("        LDA ##${X}", .{self.layout.timerWindow()});
@@ -1093,6 +1260,7 @@ const Gen = struct {
             try self.w("        LDA ##${X}", .{abi.timer_cookie << 32});
             try self.w("        STA !${X}", .{self.layout.timerBase() + 24});
             try self.w("        SEND {d}", .{abi.timer_desc});
+            try self.w("L{d}:", .{l_armed});
         }
 
         // var initializers
@@ -1114,6 +1282,7 @@ const Gen = struct {
         // ── serve ──
         self.serve_label = self.label();
         const l_dispatch = self.label();
+        const l_exit = self.label();
         try self.w("; serve: LSTN, pop, dispatch — acks are consumed, never seen", .{});
         try self.w("L{d}:   LSTN 1", .{self.serve_label});
         try self.w("        CQPOP 1", .{});
@@ -1121,24 +1290,28 @@ const Gen = struct {
         try self.w("        STA ${X}", .{self.off_w0});
         try self.w("        STX ${X}", .{self.off_ptr});
         try self.w("        AND #$FF", .{});
-        try self.w("        CMP #3", .{});
+        try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});
         try self.w("        BEQ L{d}", .{l_dispatch});
+        if (self.spawn_count > 0) {
+            try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.exit)});
+            try self.w("        BEQ L{d}", .{l_exit});
+        }
         if (self.uses_timer) {
             // tag 1 (txr) + cookie $77 = the timer; everything else is ack noise
-            const l_after = self.label();
-            try self.w("        CMP #1", .{});
+            try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.txr)});
             try self.w("        BNE L{d}", .{self.serve_label});
             try self.w("        LDA ${X}", .{self.off_ptr});
             try self.w("        AND ##$FFFFFFFF", .{});
             try self.w("        CMP #{d}", .{abi.timer_cookie});
             try self.w("        BNE L{d}", .{self.serve_label});
-            try self.w("L{d}:", .{l_after});
+            self.in_handler = true;
             for (self.actor.handlers) |*h| {
                 if (h.* == .after) {
                     try self.stmts(h.after.body);
                     break;
                 }
             }
+            self.in_handler = false;
             try self.w("        BRA L{d}", .{self.serve_label});
         } else {
             try self.w("        BRA L{d}", .{self.serve_label});
@@ -1163,19 +1336,109 @@ const Gen = struct {
             self.bind = c.bind;
             self.bind_msg = msg;
             if (c.where) |g| try self.branchIfFalse(g, l_next);
+            self.in_handler = true;
             try self.stmts(c.body);
+            self.in_handler = false;
             self.bind = null;
             self.bind_msg = null;
             try self.w("        BRA L{d}", .{self.serve_label});
             try self.w("L{d}:", .{l_next});
         }
         try self.w("        BRA L{d}", .{self.serve_label});
+
+        if (self.spawn_count > 0) try self.emitExitRuntime(l_exit);
+    }
+
+    /// The supervision runtime (sketch §2.2: "restarts N is policy, not
+    /// code"): match the obituary to a spawn record, run the policy —
+    /// clean exit stays down (and its timer is disarmed); a fault
+    /// respawns while budget lasts (SPWN, the chain keeps ticking) or is
+    /// abandoned (disarm, stay down) — then hand the obituary to the
+    /// user's exit cases as an ordinary event.
+    fn emitExitRuntime(self: *Gen, l_exit: usize) Error!void {
+        const l_crash = self.label();
+        const l_hung = self.label();
+        const l_abandoned = self.label();
+        try self.w("; exit runtime: obituaries → policy → the user's cases", .{});
+        try self.w("L{d}:   LDA ${X}", .{ l_exit, self.off_ptr });
+        try self.w("        AND ##$FFFFFFFF", .{});
+        try self.w("        STA ${X}", .{self.off_ectx});
+        try self.w("        LDA ${X}", .{self.off_ptr});
+        try self.w("        LSR #32", .{});
+        try self.w("        STA ${X}", .{self.off_elife});
+        try self.w("        LDA ${X}", .{self.off_w0});
+        try self.w("        LSR #32", .{});
+        try self.w("        STA ${X}", .{self.off_ecode});
+        var k: u16 = 0;
+        while (k < self.spawn_count) : (k += 1) {
+            const rec = self.spawnRec(k);
+            const l_next = self.label();
+            const l_fault = self.label();
+            const l_respawn = self.label();
+            try self.w("        LDA ${X}", .{rec});
+            try self.w("        CMP ${X}", .{self.off_ectx});
+            try self.w("        BNE L{d}", .{l_next});
+            try self.w("        LDA ${X}", .{self.off_w0});
+            try self.w("        LSR #8", .{});
+            try self.w("        AND #$FF", .{});
+            try self.w("        CMP #{d}", .{@intFromEnum(ring.Status.fault)});
+            try self.w("        BEQ L{d}", .{l_fault});
+            try self.w("        LDA #2              ; clean exit: it stays down, its clock stops", .{});
+            try self.w("        STA (${X})", .{rec + 32});
+            try self.w("        BRA L{d}", .{self.serve_label});
+            try self.w("L{d}:   LDA ${X}", .{ l_fault, rec + 40 });
+            try self.w("        BNE L{d}", .{l_respawn});
+            try self.w("        LDA #2              ; out of restarts: abandoned, honestly", .{});
+            try self.w("        STA (${X})", .{rec + 32});
+            try self.w("        BRA L{d}", .{l_abandoned});
+            try self.w("L{d}:   DEC ${X}", .{ l_respawn, rec + 40 });
+            try self.w("        SPWN ${X}         ; fresh registers, same near page, next life", .{rec});
+            try self.w("        LDA ${X}", .{self.off_ecode});
+            try self.w("        CMP #{d}", .{@intFromEnum(machine.Fault.watchdog)});
+            try self.w("        BEQ L{d}", .{l_hung});
+            try self.w("        BRA L{d}", .{l_crash});
+            try self.w("L{d}:", .{l_next});
+        }
+        try self.w("        BRA L{d}", .{self.serve_label});
+        // The user's cases, one landing site per cause.
+        const causes = [3]struct { cause: ExitCause, label: usize }{
+            .{ .cause = .crash, .label = l_crash },
+            .{ .cause = .hung, .label = l_hung },
+            .{ .cause = .abandoned, .label = l_abandoned },
+        };
+        for (causes) |cz| {
+            try self.w("L{d}:", .{cz.label});
+            for (self.actor.handlers) |*h| {
+                if (h.* != .exit_case or h.exit_case.cause != cz.cause) continue;
+                self.exit_bind = h.exit_case.bind;
+                self.exit_code_bind = h.exit_case.code_bind;
+                self.in_handler = true;
+                try self.stmts(h.exit_case.body);
+                self.in_handler = false;
+                self.exit_bind = null;
+                self.exit_code_bind = null;
+                break;
+            }
+            try self.w("        BRA L{d}", .{self.serve_label});
+        }
     }
 };
 
 // ── Public interface ─────────────────────────────────────────────────────
 
 pub const Slot = struct { name: []const u8, off: u16, addr: bool = false };
+
+/// One `spawn` in the actor body, exported for the loader: it places the
+/// child, wires watchdog + exit link, and stages the spawn record at
+/// `rec_off` in the spawner's near page ({ctx, entry, sp, arg} for SPWN,
+/// +32 the child's timer-SQE address).
+pub const SpawnOut = struct {
+    actor: []const u8,
+    rec_off: u16,
+    restarts: u64,
+    watchdog: u64,
+    args: []u64,
+};
 
 pub const Result = struct {
     alloc: std.mem.Allocator,
@@ -1185,6 +1448,7 @@ pub const Result = struct {
     /// and vars (tests may read them). Names are owned copies.
     params: []Slot,
     vars: []Slot,
+    spawns: []SpawnOut,
     uses_timer: bool,
     /// The `after N` period — the harness wires it as the fabric's
     /// send_timeout until per-send timeouts land (open item, spec §10).
@@ -1193,6 +1457,11 @@ pub const Result = struct {
     pub fn deinit(self: *Result) void {
         for (self.params) |p| self.alloc.free(p.name);
         for (self.vars) |v| self.alloc.free(v.name);
+        for (self.spawns) |s| {
+            self.alloc.free(s.actor);
+            self.alloc.free(s.args);
+        }
+        self.alloc.free(self.spawns);
         self.alloc.free(self.params);
         self.alloc.free(self.vars);
         self.alloc.free(self.asm_text);
@@ -1329,11 +1598,26 @@ pub fn compile(
     for (actor.vars) |v| {
         try vars.append(.{ .name = try alloc.dupe(u8, v.name), .off = gen.slots.get(v.name).? });
     }
+    var spawns = std.ArrayList(SpawnOut).init(alloc);
+    errdefer spawns.deinit();
+    var k: u16 = 0;
+    for (actor.body) |s| {
+        if (s != .spawn) continue;
+        try spawns.append(.{
+            .actor = try alloc.dupe(u8, s.spawn.actor),
+            .rec_off = gen.spawnRec(k),
+            .restarts = s.spawn.restarts,
+            .watchdog = s.spawn.watchdog,
+            .args = try alloc.dupe(u64, s.spawn.args),
+        });
+        k += 1;
+    }
     return .{
         .alloc = alloc,
         .asm_text = try gen.out.toOwnedSlice(),
         .params = try params.toOwnedSlice(),
         .vars = try vars.toOwnedSlice(),
+        .spawns = try spawns.toOwnedSlice(),
         .uses_timer = gen.uses_timer,
         .timer_period = gen.timer_period,
     };
@@ -1366,7 +1650,7 @@ test "joe: pingpong compiles and assembles" {
 test "joe: v1 refuses what it cannot yet say, honestly" {
     const src =
         \\actor A() {
-        \\    spawn B() restarts 3
+        \\    chain { } on_break(k, c) { }
         \\    serve { }
         \\}
     ;
