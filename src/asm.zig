@@ -365,6 +365,19 @@ const Assembler = struct {
     /// Choose the encoding for (mnemonic, operand shape). Sizing decisions
     /// happen here, in pass 1, and are final — pass 2 must agree.
     fn pick(self: *Assembler, line_no: usize, mnem: isa.Mnemonic, shape: OperandShape) Error!isa.Encoding {
+        // MAC n: the slot index selects one of sixteen one-byte opcodes in
+        // the $?F column. The slot must be a pass-1 literal.
+        if (mnem == .mac) {
+            const ex = switch (shape) {
+                .expr => |e2| e2.expr,
+                else => return self.fail(line_no, "MAC needs a slot number", Error.BadOperand),
+            };
+            if (!self.known(ex))
+                return self.fail(line_no, "MAC slot must be a literal", Error.BadOperand);
+            const v = self.eval(line_no, ex) catch unreachable;
+            if (v > 15) return self.fail(line_no, "MAC slot out of range", Error.ValueOutOfRange);
+            return isa.decode[(@as(u8, @intCast(v)) << 4) | 0x0F].?;
+        }
         const modes: []const isa.Mode = switch (shape) {
             .none => &.{ .impl, .acc },
             .reg_a => &.{.acc},

@@ -133,6 +133,11 @@ pub const Mnemonic = enum {
     cqpop,
     capld,
     spwn,
+    // One-byte vectored calls through the per-context MACTAB (near page
+    // $F80–$FFF). Semantics are exactly JSR [MACTAB + n*8]; the slot index
+    // is the opcode's high nibble. Pre-normative — see the MAC & chains
+    // sketch; adoption rides on the measurement plan.
+    mac,
 
     /// Assembly spelling ("and_" is spelled "AND").
     pub fn spelling(self: Mnemonic) []const u8 {
@@ -255,7 +260,27 @@ pub const table = [_]Encoding{
     // {ctx, entry IP, SP, arg→A}; near,X enables indexed spawn-block tables.
     e(.spwn, .near, 0x87, 6),
     e(.spwn, .near_x, 0x97, 6),
+    // ── MAC: the $?F column, spent whole on one feature ──────────────────
+    e(.mac, .impl, 0x0F, 6),
+    e(.mac, .impl, 0x1F, 6),
+    e(.mac, .impl, 0x2F, 6),
+    e(.mac, .impl, 0x3F, 6),
+    e(.mac, .impl, 0x4F, 6),
+    e(.mac, .impl, 0x5F, 6),
+    e(.mac, .impl, 0x6F, 6),
+    e(.mac, .impl, 0x7F, 6),
+    e(.mac, .impl, 0x8F, 6),
+    e(.mac, .impl, 0x9F, 6),
+    e(.mac, .impl, 0xAF, 6),
+    e(.mac, .impl, 0xBF, 6),
+    e(.mac, .impl, 0xCF, 6),
+    e(.mac, .impl, 0xDF, 6),
+    e(.mac, .impl, 0xEF, 6),
+    e(.mac, .impl, 0xFF, 6),
 };
+
+/// Near-page base of the 16-slot macro vector table (MACTAB).
+pub const mactab_base: u16 = 0xF80;
 
 /// 256-entry decode table, generated at comptime. `null` = undefined opcode
 /// (architectural fault, honest per the spec — no silent NOPs).

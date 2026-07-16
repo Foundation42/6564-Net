@@ -746,3 +746,115 @@ test "armstrong ring: steady-state cost per pass stays two-digit" {
     // core, scheduler included, stays under 100 cycles per pass.
     try testing.expect(o.cycles_per_pass < 100);
 }
+
+// ── MAC: one-byte vectored calls (pre-normative; MAC & chains sketch) ────
+
+test "MAC calls through the per-context vector table" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    // MAC 0 → square A into $860; MAC 15 → increment $868. Vectors staged by
+    // the program itself: near-page stores into MACTAB ($F80).
+    const src =
+        \\        .org $1000
+        \\        LDA ##double
+        \\        STA $F80            ; MACTAB slot 0
+        \\        LDA ##bump
+        \\        STA $FF8            ; MACTAB slot 15
+        \\        LDA #21
+        \\        MAC 0
+        \\        MAC 15
+        \\        MAC 15
+        \\        HLT
+        \\double: ASL
+        \\        STA $860
+        \\        RTS
+        \\bump:   INC $868
+        \\        RTS
+    ;
+    try assembleInto(&m, 0, src);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    const ctx = &m.cores[0].contexts[0];
+    try testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, ctx.near[0x860..][0..8], .little));
+    try testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, ctx.near[0x868..][0..8], .little));
+    try testing.expectEqual(@as(u64, 3), m.stats.macro_calls);
+}
+
+test "MAC through a null vector faults with bad_macro" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    try assembleInto(&m, 0, ".org $1000\n MAC 7\n HLT\n");
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.faulted, try m.run());
+    try testing.expectEqual(machine.Fault.bad_macro, m.cores[0].contexts[0].fault);
+}
+
+test "MAC vectors survive SPWN: a restarted actor keeps its bindings" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 2,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    // Child binds MAC 0 in its first life, crashes; second life calls MAC 0
+    // without rebinding — the near page (and so MACTAB) survived.
+    const child_src =
+        \\        .org $1000
+        \\        LDA ##mark
+        \\        STA $F80
+        \\        BRK
+        \\life2:  MAC 0
+        \\        HLT
+        \\mark:   INC $870
+        \\        RTS
+    ;
+    const sup_src =
+        \\        .org $1200
+        \\wait1:  LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wait1
+        \\        SPWN $900
+        \\wait2:  LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wait2
+        \\        HLT
+    ;
+    var child_out = try asm6564.assemble(testing.allocator, child_src, null);
+    defer child_out.deinit();
+    var sup_out = try asm6564.assemble(testing.allocator, sup_src, null);
+    defer sup_out.deinit();
+    m.load(0, child_out.origin, child_out.code);
+    m.load(0, sup_out.origin, sup_out.code);
+    m.setRing(0, 0, ring.slot_cq, .{
+        .base = 0x2000,
+        .cap_log2 = 3,
+        .entry_size = ring.cq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    });
+    var blk: [32]u8 = undefined;
+    std.mem.writeInt(u64, blk[0..8], 1, .little);
+    std.mem.writeInt(u64, blk[8..16], child_out.symbol("life2").?, .little);
+    std.mem.writeInt(u64, blk[16..24], 0x3800, .little);
+    std.mem.writeInt(u64, blk[24..32], 0, .little);
+    m.writeNear(0, 0, 0x900, &blk);
+    m.linkSupervisor(0, 1, 0, ring.slot_cq);
+    try m.spawn(0, 1, 0x1000, 0x3000, 0);
+    try m.spawn(0, 0, 0x1200, 0x2800, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    try testing.expectEqual(
+        @as(u64, 1),
+        std.mem.readInt(u64, m.cores[0].contexts[1].near[0x870..][0..8], .little),
+    );
+}

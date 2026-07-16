@@ -126,8 +126,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var totals = Row{ .name = "**total**", .code_bytes = 0, .instructions = 0, .cycles = 0, .context_switches = 0, .ok = true };
     for (rows) |r| {
         try stdout.print("| {s} | {d} | {d} | {d} | {d} | {s} |\n", .{
-            r.name,         r.code_bytes,
-            r.instructions, r.cycles,
+            r.name,             r.code_bytes,
+            r.instructions,     r.cycles,
             r.context_switches, if (r.ok) "yes" else "**NO**",
         });
         totals.code_bytes += r.code_bytes;
@@ -137,8 +137,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         totals.ok = totals.ok and r.ok;
     }
     try stdout.print("| {s} | {d} | {d} | {d} | {d} | {s} |\n", .{
-        totals.name,         totals.code_bytes,
-        totals.instructions, totals.cycles,
+        totals.name,             totals.code_bytes,
+        totals.instructions,     totals.cycles,
         totals.context_switches, if (totals.ok) "yes" else "**NO**",
     });
     if (!totals.ok) std.process.exit(1);

@@ -186,6 +186,15 @@ ack; first-ack-wins means a sender can be told "no buffer" about a message
 that was delivered. This is truthful (each report describes one copy's fate)
 but subtle — worth a normative sentence in §6.1.
 
+## Pre-normative prototypes (MAC & chains sketch)
+
+**`MAC n`** ($0F–$FF, the whole $?F column): one-byte vectored call —
+exactly `JSR [MACTAB + n*8]`, MACTAB at near $F80–$FFF, per-context, so
+vectors travel with the actor and survive SPWN. Null vector →
+`bad_macro` fault. `stats.macro_calls`. Adoption verdict deferred — see
+docs/measurements.md: the current corpus can't feed it (3.6% max code-byte
+saving), so it awaits the chain features and richer workloads.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

@@ -47,6 +47,8 @@ pub const Fault = enum {
     /// The context held the pipeline past its watchdog burst budget (§5.4):
     /// a compute-hung actor, force-faulted so its exit link can speak.
     watchdog,
+    /// MAC through a zero vector: a bug, not a jump to page zero.
+    bad_macro,
 };
 
 pub const CtxState = enum {
@@ -157,6 +159,8 @@ pub const Stats = struct {
     /// Contexts force-faulted for holding the pipeline past their burst
     /// budget (§5.4) — each one is a compute-hang the exit link then reports.
     watchdog_trips: u64 = 0,
+    /// MAC vectored calls executed (pre-normative mechanism; see sketch).
+    macro_calls: u64 = 0,
     cq_overflows: u64 = 0,
 };
 
@@ -616,7 +620,7 @@ pub const Machine = struct {
 
     // ── Instruction execution ────────────────────────────────────────────
 
-    const StepError = MemError || error{ BadOpcode, NoCapability, BadDescriptor, Brk, OutOfMemory };
+    const StepError = MemError || error{ BadOpcode, NoCapability, BadDescriptor, Brk, BadMacro, OutOfMemory };
 
     /// Outcome of one instruction: does the current context keep the core?
     const Disposition = enum { keep, switched_out, halted };
@@ -635,6 +639,7 @@ pub const Machine = struct {
                 error.NoCapability => .no_capability,
                 error.BadDescriptor => .bad_descriptor,
                 error.Brk => .brk,
+                error.BadMacro => .bad_macro,
                 error.OutOfMemory => return err,
             };
             ctx.fault_addr = ctx.ip;
@@ -1006,6 +1011,21 @@ pub const Machine = struct {
                     .ip = words[1],
                 });
             },
+            .mac => {
+                // JSR through MACTAB slot n (opcode high nibble). The table
+                // is per-context — vectors travel with the actor, not the
+                // code — and a null vector is a bug, reported honestly.
+                const slot: usize = enc.opcode >> 4;
+                const vector = std.mem.readInt(
+                    u64,
+                    ctx.near[isa.mactab_base + slot * 8 ..][0..8],
+                    .little,
+                );
+                if (vector == 0) return error.BadMacro;
+                self.stats.macro_calls += 1;
+                try self.push(core, ctx, next_ip);
+                ctx.ip = vector;
+            },
         }
         return .keep;
     }
@@ -1158,7 +1178,7 @@ test "arithmetic, flags, branches: countdown loop" {
 test "undefined opcode faults honestly" {
     var m = try testMachine(.{ .cores = 1, .contexts_per_core = 1, .ram_size = 0x1000 });
     defer m.deinit();
-    m.load(0, ram_base, &.{0xFF});
+    m.load(0, ram_base, &.{0x02}); // $02: a jam on NMOS, undefined here too
     try m.spawn(0, 0, ram_base, ram_base + 0x800, 0);
     _ = try m.run();
     try testing.expectEqual(CtxState.faulted, m.cores[0].contexts[0].state);
