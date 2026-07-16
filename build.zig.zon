@@ -1,0 +1,13 @@
+.{
+    .name = .sim6564,
+    .version = "0.1.0",
+    .fingerprint = 0x51fd1d605b906b0f,
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+    },
+}

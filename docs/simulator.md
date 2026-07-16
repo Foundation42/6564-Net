@@ -1,0 +1,139 @@
+# sim6564 — Reference Simulator, v0.1 Implementation Record
+
+Companion to [6564-net-architecture-v2.md](6564-net-architecture-v2.md). The
+spec says what the machine *is*; this records what v0.1 of the simulator
+*decided* where the spec left latitude, what it deliberately simplifies, and
+what building it taught us. Zig 0.14.1.
+
+## Layout of the code
+
+| File | Role |
+|---|---|
+| `src/isa.zig` | Declarative ISA table — the single source of truth. Decoder generated at comptime; duplicate opcodes are compile errors. |
+| `src/ring.zig` | Pure layouts: ring descriptors, SQ/RX/CQ entry formats, PTT entries, window pointers. No machine state. |
+| `src/mesh.zig` | Fault-injection policy: latency, jitter, loss, duplication — all from one seeded PRNG. |
+| `src/machine.zig` | Contexts, cores, memory decode, the interpreter, the hardware scheduler, the discrete-event loop. |
+| `src/asm.zig` | Two-pass assembler driven by the same ISA table. |
+| `src/integration_tests.zig` | Assembled programs run end-to-end, §6 semantics exercised. |
+| `src/main.zig` | Demo: ping-pong actors with an end-to-end protocol over a hostile fabric. |
+
+`zig build test` runs everything; `zig build run` (or
+`./zig-out/bin/sim6564 [seed] [loss_ppm4k] [rounds] [trace]`) runs the demo.
+
+## Concrete decisions (spec-compatible, but v0.1 chose)
+
+**Opcode numbering.** Inherited 6502/65C02 instructions keep their classic
+opcode bytes (`LDA #imm` = `A9`, the 65C02 zp-indirect column becomes
+near-indirect, `HLT` sits in STP's `DB`). New I/O/concurrency ops occupy the
+`0x?7` column NMOS never defined; imm64 variants sit in `0x?3`.
+
+**Near page: 4 KB, of which the bottom 2 KB is the descriptor table** — 64
+slots × 32 bytes. Slots 0/1/2 are architecturally the context's SQ/CQ/default
+RX ring. The top 2 KB is software scratch (`$800`–`$FFF`).
+
+**Ring descriptor format** (see `ring.zig` doc comments for bit layout):
+base, capacity (power of two), entry size, watermark, companion-CQ slot,
+free-running head/tail (hardware masks; software never wraps), capability
+token. `count = tail -% head` — full at `count == capacity`.
+
+**Doorbell discipline.** Software *stages* an entry at the ring's tail slot in
+RAM, then executes `SEND`/`RECV`, which advances the tail. `CQPOP` pops the
+head. The spec's "doorbell-free snooping" is modeled as these explicit
+instructions; the ring state transitions are identical.
+
+**Completion record** (16 bytes): `word0 = tag | status<<8 | count<<32`,
+`word1 = cookie`. `CQPOP` loads word0→A, cookie→X, Z set when empty. Status
+codes: ok, truncated, reject_capability, reject_no_buffer, timeout.
+
+**Address decode per context:** `$0000`–`$0FFF` near page (private),
+`$1000`+ core RAM, top byte `$FF` = network window (16-bit PTT index in bits
+55:40, 40-bit offset).
+
+**Sim addressing convention.** A PTT entry's IPv6 prefix low word carries the
+mesh coordinates the simulator routes by: dst core [0..16), dst context
+[16..24), dst RX descriptor slot [24..32). Prefix high word is cosmetic
+(`fd65:6400::/32`).
+
+**Scheduling.** Cooperative: a context runs until it parks (`LSTN`), yields
+(`YLD`), halts, or faults. The bank switch costs zero cycles per §2.2. Cores
+advance private clocks; the machine steps whichever busy core is furthest
+behind, and events fire when virtual time passes them. Ties break by core
+index / event sequence number → bit-identical replay from a seed.
+
+## Deliberate v0.1 simplifications
+
+1. **The RBC drains SQs instantly.** `SEND` accepts and transmits in the same
+   cycle; the SQ never stays full, so "SEND parks on full SQ" (§5.2) is
+   defined but unexercised. A drain-rate model is a Phase 3 refinement.
+2. **Watermarks are stored but not acted on** — `LSTN` wakes on non-empty
+   only. Threshold events beyond that are future work.
+3. **`RECV` on a full ring faults** (`bad_descriptor`). Posting to a full
+   ring is a software bug; the fault is honest. (Parking instead is a
+   defensible alternative — revisit with real workloads.)
+4. **Remote loads fault** (`remote_load`). Remote reads are a software
+   protocol (SEND a request, RECV the answer), not a synchronous bus op.
+   Stores through the window become single-word datagrams (TXR semantics);
+   the PTT `write` right is reserved for future registered-region RDMA
+   writes, and the window offset is carried but not yet interpreted.
+5. **Contexts on one core share RAM above the near page.** Actor purity
+   (spec open question 3) says they shouldn't share mutable state; v0.1
+   trusts software. The near page *is* enforced private.
+6. **Single privilege level.** `CAPLD` is executable by anyone; the
+   privileged/unprivileged split (open question 4) is not yet modeled.
+7. **CQ overflow drops the completion and counts it** (`stats.cq_overflows`).
+   Size CQs generously. io_uring-style overflow handling is future work.
+8. **The ownership bit is cleared by RAM address** captured at accept time.
+   If software reuses an SQ slot before its completion posts, the clear can
+   land on the reused entry — consistent with §6.2's "undefined effect" for
+   software that touches in-flight state.
+
+## What building it taught us (feed back into the spec)
+
+**The fabric is a clock.** The ISA has no timer, and a real end-to-end
+protocol *needs* one: the "send acked OK but the reply was lost" case leaves
+the sender with nothing outstanding and nothing ever arriving — an
+unrecoverable park. The idiom that fixes it: **send to an unroutable PTT
+prefix**. The datagram vanishes; the mandatory timeout completion arrives
+exactly `send_timeout` cycles later. Software gets its retransmission timer
+from the fabric's honesty alone, no new silicon. The demo's ping actor runs a
+persistent timer chain this way. *Blessed:* this is now normative — spec §6.3,
+"Timers: the Fabric as Clock". Per-send timeout values and a fixed black-hole
+slot number remain open.
+
+**Landed-but-unwanted still consumes the buffer.** A sequence-checking
+receiver that ignores a stale duplicate must still re-post its landing
+buffer: the reject/accept decision is the application's, but the *consumption*
+already happened in hardware. Missing this deadlocked the first demo protocol.
+The pattern: repost on every `ok` delivery completion, wanted or not.
+
+**Transport acks are nearly useless to applications.** The demo's first
+protocol acted on SEND acks ("delivered, so stop retransmitting") and
+deadlocked; the working protocol ignores them entirely and trusts only
+end-to-end evidence (the echo) plus timers. This is the end-to-end argument
+reproduced from first principles in ~60 instructions. The CQ ack still
+matters for one thing: buffer ownership release (§6.2).
+
+**Duplicate reject acks race genuine ok acks.** When a duplicated datagram's
+second copy finds no buffer, its reject ack can overtake the first copy's ok
+ack; first-ack-wins means a sender can be told "no buffer" about a message
+that was delivered. This is truthful (each report describes one copy's fate)
+but subtle — worth a normative sentence in §6.1.
+
+## Stats and tracing
+
+`Machine.stats`: instructions, context switches, sends, delivered, lost,
+duplicated, timeouts, rejects, unroutable, CQ overflows. `Config.trace`
+prints scheduler/RBC/fabric events with cycle stamps to stderr — the demo
+takes `trace` as its 4th CLI arg.
+
+## Phase status (§9 of the spec)
+
+- **Phase 1 — deterministic core: done.** Comptime-decoded ISA, banked
+  contexts, near-page descriptors, continuation queue, single-core queue
+  pairs, cycle-stepped clock.
+- **Phase 2 — virtual mesh: done.** Multi-core, PTT routing, seeded
+  loss/latency/reorder/duplication on off-chip paths (acks included —
+  two-generals is live), deterministic replay verified by test.
+- **Phase 3 — actor workloads: started.** Ping-pong with end-to-end
+  reliability is in `main.zig` with cycle/utilization stats. Supervision
+  trees, pipelines, scatter-gather: next.
