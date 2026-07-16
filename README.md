@@ -74,6 +74,15 @@ BLOCK OK
 CYCLES 00000000000039A7
 ```
 
+**joe** is the language (`sim6564 joe`; compiler in `src/joe.zig`,
+sketch in `docs/joe-v1-sketch.md`): Go's clothes, Erlang's soul,
+occam's discipline. `pingpong.joe` — an actor, a `serve` loop, a
+fabric timer, and not one line of ack handling, because joe has no
+syntax for transport acks — compiles to 6564 assembly (`sim6564 joec
+src/programs/pingpong.joe Pinger` to read it) and completes its rounds
+at 73% packet loss, sequence-checked. The compiled protocol costs
++10% code and +1% wall clock against the hand-written ping.asm.
+
 **mandel** renders the Mandelbrot set in IEEE 754 double precision on
 a 6502 descendant (`sim6564 mandel`): Tier 0 scalar FP lives on the
 extended opcode page behind prefix `$42` — WDM, the byte the 65816

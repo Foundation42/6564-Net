@@ -433,6 +433,38 @@ hello.asm's retry discipline. The test replays the whole picture
 against a host-f64 oracle — any misrounding anywhere in ~40k FP ops
 is a visibly wrong character.
 
+## joe v1 (post-v2.5 handoff item 3)
+
+`src/joe.zig` compiles the sketch's pingpong subset to .asm text —
+four passes, no IR, the near page as the frame. Design notes that
+matter for extending it:
+
+- **The runtime ABI is ping.asm's wiring, verbatim** (desc 0/1/2 =
+  SQ/CQ/RX, timer SQ at slot 5, landing buffers with cookie = buffer
+  address, AUTO_REARM black-hole timer with reserved cookie $77). A
+  compiled actor drops into any harness that speaks that shape;
+  `demo_joe.zig` is the reference loader — staging params into the
+  near page is all a loader is.
+- **Wire format**: word0 low 16 bits = tag (declaration order,
+  1-based), fields packed at their own alignment so none straddles a
+  word; ≤ 8 bytes total rides TXR (one register datagram), larger
+  stages at $2500 and rides SEND. The receive side can't tell.
+- **The serve loop consumes transport acks invisibly** (tag 1/2
+  completions that aren't the timer cookie) — the end-to-end argument
+  is enforced by the dispatcher the compiler emits, not by programmer
+  discipline.
+- **`.from` is deliberately absent from v1**: a reply target is a
+  capability in the receiver's PTT space, and the sender cannot name
+  it. Surfacing `.from` is the capability-transfer question — it needs
+  spec work, not compiler work. Reply routes are params for now.
+- **`after N` leans on the harness**: per-send timeout values are
+  still an open spec item (§10), so the contract exports
+  `timer_period` and the harness wires it as the fabric's
+  send_timeout. One `after` per serve until then.
+- `let` errors as unsupported ON PURPOSE — park-point liveness is
+  handoff item 4's experiment and should arrive as a measured change,
+  not a freebie.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,
