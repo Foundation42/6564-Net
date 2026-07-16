@@ -1,6 +1,6 @@
 # sim6564 — Reference Simulator, v0.1 Implementation Record
 
-Companion to [6564-net-architecture-v2.2.md](6564-net-architecture-v2.2.md). The
+Companion to [6564-net-architecture-v2.3.md](6564-net-architecture-v2.3.md). The
 spec says what the machine *is*; this records what v0.1 of the simulator
 *decided* where the spec left latitude, what it deliberately simplifies, and
 what building it taught us. Zig 0.14.1.
@@ -255,14 +255,50 @@ fan-out degree is bounded by PTT size (256/core, shared by the core's
 contexts) and LINK chains by near-page scratch (~59 entries), so big
 fan-out is hierarchical by construction.
 
+## The peripheral row (spec §7, v2.3)
+
+Devices live in `src/dev.zig` as pure policy (payload in → status +
+optional reply out); `machine.zig` owns routing, tokens, and the event
+queue. A `DevEndpoint` is `{device, token, 16-entry PTT}` in a hashmap
+keyed by mesh coordinate ($FF00–$FFFE; $FFFF stays the black hole).
+`sendDatagram` treats a device coordinate as routable; `deliver()`
+branches to `deliverToDevice`, which token-gates, applies the request at
+fabric time, acks the sender through the ordinary path, and fires any
+reply through the device's own PTT as fresh fire-and-forget datagrams
+(never in `pending` — no ack sought, and the reply crosses the same
+lossy links as everything else). Zero new opcodes; zero cycle-model
+changes; null cost verified — `sim6564 measure` reproduces the frozen
+table byte-identically with no devices attached.
+
+v1 devices: **console** (bytes → transcript; `Console.echo` for live
+write-through), **entropy** (own seeded PRNG, deliberately separate from
+the mesh PRNG so attaching it can't perturb fault injection; count
+clamped to 64), **rtc** (replies with the request's arrival cycle),
+**block** (init-time sector count/size, size 8..512; write applies at
+delivery so the fabric ack is the write ack).
+
+Demos: `sim6564 hello` (programs/hello.asm — one send, one teletype) and
+`sim6564 periph` (programs/periph.asm — walks all four devices,
+timestamps its errand off the RTC, hex-prints an entropy draw glyph by
+glyph through a one-byte char SQE, verifies a sector round-trip, prints
+its own cycle bill).
+
+**Driver lesson (recorded in spec §7.3):** a device reply can race its
+own request-ack home — the ack and the reply leave the device at the
+same fabric instant on independently-jittered paths. periph.asm's
+ack-wait therefore stashes any delivery record it pops ($8B0/$8B8) for
+the reply-collector to pick up. Sequential request/reply protocols need
+one stash slot; pipelined ones need a real dispatch loop.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,
-duplicated, timeouts, rejects, unroutable, CQ overflows. `Config.trace`
-prints scheduler/RBC/fabric events with cycle stamps to stderr — the demo
+duplicated, timeouts, rejects, unroutable, CQ overflows, and the §7
+counters dev_deliveries / dev_replies. `Config.trace` prints
+scheduler/RBC/fabric events with cycle stamps to stderr — the demo
 takes `trace` as its 4th CLI arg.
 
-## Phase status (§9 of the spec)
+## Phase status (§10 of the spec)
 
 - **Phase 1 — deterministic core: done.** Comptime-decoded ISA, banked
   contexts, near-page descriptors, continuation queue, single-core queue
@@ -279,8 +315,12 @@ takes `trace` as its 4th CLI arg.
   (`sim6564 pipeline`); scatter-gather fan-out/fan-in with idempotent
   workers, straggler re-scatter, and a capacity-8 RX ring absorbing the
   result burst (`sim6564 scatter`). The spec's three representative
-  workloads all run, entirely from CQ feedback and the primitives of §5–§7
+  workloads all run, entirely from CQ feedback and the primitives of §5–§8
   — no ISA additions were needed beyond §5.4's supervision pair.
+- **Peripheral row (spec §7, v2.3): complete.** Console, entropy, RTC and
+  block devices as fabric endpoints; `sim6564 hello` and `sim6564 periph`
+  drive them end to end from assembly; null cost verified against the
+  frozen measurement table.
 - **Measured claims** (`sim6564 ring` — Joe Armstrong's N-processes-in-a-ring
   challenge from Programming Erlang ch. 12, run as N banked contexts on one
   core passing a single-register TXR): **66 cycles per message pass** at

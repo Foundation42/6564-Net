@@ -43,6 +43,17 @@ const usage_text =
     \\      (programs/fj_root.asm, fj_lieutenant.asm, fj_pass.asm,
     \\      fanin_sink.asm). Default 8x125 = 1000.
     \\
+    \\  sim6564 hello [seed] [trace]
+    \\      The machine's first words: one actor prints through the console
+    \\      device on the peripheral row (§7) — SEND is the only I/O
+    \\      instruction there is (programs/hello.asm).
+    \\
+    \\  sim6564 periph [seed] [trace]
+    \\      Walk the whole peripheral row: console, entropy well, RTC and
+    \\      block store. The actor timestamps itself, draws random bytes,
+    \\      round-trips them through a disk sector and prints its own cycle
+    \\      bill (programs/periph.asm).
+    \\
     \\  sim6564 measure
     \\      Run every demo at its frozen baseline config and emit the
     \\      instructions / cycles / code-bytes table (the MAC & chains
@@ -96,6 +107,20 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, first, "measure"))
         return sim.measure.run(alloc);
+
+    if (std.mem.eql(u8, first, "hello")) {
+        var opts = sim.demo_hello.Options{};
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_hello.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "periph")) {
+        var opts = sim.demo_periph.Options{};
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_periph.run(alloc, opts);
+    }
 
     if (std.mem.eql(u8, first, "bigbrother")) {
         var opts = sim.demo_bigbrother.Options{};

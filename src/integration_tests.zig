@@ -1255,3 +1255,111 @@ test "fork-join matrix at full scale: 8x125, forked, relayed, joined" {
     try testing.expectEqual(@as(u64, 7), o.stats.chain_fires);
     try testing.expectEqual(@as(u64, 0), o.stats.cq_overflows);
 }
+
+// ── The peripheral row (§7) ──────────────────────────────────────────────
+
+test "hello: the console device hears the machine's first words" {
+    const o = try @import("demo_hello.zig").simulate(testing.allocator, .{});
+    defer testing.allocator.free(o.text);
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    try testing.expectEqualStrings("HELLO, WORLD - THE 6564 SPEAKS.\n", o.text);
+    try testing.expectEqual(@as(u64, 1), o.stats.dev_deliveries);
+    try testing.expectEqual(@as(u64, 0), o.stats.dev_replies);
+}
+
+test "peripheral row: console, entropy, rtc and block all answer" {
+    const o = try @import("demo_periph.zig").simulate(testing.allocator, .{});
+    defer testing.allocator.free(o.text);
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    try testing.expect(o.block_ok);
+    try testing.expect(std.mem.startsWith(u8, o.text, "6564 PERIPHERAL BUS CHECK\n"));
+    try testing.expect(std.mem.indexOf(u8, o.text, "ENTROPY ") != null);
+    try testing.expect(std.mem.indexOf(u8, o.text, "CYCLES ") != null);
+    // The program's RTC arithmetic must agree with the fabric's clock:
+    // elapsed is bounded by the whole run.
+    try testing.expect(o.elapsed > 0 and o.elapsed < o.cycles);
+    try testing.expectEqual(@as(u64, 4), o.stats.dev_replies); // rtc x2, entropy, block read
+    try testing.expectEqual(@as(u64, 0), o.stats.lost);
+}
+
+test "peripheral row is deterministic: same seed, same transcript" {
+    const a = try @import("demo_periph.zig").simulate(testing.allocator, .{ .seed = 99 });
+    defer testing.allocator.free(a.text);
+    const b = try @import("demo_periph.zig").simulate(testing.allocator, .{ .seed = 99 });
+    defer testing.allocator.free(b.text);
+    try testing.expectEqualStrings(a.text, b.text);
+    try testing.expectEqual(a.cycles, b.cycles);
+    // …and a different seed draws different entropy.
+    const c = try @import("demo_periph.zig").simulate(testing.allocator, .{ .seed = 100 });
+    defer testing.allocator.free(c.text);
+    try testing.expect(!std.mem.eql(u8, a.text, c.text));
+}
+
+const dev_token_probe_src =
+    \\        .org $1000
+    \\        LDA #1
+    \\        STA !$2400
+    \\        LDA ##$FF00_0000_0000_0000
+    \\        STA !$2408
+    \\        LDA ##$2500
+    \\        STA !$2410
+    \\        LDA ##$1_0000_0008
+    \\        STA !$2418
+    \\        SEND 0
+    \\wait:   LSTN 1
+    \\        CQPOP 1
+    \\        BEQ wait
+    \\        STA $840
+    \\        HLT
+;
+
+test "a device demands its token like any ring: wrong token, reject_capability" {
+    const dev6564 = @import("dev.zig");
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x8000,
+        .max_cycles = 100_000,
+    });
+    defer m.deinit();
+    try m.attachDevice(0xFF00, 0x6564, .{ .console = dev6564.Console.init(testing.allocator) });
+    m.setPtt(0, 0, .{
+        .prefix_lo = ring.PttEntry.loFrom(0xFF00, 0, 0),
+        .rights = .{ .send = true },
+        .token = 0xBAD, // a stale capability
+    });
+    m.setRing(0, 0, ring.slot_sq, .{
+        .base = 0x2400,
+        .cap_log2 = 0,
+        .entry_size = ring.sq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    });
+    m.setRing(0, 0, ring.slot_cq, .{
+        .base = 0x2000,
+        .cap_log2 = 4,
+        .entry_size = ring.cq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    });
+    var diag = asm6564.Diagnostic{};
+    var out = try asm6564.assemble(testing.allocator, dev_token_probe_src, &diag);
+    defer out.deinit();
+    m.load(0, out.origin, out.code);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    const word0 = std.mem.readInt(u64, m.cores[0].contexts[0].near[0x840..][0..8], .little);
+    try testing.expectEqual(
+        @as(u64, @intFromEnum(ring.Status.reject_capability)),
+        (word0 >> 8) & 0xFF,
+    );
+    // Nothing reached the device.
+    try testing.expectEqual(@as(usize, 0), m.device(0xFF00).?.console.out.items.len);
+    try testing.expectEqual(@as(u64, 0), m.stats.dev_deliveries);
+}

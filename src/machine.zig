@@ -28,6 +28,7 @@ const std = @import("std");
 const isa = @import("isa.zig");
 const ring = @import("ring.zig");
 const mesh = @import("mesh.zig");
+const dev = @import("dev.zig");
 
 pub const near_size = 0x1000;
 pub const ram_base: u64 = 0x1000;
@@ -170,6 +171,19 @@ pub const Stats = struct {
     /// Staged entries cancelled by an upstream chain break.
     chain_cancels: u64 = 0,
     cq_overflows: u64 = 0,
+    /// Requests accepted by peripheral-row devices (§7).
+    dev_deliveries: u64 = 0,
+    /// Reply datagrams devices fired back through their own PTTs.
+    dev_replies: u64 = 0,
+};
+
+/// A device attached to the peripheral row: the device itself, the token it
+/// demands of requesters (0 = open), and the PTT its replies route through —
+/// bound by the loader exactly like any actor's capabilities.
+pub const DevEndpoint = struct {
+    dev: dev.Device,
+    token: u64 = 0,
+    ptt: [dev.ptt_slots]ring.PttEntry = @splat(.{}),
 };
 
 const PendingSend = struct {
@@ -185,6 +199,7 @@ pub const Machine = struct {
     prng: std.Random.DefaultPrng,
     seq: u64 = 0,
     pending: std.AutoHashMap(u64, PendingSend),
+    devices: std.AutoHashMap(u16, DevEndpoint),
     stats: Stats = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) !Machine {
@@ -217,6 +232,7 @@ pub const Machine = struct {
             .events = std.PriorityQueue(mesh.Event, void, mesh.Event.order).init(alloc, {}),
             .prng = std.Random.DefaultPrng.init(cfg.seed),
             .pending = std.AutoHashMap(u64, PendingSend).init(alloc),
+            .devices = std.AutoHashMap(u16, DevEndpoint).init(alloc),
         };
     }
 
@@ -224,6 +240,9 @@ pub const Machine = struct {
         while (self.events.removeOrNull()) |ev| self.freeEvent(ev);
         self.events.deinit();
         self.pending.deinit();
+        var it = self.devices.valueIterator();
+        while (it.next()) |ep| ep.dev.deinit();
+        self.devices.deinit();
         for (self.cores) |*core| {
             self.alloc.free(core.ram);
             self.alloc.free(core.contexts);
@@ -290,6 +309,26 @@ pub const Machine = struct {
 
     /// Pre-stage bytes into a context's near page (config blocks, spawn
     /// tables — the loader's job in a real system).
+    /// Attach a device at a peripheral-row coordinate ($FF00..$FFFE). The
+    /// token is what requesters' PTT entries must present (0 = open).
+    pub fn attachDevice(self: *Machine, coord: u16, token: u64, d: dev.Device) !void {
+        std.debug.assert(coord >= dev.first_core and coord <= dev.last_core);
+        const slot = try self.devices.getOrPut(coord);
+        std.debug.assert(!slot.found_existing);
+        slot.value_ptr.* = .{ .dev = d, .token = token };
+    }
+
+    /// Bind a reply capability into a device's PTT — the loader wiring a
+    /// driver to its device, same act as wiring any two actors together.
+    pub fn setDevicePtt(self: *Machine, coord: u16, slot: u8, entry: ring.PttEntry) void {
+        self.devices.getPtr(coord).?.ptt[slot] = entry;
+    }
+
+    pub fn device(self: *Machine, coord: u16) ?*dev.Device {
+        const ep = self.devices.getPtr(coord) orelse return null;
+        return &ep.dev;
+    }
+
     pub fn writeNear(self: *Machine, core_idx: u16, ctx_idx: u8, offset: u16, bytes: []const u8) void {
         const ctx = &self.cores[core_idx].contexts[ctx_idx];
         @memcpy(ctx.near[offset..][0..bytes.len], bytes);
@@ -456,9 +495,12 @@ pub const Machine = struct {
         try self.pending.put(send_id, .{ .reply = reply });
 
         const now = self.cores[src_core].clock;
-        const routable = entry.dstCore() < self.cores.len and
-            entry.dstContext() < self.cfg.contexts_per_core and
-            entry.dstSlot() < ring.desc_slots;
+        // The peripheral row (§7): a device coordinate routes like any
+        // other — context/slot bits below the row are device-defined.
+        const routable = self.devices.contains(entry.dstCore()) or
+            (entry.dstCore() < self.cores.len and
+                entry.dstContext() < self.cfg.contexts_per_core and
+                entry.dstSlot() < ring.desc_slots);
         if (!routable) {
             // Sent into the void: no arrival, no reject — only the timeout
             // below will speak, and honestly.
@@ -512,6 +554,8 @@ pub const Machine = struct {
         self.trace("fabric @{d} deliver send_id={d} → c{d}x{d} slot{d} ({d} bytes)", .{
             due, gram.send_id, gram.dst_core, gram.dst_ctx, gram.dst_slot, gram.payload.len,
         });
+        if (self.devices.contains(gram.dst_core))
+            return self.deliverToDevice(due, gram);
         const core = &self.cores[gram.dst_core];
         const ctx = &core.contexts[gram.dst_ctx];
         const d = readDesc(ctx, gram.dst_slot);
@@ -594,24 +638,96 @@ pub const Machine = struct {
                 });
             }
         }
-        // The ack rides the same fault-injected fabric back: it can be lost,
-        // in which case the sender's timeout tells the truth (§6.1) — "your
-        // datagram MAY have arrived; you don't get to know."
-        const pend = self.pending.get(gram.send_id) orelse return; // dup already resolved
-        const src_core = pend.reply.core;
-        const onchip = src_core == gram.dst_core;
+        try self.ackSender(due, gram.send_id, gram.dst_core, status, count);
+    }
+
+    /// The ack rides the same fault-injected fabric back: it can be lost,
+    /// in which case the sender's timeout tells the truth (§6.1) — "your
+    /// datagram MAY have arrived; you don't get to know."
+    fn ackSender(self: *Machine, due: u64, send_id: u64, from_core: u16, status: ring.Status, count: u32) !void {
+        const pend = self.pending.get(send_id) orelse return; // dup already resolved
+        const onchip = pend.reply.core == from_core;
         if (onchip) {
             try self.events.add(.{
                 .due = due + self.cfg.link.onchip_latency,
                 .seq = self.nextSeq(),
-                .kind = .{ .ack = .{ .send_id = gram.send_id, .status = status, .byte_count = count } },
+                .kind = .{ .ack = .{ .send_id = send_id, .status = status, .byte_count = count } },
             });
         } else if (!mesh.roll(self.prng.random(), self.cfg.link.loss_ppm4k)) {
             try self.events.add(.{
                 .due = due + mesh.latency(self.cfg.link, self.prng.random()),
                 .seq = self.nextSeq(),
-                .kind = .{ .ack = .{ .send_id = gram.send_id, .status = status, .byte_count = count } },
+                .kind = .{ .ack = .{ .send_id = send_id, .status = status, .byte_count = count } },
             });
+        }
+    }
+
+    /// A request reached the peripheral row (§7). The endpoint's token gates
+    /// admission exactly as a ring descriptor's does; the device applies the
+    /// request at fabric time `due`; any reply routes through the device's
+    /// own PTT as ordinary fire-and-forget datagrams.
+    fn deliverToDevice(self: *Machine, due: u64, gram: mesh.Datagram) !void {
+        const ep = self.devices.getPtr(gram.dst_core).?;
+        var status: ring.Status = .ok;
+        var count: u32 = 0;
+        if (ep.token != 0 and ep.token != gram.token) {
+            status = .reject_capability;
+            self.stats.rejects += 1;
+        } else {
+            const res = ep.dev.handle(due, gram.payload);
+            status = res.status;
+            if (status == .ok or status == .truncated) {
+                count = @intCast(gram.payload.len);
+                self.stats.delivered += 1;
+                self.stats.dev_deliveries += 1;
+                self.trace("dev ${X} @{d} accepted {d} bytes", .{ gram.dst_core, due, gram.payload.len });
+            } else {
+                self.stats.rejects += 1;
+            }
+            if (res.reply) |r| try self.deviceReply(ep, due, r);
+        }
+        try self.ackSender(due, gram.send_id, gram.dst_core, status, count);
+    }
+
+    /// Fire a device reply through the device's PTT: same capability
+    /// discipline as software sends, but silicon doesn't wait — no pending
+    /// entry, no timeout, no retry. Driver protocols are idempotent
+    /// request/retry, so a lost reply just costs the requester another ask.
+    fn deviceReply(self: *Machine, ep: *DevEndpoint, due: u64, r: dev.Reply) !void {
+        const slot = ring.windowPtt(r.window);
+        const entry = if (slot < ep.ptt.len) ep.ptt[slot] else ring.PttEntry{};
+        if (!entry.rights.send) {
+            // Reply aimed at an unbound slot: the request lied about its
+            // reply window. Nothing routes; the requester's silence-timeout
+            // is the only symptom, as for any bad address.
+            self.stats.rejects += 1;
+            return;
+        }
+        const routable = entry.dstCore() < self.cores.len and
+            entry.dstContext() < self.cfg.contexts_per_core and
+            entry.dstSlot() < ring.desc_slots;
+        if (!routable) {
+            self.stats.unroutable += 1;
+            return;
+        }
+        self.stats.sends += 1;
+        self.stats.dev_replies += 1;
+        const gram = mesh.Datagram{
+            .send_id = self.nextSeq(), // never in pending: no ack sought
+            .dst_core = entry.dstCore(),
+            .dst_ctx = entry.dstContext(),
+            .dst_slot = entry.dstSlot(),
+            .offset = ring.windowOffset(r.window),
+            .token = entry.token,
+            .payload = undefined,
+        };
+        const p = mesh.plan(self.cfg.link, self.prng.random(), due);
+        if (p.arrivals.len == 0) self.stats.lost += 1;
+        if (p.arrivals.len == 2) self.stats.duplicated += 1;
+        for (p.arrivals.constSlice()) |arrive| {
+            var g = gram;
+            g.payload = try self.alloc.dupe(u8, r.data.slice());
+            try self.events.add(.{ .due = arrive, .seq = self.nextSeq(), .kind = .{ .deliver = g } });
         }
     }
 

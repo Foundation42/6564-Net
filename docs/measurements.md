@@ -177,3 +177,26 @@ unconditional — *a popped payload is valid until the next CQPOP from
 that ring*. One bit of hardware state; regression-tested at saturation.
 (This slightly shifts the frozen table: total instructions 217,537 →
 217,341, cycles 523,078 → 524,034; all demos still verify.)
+
+## The peripheral row landed (2026-07-16, spec v2.3)
+
+Not a mechanism campaign — §7 adds **zero opcodes and zero cycle-model
+changes**, so the only measurement it owes is the null-cost rule:
+
+| demo | code bytes | instructions | cycles | ctx switches | verified |
+|---|---:|---:|---:|---:|---|
+| **total (frozen table, devices attached: none)** | 2877 | 217341 | 524034 | 13285 | yes |
+
+Byte-identical to the post-deferred-grant frozen table above. The
+device path costs one hashmap probe per send on the simulator side and
+nothing architectural.
+
+New workload data points (not part of the frozen table):
+
+- `hello`: 28 instructions, 1 send — the machine's first words.
+- `periph` (seed 0x6564): 2,307 instructions, 47 sends, 43 device
+  deliveries, 4 device replies; the program's own RTC arithmetic bills
+  the errand at 14,929 cycles, dominated by the glyph-per-datagram hex
+  printer (33 console round-trips at ~400 cycles of fabric latency
+  each). Console I/O is fabric-latency-bound, as it should be — a
+  teletype across a network costs network.

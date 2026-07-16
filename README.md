@@ -4,7 +4,7 @@ Reference simulator for the **6564-Net** — a 64-bit silicon actor machine
 descended from the 6502: five registers, a 4 KB near page, hardware queue
 pairs, IPv6-native network addressing, and free-running concurrency.
 
-- Architecture: [docs/6564-net-architecture-v2.2.md](docs/6564-net-architecture-v2.2.md)
+- Architecture: [docs/6564-net-architecture-v2.3.md](docs/6564-net-architecture-v2.3.md)
 - Implementation record: [docs/simulator.md](docs/simulator.md)
 
 Built with **Zig 0.14.1**.
@@ -15,6 +15,7 @@ zig build run           # ping-pong actors across a 25%-lossy fabric
 ./zig-out/bin/sim6564 [seed] [loss_ppm4k] [rounds] [trace]
 ./zig-out/bin/sim6564 0xBEEF 3000 12      # 73% packet loss; still finishes
 ./zig-out/bin/sim6564 supervise           # supervision tree demo
+./zig-out/bin/sim6564 hello               # the machine says hello
 ```
 
 The 6564 programs themselves live in `src/programs/*.asm`.
@@ -58,6 +59,20 @@ while its work survives in RAM — Erlang's supervisors, in silicon (spec
 and only its watchdog burst budget can tell — the hang becomes an ordinary
 fault with its own fault code. Per-child restart budgets run out; the
 unreliable are abandoned, honestly.
+
+**hello** and **periph** drive the peripheral row (spec §7): devices are
+actors at mesh coordinates `$FF00..$FFFE`, reached by `SEND` through PTT
+capabilities — no MMIO, no interrupts, no DMA engine, zero new opcodes.
+`hello` prints through the console device; `periph` walks the whole row —
+timestamps itself off the RTC, hex-prints an entropy draw, round-trips a
+disk sector with verification, and prints its own cycle bill:
+
+```
+6564 PERIPHERAL BUS CHECK
+ENTROPY 33FB3C626C1F610A
+BLOCK OK
+CYCLES 0000000000003A51
+```
 
 Everything decodes from one declarative ISA table (`src/isa.zig`): the
 simulator, the assembler, and the disassembly of intent. Adding an
