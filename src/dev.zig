@@ -179,6 +179,107 @@ pub const Block = struct {
     }
 };
 
+// ── Net: the byte-pipe to the outside world ──────────────────────────────
+//
+// The NIC-as-device (§7.4's predicted fifth citizen): raw TCP, no
+// protocol opinion — HTTP, WebSockets, TLS are PROTOCOL ACTORS layered
+// above (§7.5), in silicon or in 6564 code, and clients can't tell.
+//
+// Requests (word0 = op | conn << 8):
+//   op 0 open:  word1 = reply window, word2 = port, bytes[24..] = host.
+//               Reply: 8 bytes, the connection id. Failure rejects.
+//   op 1 send:  bytes[8..] go down the pipe. The ack is the write ack.
+//   op 2 recv:  word1 = reply window, word2 = max bytes (≤ 240 sane).
+//               Reply: 0..max bytes; EMPTY means "nothing yet, ask
+//               again" — and a REJECTED request means EOF/closed: no
+//               in-band framing, the ack vocabulary already suffices.
+//   op 3 close: done. Ack ok.
+//
+// This is the one device that touches wall-clock reality: DNS, connect
+// and a bounded poll happen inside `handle`, and the outside world does
+// not replay. Determinism stays scoped to everything on our side of the
+// socket (§7.5); a machine without a Net attached replays exactly as
+// before.
+
+pub const Net = struct {
+    alloc: std.mem.Allocator,
+    conns: [4]?std.net.Stream = @splat(null),
+    /// How long a recv with no data may hold the event loop, real ms.
+    poll_ms: i32 = 25,
+
+    pub fn init(alloc: std.mem.Allocator) Net {
+        return .{ .alloc = alloc };
+    }
+
+    fn free(self: *Net) ?usize {
+        for (&self.conns, 0..) |*c, i| {
+            if (c.* == null) return i;
+        }
+        return null;
+    }
+
+    fn handle(self: *Net, payload: []const u8) Result {
+        if (payload.len < 8) return .{ .status = .reject_no_buffer };
+        const op = word(payload, 0) & 0xFF;
+        const conn_id = (word(payload, 0) >> 8) & 0xFF;
+        switch (op) {
+            0 => { // open
+                if (payload.len < 25) return .{ .status = .reject_no_buffer };
+                const window = replyWindow(payload[8..]) orelse
+                    return .{ .status = .reject_no_buffer };
+                const port: u16 = @truncate(word(payload, 2));
+                const slot = self.free() orelse
+                    return .{ .status = .reject_no_buffer };
+                const host = payload[24..];
+                const stream = std.net.tcpConnectToHost(self.alloc, host, port) catch
+                    return .{ .status = .reject_no_buffer };
+                self.conns[slot] = stream;
+                var r = Reply{ .window = window };
+                r.data.resize(8) catch unreachable;
+                std.mem.writeInt(u64, r.data.slice()[0..8], slot, .little);
+                return .{ .reply = r };
+            },
+            1 => { // send
+                const c = if (conn_id < self.conns.len) self.conns[conn_id] else null;
+                const stream = c orelse return .{ .status = .reject_no_buffer };
+                stream.writeAll(payload[8..]) catch
+                    return .{ .status = .reject_no_buffer };
+                return .{};
+            },
+            2 => { // recv
+                if (payload.len < 24) return .{ .status = .reject_no_buffer };
+                const window = replyWindow(payload[8..]) orelse
+                    return .{ .status = .reject_no_buffer };
+                const max = @min(@max(word(payload, 2), 1), 240);
+                const c = if (conn_id < self.conns.len) self.conns[conn_id] else null;
+                const stream = c orelse return .{ .status = .reject_no_buffer };
+                var fds = [_]std.posix.pollfd{.{
+                    .fd = stream.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&fds, self.poll_ms) catch 0;
+                var r = Reply{ .window = window };
+                if (ready == 0) return .{ .reply = r }; // nothing yet: empty
+                r.data.resize(@intCast(max)) catch unreachable;
+                const n = stream.read(r.data.slice()) catch
+                    return .{ .status = .reject_no_buffer };
+                if (n == 0) return .{ .status = .reject_no_buffer }; // EOF
+                r.data.resize(n) catch unreachable;
+                return .{ .reply = r };
+            },
+            3 => { // close
+                if (conn_id < self.conns.len) {
+                    if (self.conns[conn_id]) |s| s.close();
+                    self.conns[conn_id] = null;
+                }
+                return .{};
+            },
+            else => return .{ .status = .reject_no_buffer },
+        }
+    }
+};
+
 // ── The device itself ────────────────────────────────────────────────────
 
 pub const Device = union(enum) {
@@ -186,6 +287,7 @@ pub const Device = union(enum) {
     entropy: Entropy,
     rtc: Rtc,
     block: Block,
+    net: Net,
 
     /// One request, delivered at fabric time `due`.
     pub fn handle(self: *Device, due: u64, payload: []const u8) Result {
@@ -194,6 +296,7 @@ pub const Device = union(enum) {
             .entropy => |*d| d.handle(payload),
             .rtc => |*d| d.handle(due, payload),
             .block => |*d| d.handle(payload),
+            .net => |*d| d.handle(payload),
         };
     }
 
@@ -201,6 +304,10 @@ pub const Device = union(enum) {
         switch (self.*) {
             .console => |*d| d.out.deinit(d.alloc),
             .block => |*d| d.alloc.free(d.data),
+            .net => |*d| for (&d.conns) |*c| {
+                if (c.*) |s| s.close();
+                c.* = null;
+            },
             else => {},
         }
     }

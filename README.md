@@ -4,7 +4,7 @@ Reference simulator for the **6564-Net** — a 64-bit silicon actor machine
 descended from the 6502: five registers, a 4 KB near page, hardware queue
 pairs, IPv6-native network addressing, and free-running concurrency.
 
-- Architecture: [docs/6564-net-architecture-v2.4.md](docs/6564-net-architecture-v2.4.md)
+- Architecture: [docs/6564-net-architecture-v2.5.md](docs/6564-net-architecture-v2.5.md)
 - Implementation record: [docs/simulator.md](docs/simulator.md)
 
 Built with **Zig 0.14.1**.
@@ -90,6 +90,15 @@ socket (`sim6564 net listen 6564` + `sim6564 net connect 127.0.0.1
 virtual-time-stamped datagrams, so the federation replays
 bit-identically from its seeds regardless of real network timing. The
 wall clock never enters the machine — TCP is just a slow backplane.
+
+**web** is the capstone: `http_get.asm` — 6502-descendant assembly —
+speaks HTTP/1.1 through the `net` device (a raw byte pipe, spec §7.4)
+and prints a real web page on its teletype (`sim6564 web` fetches
+example.com; 784 instructions, clean halt). The protocol lives in 6564
+code: spec §7.5's rule is that silicon is an optimization, never an
+interface — any device contract must be implementable by an ordinary
+actor, so HTTP/WebSocket/TLS engines can ship as gates or as polyfill
+and no client can tell.
 
 Everything decodes from one declarative ISA table (`src/isa.zig`): the
 simulator, the assembler, and the disassembly of intent. Adding an

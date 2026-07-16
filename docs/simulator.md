@@ -1,6 +1,6 @@
 # sim6564 — Reference Simulator, v0.1 Implementation Record
 
-Companion to [6564-net-architecture-v2.4.md](6564-net-architecture-v2.4.md). The
+Companion to [6564-net-architecture-v2.5.md](6564-net-architecture-v2.5.md). The
 spec says what the machine *is*; this records what v0.1 of the simulator
 *decided* where the spec left latitude, what it deliberately simplifies, and
 what building it taught us. Zig 0.14.1.
@@ -366,6 +366,28 @@ CCDs overflow. Cluster runs now end with a per-die retirement table
 (`cluster.writeStatsTable`): cycles, instructions, sends, delivered,
 rejects, timeouts, context switches per die plus totals and plane
 traffic.
+
+## The net device and the web capstone (spec §7.4/§7.5, v2.5)
+
+`dev.Net` is the raw byte pipe: open (real DNS + TCP connect), send,
+recv (bounded poll — the ONE place the event loop may hold for real
+milliseconds; it is the wall-clock boundary anyway), close. Stream
+semantics need no in-band framing: an empty recv reply means "ask
+again", a rejected recv request means EOF — the ack vocabulary
+suffices. Determinism scope (spec §7.4): the outside world does not
+replay; machines without a Net attached are unaffected.
+
+`programs/http_get.asm` + `sim6564 web [host] [port] [path]`: HTTP/1.1
+entirely in 6564 code, chunks forwarded straight from the landing
+buffer to the console (AUTO_REPOST's deferred grant covers the console
+ack wait). Tests run it hermetically against a local TCP server thread.
+Driver lesson #2, earned the slow way: **a shared staged SQE is mutable
+state — set every field you depend on, every submission.** http_get's
+pump set the SQE buffer each lap but not the target; after the first
+console print, the next recv request went to the teletype (which
+printed it) and the data reply never came. The retirement stats made
+the diagnosis arithmetic: 104 console bytes = 80 response + 24 = one
+recv request, verbatim.
 
 ## Stats and tracing
 

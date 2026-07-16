@@ -1657,3 +1657,44 @@ test "socket bridge: the federation replays bit-identically, threaded or not" {
     );
     try testing.expect(a.l.finished_here and b.l.finished_here and p.l.finished_here);
 }
+
+// ── The net device: HTTP against a local server, hermetically ───────────
+
+fn miniHttpServer(server: *std.net.Server, err: *?anyerror) void {
+    const conn = server.accept() catch |e| {
+        err.* = e;
+        return;
+    };
+    defer conn.stream.close();
+    var buf: [512]u8 = undefined;
+    _ = conn.stream.read(&buf) catch |e| {
+        err.* = e;
+        return;
+    };
+    conn.stream.writeAll(
+        "HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\nHELLO FROM THE OUTSIDE",
+    ) catch |e| {
+        err.* = e;
+        return;
+    };
+}
+
+test "net device: http_get.asm fetches from a real (local) TCP server" {
+    var server = try bridge_mod.Bridge.listenOn(0);
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var serr: ?anyerror = null;
+    const t = try std.Thread.spawn(.{}, miniHttpServer, .{ &server, &serr });
+    const o = try @import("demo_web.zig").simulate(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/hello",
+    });
+    defer testing.allocator.free(o.text);
+    t.join();
+    try testing.expect(serr == null);
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    try testing.expect(std.mem.startsWith(u8, o.text, "HTTP/1.1 200 OK"));
+    try testing.expect(std.mem.indexOf(u8, o.text, "HELLO FROM THE OUTSIDE") != null);
+    try testing.expect(o.stats.dev_replies >= 2); // the open reply + data
+}

@@ -1,5 +1,5 @@
 //! sim6564 — reference simulator for the 6564-Net architecture.
-//! See docs/6564-net-architecture-v2.4.md and docs/simulator.md.
+//! See docs/6564-net-architecture-v2.5.md and docs/simulator.md.
 
 pub const isa = @import("isa.zig");
 pub const ring = @import("ring.zig");
@@ -12,6 +12,7 @@ pub const demo_dies = @import("demo_dies.zig");
 pub const demo_churn = @import("demo_churn.zig");
 pub const bridge = @import("bridge.zig");
 pub const demo_net = @import("demo_net.zig");
+pub const demo_web = @import("demo_web.zig");
 pub const asm6564 = @import("asm.zig");
 pub const demo_pingpong = @import("demo_pingpong.zig");
 pub const demo_hello = @import("demo_hello.zig");

@@ -65,6 +65,13 @@ const usage_text =
     \\      On asymmetric hosts (Zen X3D), add spread | vcache | freq to
     \\      pin die threads by L3 domain — wall-clock only, same bits.
     \\
+    \\  sim6564 web [host] [port] [path]
+    \\      The capstone: http_get.asm speaks HTTP/1.1 through the net
+    \\      device (a raw byte pipe, §7.4) and prints a REAL web page on
+    \\      its teletype. Protocol in 6564 code — §7.5's polyfill layer.
+    \\      Default http://example.com:80/. Not deterministic: the
+    \\      outside world does not replay.
+    \\
     \\  sim6564 net <listen [port] | connect [host] [port]> [dies] [nodes] [laps]
     \\      The ring across two OS PROCESSES: each runs half the dies; the
     \\      IO plane's window barriers cross a real TCP socket. Virtual
@@ -160,6 +167,14 @@ pub fn main() !void {
             }
         }
         return sim.demo_dies.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "web")) {
+        var opts = sim.demo_web.Options{};
+        if (args.next()) |s| opts.host = s;
+        if (args.next()) |s| opts.port = parseOr(u16, s, "port");
+        if (args.next()) |s| opts.path = s;
+        return sim.demo_web.run(alloc, opts);
     }
 
     if (std.mem.eql(u8, first, "net")) {
