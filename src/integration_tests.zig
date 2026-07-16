@@ -669,6 +669,160 @@ test "WDEX: a second declaration replaces, and ##0 cancels back to base" {
     }
 }
 
+fn resultAt(m: *Machine, addr: u64) u64 {
+    return std.mem.readInt(u64, m.cores[0].ram[addr - machine.ram_base ..][0..8], .little);
+}
+
+test "Tier 0 FP: bit-exact arithmetic — 0.1 + 0.2 is famously $3FD3333333333334" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    try assembleInto(&m, 0,
+        \\        .org $1000
+        \\        LDA ##$3FB999999999999A   ; 0.1
+        \\        FADD ##$3FC999999999999A  ; + 0.2
+        \\        STA !$2280                ; the famous sum
+        \\        FSUB ##$3FD3333333333333  ; - 0.3
+        \\        STA !$2288                ; the residue, exact
+        \\        LDA ##$4000000000000000   ; 2.0
+        \\        FSQRT
+        \\        STA !$2290
+        \\        LDA ##$3FF0000000000000   ; 1.0
+        \\        FDIV ##$4008000000000000  ; / 3.0
+        \\        STA !$2298
+        \\        FMUL ##$4008000000000000  ; * 3.0: RNE brings it home
+        \\        STA !$22A0
+        \\        HLT
+    );
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    try testing.expectEqual(@as(u64, 0x3FD3333333333334), resultAt(&m, 0x2280));
+    try testing.expectEqual(@as(u64, 0x3C90000000000000), resultAt(&m, 0x2288));
+    try testing.expectEqual(@as(u64, 0x3FF6A09E667F3BCD), resultAt(&m, 0x2290));
+    try testing.expectEqual(@as(u64, 0x3FD5555555555555), resultAt(&m, 0x2298));
+    try testing.expectEqual(@as(u64, 0x3FF0000000000000), resultAt(&m, 0x22A0));
+}
+
+test "Tier 0 FP: FCMP flag vocabulary, FTOI truncation and saturation, ITOF" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    try assembleInto(&m, 0,
+        \\        .org $1000
+        \\        LDA ##$4004000000000000   ; 2.5
+        \\        FCMP ##$4004000000000000  ; equal: Z
+        \\        BNE bad
+        \\        FCMP ##$4008000000000000  ; vs 3.0 — less: N, no C
+        \\        BPL bad
+        \\        BCS bad
+        \\        FCMP ##$3FF0000000000000  ; vs 1.0 — greater: C, no Z/N
+        \\        BCC bad
+        \\        BEQ bad
+        \\        BMI bad
+        \\        FCMP ##$7FF8000000000000  ; vs NaN — unordered: V alone
+        \\        BVC bad
+        \\        BEQ bad
+        \\        BMI bad
+        \\        BCS bad
+        \\        FTOI                      ; 2.5 truncates toward zero
+        \\        BVS bad
+        \\        STA !$2280                ; 2
+        \\        LDA ##$C004000000000000   ; -2.5
+        \\        FTOI
+        \\        BVS bad
+        \\        STA !$2288                ; -2, toward zero
+        \\        LDA ##$7FF8000000000000   ; NaN
+        \\        FTOI
+        \\        BVC bad
+        \\        STA !$2290                ; 0
+        \\        LDA ##$7E37E43C8800759C   ; 1e300
+        \\        FTOI
+        \\        BVC bad
+        \\        STA !$2298                ; saturated to maxInt
+        \\        LDA ##$FFFFFFFFFFFFFFF9   ; -7
+        \\        ITOF
+        \\        BPL bad                   ; result flags speak FP: N = sign
+        \\        STA !$22A0                ; -7.0
+        \\        HLT
+        \\bad:    BRK
+    );
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    try testing.expectEqual(@as(u64, 2), resultAt(&m, 0x2280));
+    try testing.expectEqual(@as(u64, @bitCast(@as(i64, -2))), resultAt(&m, 0x2288));
+    try testing.expectEqual(@as(u64, 0), resultAt(&m, 0x2290));
+    try testing.expectEqual(@as(u64, std.math.maxInt(i64)), resultAt(&m, 0x2298));
+    try testing.expectEqual(@as(u64, 0xC01C000000000000), resultAt(&m, 0x22A0));
+}
+
+test "Tier 0 FP: FP32 narrows on store, widens on load — rounding is visible once" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    try assembleInto(&m, 0,
+        \\        .org $1000
+        \\        LDA ##$3FB999999999999A   ; 0.1 (f64)
+        \\        FSTS !$2280               ; f32: $3DCCCCCD
+        \\        FLDS !$2280
+        \\        STA !$2290                ; f32(0.1) widened — not 0.1
+        \\        LDA ##$3FF8000000000000   ; 1.5 survives the trip exactly
+        \\        FSTS !$2298
+        \\        FLDS !$2298
+        \\        STA !$22A0
+        \\        HLT
+    );
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    const f32bits = std.mem.readInt(u32, m.cores[0].ram[0x2280 - machine.ram_base ..][0..4], .little);
+    try testing.expectEqual(@as(u32, 0x3DCCCCCD), f32bits);
+    try testing.expectEqual(@as(u64, 0x3FB99999A0000000), resultAt(&m, 0x2290));
+    try testing.expectEqual(@as(u64, 0x3FF8000000000000), resultAt(&m, 0x22A0));
+}
+
+test "mandel: the whole picture matches the host-f64 oracle, row for row" {
+    // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
+    // FSUB/FCMP results, every one of which must round exactly as the
+    // host's IEEE doubles do, or a character somewhere is wrong.
+    const demo_mandel = @import("demo_mandel.zig");
+    const o = try demo_mandel.simulate(testing.allocator, .{});
+    defer testing.allocator.free(o.text);
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    try testing.expectEqual(
+        @as(usize, (demo_mandel.cols + 1) * demo_mandel.rows),
+        o.text.len,
+    );
+    for (0..demo_mandel.rows) |r| {
+        const expected = try demo_mandel.oracleRow(testing.allocator, r);
+        defer testing.allocator.free(expected);
+        const got = o.text[r * (demo_mandel.cols + 1) ..][0 .. demo_mandel.cols + 1];
+        try testing.expectEqualStrings(expected, got);
+    }
+}
+
+test "the extended page does not stack: $42 $42 faults, and so does an undefined slot" {
+    for ([_]u8{ 0x42, 0x00 }) |second| {
+        var m = try Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .ram_size = 0x4000,
+        });
+        defer m.deinit();
+        m.load(0, 0x1000, &.{ 0x42, second });
+        try m.spawn(0, 0, 0x1000, 0x3000, 0);
+        try testing.expectEqual(machine.StopReason.faulted, try m.run());
+        try testing.expectEqual(machine.Fault.bad_opcode, m.cores[0].contexts[0].fault);
+    }
+}
+
 test "WDEX with no watchdog armed is a no-op: nothing to extend, nothing to fault" {
     var m = try Machine.init(testing.allocator, .{
         .cores = 1,

@@ -134,6 +134,19 @@ pub const Mnemonic = enum {
     capld,
     spwn,
     wdex,
+    // Tier 0 scalar floating point (extended page, prefix $42). FP64 lives
+    // in A; FP32 widens on load. IEEE 754, round-to-nearest-even, no
+    // FTZ/DAZ, no silent fusion — bit-exact deterministic.
+    fadd,
+    fsub,
+    fmul,
+    fdiv,
+    fsqrt,
+    fcmp,
+    ftoi,
+    itof,
+    flds,
+    fsts,
     // One-byte vectored calls through the per-context MACTAB (near page
     // $F80–$FFF). Semantics are exactly JSR [MACTAB + n*8]; the slot index
     // is the opcode's high nibble. Pre-normative — see the MAC & chains
@@ -154,21 +167,39 @@ pub const Mnemonic = enum {
     }
 };
 
+/// Which opcode page an encoding lives on. The extended page is reached by
+/// one prefix byte (`ext_prefix`) — one prefix, one page, done. Non-stacking
+/// by hard rule: the prefix byte is undefined ON the extended page, so a
+/// second prefix is an honest fault, not a deeper decode.
+pub const Page = enum { base, ext };
+
+/// The extended-page prefix: $42 — WDM, the one opcode the 65816 reserved
+/// for future expansion when it grew the 6502. The 6564 spends that
+/// reservation here.
+pub const ext_prefix: u8 = 0x42;
+
 pub const Encoding = struct {
     mnemonic: Mnemonic,
     mode: Mode,
     opcode: u8,
     /// Base cycle cost. Taken branches add 1; queue ops that park add nothing
     /// (parking is free — the context simply leaves the run queue).
+    /// Extended-page costs include the prefix fetch.
     cycles: u8,
+    page: Page = .base,
 
     pub fn size(self: Encoding) u8 {
-        return 1 + self.mode.operandSize();
+        const prefix: u8 = if (self.page == .ext) 1 else 0;
+        return prefix + 1 + self.mode.operandSize();
     }
 };
 
 fn e(mnemonic: Mnemonic, mode: Mode, opcode: u8, cycles: u8) Encoding {
     return .{ .mnemonic = mnemonic, .mode = mode, .opcode = opcode, .cycles = cycles };
+}
+
+fn x(mnemonic: Mnemonic, mode: Mode, opcode: u8, cycles: u8) Encoding {
+    return .{ .mnemonic = mnemonic, .mode = mode, .opcode = opcode, .cycles = cycles, .page = .ext };
 }
 
 /// The ISA. One row per (mnemonic, mode) pair.
@@ -293,6 +324,45 @@ pub const table = [_]Encoding{
     e(.mac, .impl, 0xFF, 6),
 };
 
+/// The extended page (prefix $42): Tier 0 scalar floating point. Layout
+/// convention carried over from the base page — each FP op sits in its
+/// integer analog's row: FADD in ADC's ($6x), FSUB in SBC's ($Ex), FCMP in
+/// CMP's ($Cx); FMUL and FDIV, having no integer analog, borrow AND's ($2x)
+/// and EOR's ($4x) rows. Unary ops take the $?A accumulator column. Cycle
+/// costs include the prefix fetch; FDIV/FSQRT are long ops, honestly priced.
+pub const xtable = [_]Encoding{
+    // ── FADD: A ⟵ A + M ─────────────────────────────────────────────────
+    x(.fadd, .imm64, 0x63, 6),  x(.fadd, .near, 0x65, 6),
+    x(.fadd, .near_x, 0x75, 6), x(.fadd, .abs, 0x6D, 7),
+    x(.fadd, .ind, 0x72, 8),    x(.fadd, .ind_y, 0x71, 8),
+    // ── FSUB: A ⟵ A − M ─────────────────────────────────────────────────
+    x(.fsub, .imm64, 0xE3, 6),  x(.fsub, .near, 0xE5, 6),
+    x(.fsub, .near_x, 0xF5, 6), x(.fsub, .abs, 0xED, 7),
+    x(.fsub, .ind, 0xF2, 8),    x(.fsub, .ind_y, 0xF1, 8),
+    // ── FMUL: A ⟵ A × M ─────────────────────────────────────────────────
+    x(.fmul, .imm64, 0x23, 6),  x(.fmul, .near, 0x25, 6),
+    x(.fmul, .near_x, 0x35, 6), x(.fmul, .abs, 0x2D, 7),
+    x(.fmul, .ind, 0x32, 8),    x(.fmul, .ind_y, 0x31, 8),
+    // ── FDIV: A ⟵ A ÷ M ─────────────────────────────────────────────────
+    x(.fdiv, .imm64, 0x43, 20), x(.fdiv, .near, 0x45, 20),
+    x(.fdiv, .near_x, 0x55, 20), x(.fdiv, .abs, 0x4D, 21),
+    x(.fdiv, .ind, 0x52, 22),   x(.fdiv, .ind_y, 0x51, 22),
+    // ── FCMP: flags ⟵ A ? M (Z eq, N lt, C ge; unordered sets V only) ───
+    x(.fcmp, .imm64, 0xC3, 5),  x(.fcmp, .near, 0xC5, 5),
+    x(.fcmp, .near_x, 0xD5, 5), x(.fcmp, .abs, 0xCD, 6),
+    x(.fcmp, .ind, 0xD2, 7),    x(.fcmp, .ind_y, 0xD1, 7),
+    // ── Unary, on A ──────────────────────────────────────────────────────
+    x(.fsqrt, .acc, 0x0A, 20),
+    x(.ftoi, .acc, 0x1A, 4), // f64 → i64, truncate toward zero; sat + V
+    x(.itof, .acc, 0x3A, 4), // i64 → f64, round-to-nearest-even
+    // ── FP32 in memory, FP64 in A: widen on load, narrow on store ───────
+    x(.flds, .near, 0xA5, 4),   x(.flds, .near_x, 0xB5, 4),
+    x(.flds, .abs, 0xAD, 5),    x(.flds, .ind, 0xB2, 6),
+    x(.flds, .ind_y, 0xB1, 6),  x(.fsts, .near, 0x85, 4),
+    x(.fsts, .near_x, 0x95, 4), x(.fsts, .abs, 0x8D, 5),
+    x(.fsts, .ind, 0x92, 6),    x(.fsts, .ind_y, 0x91, 6),
+};
+
 /// Near-page base of the 16-slot macro vector table (MACTAB).
 pub const mactab_base: u16 = 0xF80;
 
@@ -308,13 +378,38 @@ pub const decode: [256]?Encoding = blk: {
             ));
         d[enc.opcode] = enc;
     }
+    if (d[ext_prefix] != null)
+        @compileError("the extended-page prefix byte must stay free on the base page");
+    break :blk d;
+};
+
+/// Extended-page decode table (after an `ext_prefix` byte). The prefix's
+/// own slot stays null here too — prefixes do not stack.
+pub const xdecode: [256]?Encoding = blk: {
+    var d: [256]?Encoding = .{null} ** 256;
+    for (xtable) |enc| {
+        if (enc.page != .ext)
+            @compileError("xtable entries must be page .ext");
+        if (d[enc.opcode] != null)
+            @compileError(std.fmt.comptimePrint(
+                "duplicate extended opcode 0x{X:0>2}",
+                .{enc.opcode},
+            ));
+        d[enc.opcode] = enc;
+    }
+    if (d[ext_prefix] != null)
+        @compileError("prefixes do not stack: $42 is undefined on the extended page");
     break :blk d;
 };
 
 /// Find the encoding for a (mnemonic, mode) pair; null if that pairing
-/// doesn't exist in the ISA. Used by the assembler.
+/// doesn't exist in the ISA. Used by the assembler. Searches both pages —
+/// a mnemonic lives on exactly one.
 pub fn lookup(mnemonic: Mnemonic, mode: Mode) ?Encoding {
     inline for (table) |enc| {
+        if (enc.mnemonic == mnemonic and enc.mode == mode) return enc;
+    }
+    inline for (xtable) |enc| {
         if (enc.mnemonic == mnemonic and enc.mode == mode) return enc;
     }
     return null;
@@ -343,6 +438,20 @@ test "decode table round-trips every encoding" {
         try std.testing.expectEqual(enc.mnemonic, got.mnemonic);
         try std.testing.expectEqual(enc.mode, got.mode);
     }
+}
+
+test "extended page round-trips and sizes include the prefix" {
+    for (xtable) |enc| {
+        const got = xdecode[enc.opcode] orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(enc.mnemonic, got.mnemonic);
+        try std.testing.expectEqual(enc.mode, got.mode);
+    }
+    // FADD ##imm: prefix + opcode + 8 = 10 bytes; base-page LDA ##imm stays 9.
+    try std.testing.expectEqual(@as(u8, 10), lookup(.fadd, .imm64).?.size());
+    try std.testing.expectEqual(@as(u8, 9), lookup(.lda, .imm64).?.size());
+    // The prefix's own slot is null on BOTH pages — prefixes do not stack.
+    try std.testing.expectEqual(@as(?Encoding, null), decode[ext_prefix]);
+    try std.testing.expectEqual(@as(?Encoding, null), xdecode[ext_prefix]);
 }
 
 test "classic 6502 opcodes are honored" {

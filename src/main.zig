@@ -49,6 +49,12 @@ const usage_text =
     \\      device on the peripheral row (§7) — SEND is the only I/O
     \\      instruction there is (programs/hello.asm).
     \\
+    \\  sim6564 mandel [seed] [trace]
+    \\      The Mandelbrot set in IEEE 754 doubles — Tier 0 scalar FP on
+    \\      the extended page (prefix $42), one console line per row,
+    \\      every row asserted bit-exact against an independent oracle
+    \\      (programs/mandel.asm).
+    \\
     \\  sim6564 periph [seed] [trace]
     \\      Walk the whole peripheral row: console, entropy well, RTC and
     \\      block store. The actor timestamps itself, draws random bytes,
@@ -148,6 +154,13 @@ pub fn main() !void {
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
         return sim.demo_hello.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "mandel")) {
+        var opts = sim.demo_mandel.Options{};
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_mandel.run(alloc, opts);
     }
 
     if (std.mem.eql(u8, first, "dies")) {

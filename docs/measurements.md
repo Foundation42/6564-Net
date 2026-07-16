@@ -341,3 +341,41 @@ costs nothing. 4 new tests (75 total): declared burst outlives base
 budget then declaration dies at the park (fault_addr proves which spin
 tripped), over-ceiling faults, replace + cancel semantics, no-watchdog
 no-op.
+
+## Tier 0 scalar FP + the extended page (2026-07-16, handoff item 2)
+
+The extended opcode page opens with one prefix byte: **$42 — WDM, the
+opcode the 65816 reserved for future expansion when it grew the 6502
+and never spent.** One prefix, one page, hard rule: $42 is null on the
+extended page itself, so a stacked prefix is an honest `bad_opcode`
+fault (test-guarded). No Z80 DD/CB soup, ever. The comptime ISA table
+grows a second 256-entry page with the same duplicate detection, and
+each FP op sits in its integer analog's row: FADD in ADC's, FSUB in
+SBC's, FCMP in CMP's; FMUL/FDIV borrow AND/EOR's.
+
+Tier 0 per the handoff: FP64 in A (the most 6502 shape available), no
+new registers, so the volatility question never arises. FADD/FSUB/
+FMUL/FDIV/FSQRT/FCMP/FTOI/ITOF, plus FLDS/FSTS (FP32 widens on load,
+narrows on store, RNE). IEEE 754, round-to-nearest-even, no FTZ/DAZ,
+no fusion. Flag vocabulary: results set Z = numerically zero, N = sign
+bit, V = NaN; FCMP speaks CMP's dialect (Z eq, N lt, C ge) with
+unordered = V alone. FTOI truncates toward zero (the C-cast
+convention), saturates out-of-range and zeroes NaN, V flags both.
+
+Numerics verified bit-exact in Debug AND ReleaseFast: 0.1 + 0.2 =
+$3FD3333333333334, the 0.3 residue = $3C90000000000000 exactly,
+√2 = $3FF6A09E667F3BCD, 3·(1/3) rounds home to 1.0.
+
+**The proof workload: `sim6564 mandel`.** The Mandelbrot set, 64×22,
+z ← z² + c in IEEE doubles on a 6502 descendant, one console line per
+row — 291,139 instructions, 1,195,538 cycles, 22 sends, clean halt.
+The test asserts every row character-for-character against an
+independent host-f64 oracle: 1,408 points × up to 16 iterations, and
+one misrounded result anywhere is a visibly wrong character. A picture
+as a determinism test. (The Superboard II did this in interpreted
+BASIC with 5-digit floats; the lineage now does it correctly rounded.)
+
+Null-cost: frozen v2.5 table reproduces byte-identically with the
+extended page present and unused (2820 / 171,112 / 479,273). 81 tests
+green (75 → 81: exact-bits, FCMP/FTOI/ITOF vocabulary, FP32 round
+trip, prefix discipline, the mandel oracle, extended-page decode).

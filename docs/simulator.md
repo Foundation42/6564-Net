@@ -405,6 +405,34 @@ an architectural no-op (nothing to extend — joe's `bounded` blocks run
 identically supervised or not). This is the lowering target for joe's
 `bounded N { … }`. Null-cost verified against the frozen v2.5 table.
 
+## The extended page and Tier 0 scalar FP (post-v2.5 handoff items 2)
+
+Prefix **$42** — the 65816's WDM, the one byte that family reserved
+for expansion — opens a second 256-entry opcode page (`isa.xtable` /
+`isa.xdecode`, same comptime duplicate detection). Non-stacking by
+construction: $42 is null on the extended page, so `$42 $42` faults
+`bad_opcode`. `Encoding` gained a `page` field; `size()` includes the
+prefix, so the assembler and `exec` agree on layout for free; the
+assembler's only change was writing the prefix byte in `emit`.
+
+Tier 0 FP is accumulator-shaped: FP64 bits live in A, `loadOperand`
+supplies M, and FLDS/FSTS move FP32 through memory (widen on load,
+narrow RNE on store; a 4-byte window store is not a datagram — it
+faults). Zig's f64 arithmetic is the implementation: IEEE requires
+correctly-rounded +,−,×,÷,√, so bit-exactness costs nothing —
+verified in ReleaseFast too, where the optimizer would be the first
+suspect. FTOI truncates toward zero and saturates with V (NaN → 0
+with V); the boundary case is exact because 2^63 is representable and
+the largest f64 below it fits i64.
+
+`sim6564 mandel` is the workload: mandel.asm iterates z² + c in the
+near page (variables lived in zero page on the ancestor, and still
+do), builds each row left-to-right so the 8-byte STA tails are
+overwritten by the next column, and ships rows to the console with
+hello.asm's retry discipline. The test replays the whole picture
+against a host-f64 oracle — any misrounding anywhere in ~40k FP ops
+is a visibly wrong character.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

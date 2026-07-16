@@ -1052,8 +1052,14 @@ pub const Machine = struct {
 
     fn exec(self: *Machine, core: *Core, ctx_idx: u8, ctx: *Context) StepError!Disposition {
         const opcode = try read8(core, ctx, ctx.ip);
-        const enc = isa.decode[opcode] orelse return error.BadOpcode;
-        const operand_addr = ctx.ip + 1;
+        // $42 — WDM, the 65816's reserved expansion byte — opens the
+        // extended page for exactly one opcode. Prefixes do not stack:
+        // $42 $42 hits the null slot in xdecode and faults honestly.
+        const enc = if (opcode == isa.ext_prefix)
+            isa.xdecode[try read8(core, ctx, ctx.ip + 1)] orelse return error.BadOpcode
+        else
+            isa.decode[opcode] orelse return error.BadOpcode;
+        const operand_addr = ctx.ip + 1 + @intFromBool(enc.page == .ext);
         const next_ip = ctx.ip + enc.size();
         core.clock += enc.cycles;
         ctx.instructions += 1;
@@ -1397,6 +1403,86 @@ pub const Machine = struct {
                 for (&words, 0..) |*w, i| w.* = try read64(core, ctx, base + i * 8);
                 core.ptt[cap_slot] = ring.PttEntry.unpack(words);
             },
+            // ── Tier 0 scalar floating point (extended page, prefix $42) ──
+            // FP64 lives in A as its bit pattern. IEEE 754, round-to-
+            // nearest-even, no FTZ/DAZ, no fusion: every host computes
+            // correctly-rounded +,−,×,÷,√ — bit-exact deterministic.
+            .fadd, .fsub, .fmul, .fdiv => {
+                const a: f64 = @bitCast(ctx.a);
+                const m: f64 = @bitCast(try self.loadOperand(core, ctx, enc.mode, imm, ea));
+                const r = switch (enc.mnemonic) {
+                    .fadd => a + m,
+                    .fsub => a - m,
+                    .fmul => a * m,
+                    .fdiv => a / m,
+                    else => unreachable,
+                };
+                ctx.a = @bitCast(r);
+                fpFlags(ctx, r);
+            },
+            .fsqrt => {
+                const r = @sqrt(@as(f64, @bitCast(ctx.a)));
+                ctx.a = @bitCast(r);
+                fpFlags(ctx, r);
+            },
+            .fcmp => {
+                // Z = equal, N = less, C = greater-or-equal (CMP's carry
+                // convention). Unordered clears all three and raises V —
+                // a NaN comparison is a fact, not a fault.
+                const a: f64 = @bitCast(ctx.a);
+                const m: f64 = @bitCast(try self.loadOperand(core, ctx, enc.mode, imm, ea));
+                if (std.math.isNan(a) or std.math.isNan(m)) {
+                    ctx.p.z = false;
+                    ctx.p.n = false;
+                    ctx.p.c = false;
+                    ctx.p.v = true;
+                } else {
+                    ctx.p.z = a == m;
+                    ctx.p.n = a < m;
+                    ctx.p.c = a >= m;
+                    ctx.p.v = false;
+                }
+            },
+            .ftoi => {
+                // Truncate toward zero (the C-cast convention). Out-of-range
+                // saturates, NaN converts to 0 — both raise V; in-range
+                // conversions clear it. Deterministic in every case.
+                const a: f64 = @bitCast(ctx.a);
+                const t = @trunc(a);
+                var oob = true;
+                const r: i64 = if (std.math.isNan(a))
+                    0
+                else if (t >= 9223372036854775808.0) // 2^63
+                    std.math.maxInt(i64)
+                else if (t < -9223372036854775808.0)
+                    std.math.minInt(i64)
+                else blk: {
+                    oob = false;
+                    break :blk @intFromFloat(t);
+                };
+                ctx.a = @bitCast(r);
+                ctx.p.setNZ(ctx.a);
+                ctx.p.v = oob;
+            },
+            .itof => {
+                const r: f64 = @floatFromInt(@as(i64, @bitCast(ctx.a)));
+                ctx.a = @bitCast(r);
+                fpFlags(ctx, r);
+            },
+            .flds => {
+                // FP32 widens on load — exactly, every f32 is an f64.
+                const bits = std.mem.readInt(u32, (try bytesAt(core, ctx, ea, 4))[0..4], .little);
+                const r: f64 = @floatCast(@as(f32, @bitCast(bits)));
+                ctx.a = @bitCast(r);
+                fpFlags(ctx, r);
+            },
+            .fsts => {
+                // Narrow to FP32 (round-to-nearest-even) and store 4 bytes.
+                // Plain memory only — a 4-byte window store is not a
+                // datagram, and bytesAt faults it honestly.
+                const s: f32 = @floatCast(@as(f64, @bitCast(ctx.a)));
+                std.mem.writeInt(u32, (try bytesAt(core, ctx, ea, 4))[0..4], @as(u32, @bitCast(s)), .little);
+            },
             .wdex => {
                 // WDEX ##n (§5.4): declare this burst long — set its
                 // remaining watchdog budget to n, checked against the
@@ -1461,6 +1547,14 @@ pub const Machine = struct {
             },
         }
         return .keep;
+    }
+
+    /// Flags after an FP-valued result: Z = numerically zero (either sign),
+    /// N = the sign bit (so −0.0 sets both), V = NaN. Carry untouched.
+    fn fpFlags(ctx: *Context, r: f64) void {
+        ctx.p.z = r == 0.0;
+        ctx.p.n = std.math.signbit(r);
+        ctx.p.v = std.math.isNan(r);
     }
 
     fn readU16(core: *Core, ctx: *Context, addr: u64) MemError!u16 {

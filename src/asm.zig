@@ -411,7 +411,14 @@ const Assembler = struct {
         return self.fail(line_no, "no such encoding for this operand form", Error.NoSuchEncoding);
     }
 
-    fn emit(self: *Assembler, line_no: usize, pc: u64, enc: isa.Encoding, shape: OperandShape, buf: []u8) Error!void {
+    fn emit(self: *Assembler, line_no: usize, pc: u64, enc: isa.Encoding, shape: OperandShape, whole: []u8) Error!void {
+        // Extended-page encodings carry the $42 prefix; operands follow the
+        // opcode byte either way.
+        var buf = whole;
+        if (enc.page == .ext) {
+            buf[0] = isa.ext_prefix;
+            buf = buf[1..];
+        }
         buf[0] = enc.opcode;
         const next_ip = pc + enc.size();
         switch (enc.mode) {

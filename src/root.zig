@@ -16,6 +16,7 @@ pub const demo_web = @import("demo_web.zig");
 pub const asm6564 = @import("asm.zig");
 pub const demo_pingpong = @import("demo_pingpong.zig");
 pub const demo_hello = @import("demo_hello.zig");
+pub const demo_mandel = @import("demo_mandel.zig");
 pub const demo_periph = @import("demo_periph.zig");
 pub const demo_supervise = @import("demo_supervise.zig");
 pub const demo_pipeline = @import("demo_pipeline.zig");

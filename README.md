@@ -74,6 +74,15 @@ BLOCK OK
 CYCLES 00000000000039A7
 ```
 
+**mandel** renders the Mandelbrot set in IEEE 754 double precision on
+a 6502 descendant (`sim6564 mandel`): Tier 0 scalar FP lives on the
+extended opcode page behind prefix `$42` — WDM, the byte the 65816
+reserved for expansion and never spent. FP64 in the accumulator, IEEE
+round-to-nearest-even, no FTZ, no fusion; the test asserts all 22 rows
+character-for-character against an independent host computation, so
+one misrounded result among ~40,000 FP ops is a visibly wrong pixel.
+A picture as a determinism test.
+
 **dies** runs Armstrong's ring across up to 16 whole dies joined by the
 IO plane (spec §6.5) — each die a complete machine on its own host
 thread, exchanging datagrams at conservative-horizon barriers, **bit-
