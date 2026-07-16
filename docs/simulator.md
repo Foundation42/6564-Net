@@ -325,6 +325,16 @@ work: the lone global token is Amdahl's law incarnate (one busy die at
 a time), and the harness says so rather than pretending. Numbers in
 measurements.md; bit-identity threaded-vs-sequential is test-guarded.
 
+Thread placement (`src/topology.zig`, vendored from substr): pin die
+threads by L3 domain with `spread | vcache | freq` — built for the
+asymmetric 9950X3D host (one V-cache CCD, one frequency CCD). Measured
+findings (ledger): pinning at all is the big win (~20-25%, takes the
+16-thread speedup from 3.7x to 6.1x — the scheduler stops migrating
+workers across CCDs); at 8 dies one CCD beats two (barriers stay in one
+L3); vcache vs freq is a wash until per-die footprints outgrow the
+small CCD's 32 MB. Placement never changes results — md5-identical
+output across all five policies.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

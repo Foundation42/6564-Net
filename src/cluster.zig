@@ -25,6 +25,7 @@ const std = @import("std");
 const ring = @import("ring.zig");
 const mesh = @import("mesh.zig");
 const machine = @import("machine.zig");
+const topology = @import("topology.zig");
 
 /// Route-table entry meaning "no such path": the plane's black hole.
 pub const no_route: u16 = 0xFFFF;
@@ -47,6 +48,23 @@ pub const Config = struct {
     seed: u64 = 0x6564,
     /// Step dies on host threads within each window.
     parallel: bool = false,
+    /// Where die threads land on an asymmetric host (Zen X3D: one
+    /// big-cache CCD, one high-frequency CCD). Placement is a wall-clock
+    /// knob only — results are bit-identical regardless (the whole point
+    /// of the conservative windows). Best-effort: silently unpinned off
+    /// Linux or when sysfs is unreadable.
+    pin: PinPolicy = .none,
+};
+
+pub const PinPolicy = enum {
+    none,
+    /// Round-robin across L3 domains, low indices first — on typical Zen
+    /// numbering those are distinct physical cores before SMT siblings.
+    spread,
+    /// Everyone onto the big-cache CCD: barrier traffic stays in one L3.
+    vcache,
+    /// Everyone onto the high-frequency CCD: clocks over cache.
+    freq,
 };
 
 pub const PlaneStats = struct {
@@ -278,13 +296,45 @@ pub const Cluster = struct {
         quit: bool = false,
     };
 
+    /// Decide the cpu each die thread pins to (null = unpinned).
+    fn planPins(policy: PinPolicy, pins: []?usize) void {
+        if (policy == .none) return;
+        const ncpu = std.Thread.getCpuCount() catch return;
+        const topo = topology.detectTopology(ncpu) orelse return;
+        var cpus: [topology.MAX_CPUS_PER_GROUP * topology.MAX_GROUPS]usize = undefined;
+        switch (policy) {
+            .none => {},
+            .vcache => {
+                const cn = topo.vcacheCpus(cpus[0..]);
+                if (cn == 0) return;
+                for (pins, 0..) |*p, i| p.* = cpus[i % cn];
+            },
+            .freq => {
+                var cn = topo.freqCpus(cpus[0..]);
+                if (cn == 0) cn = topo.vcacheCpus(cpus[0..]); // single-CCD box
+                if (cn == 0) return;
+                for (pins, 0..) |*p, i| p.* = cpus[i % cn];
+            },
+            .spread => {
+                if (topo.ng == 0) return;
+                for (pins, 0..) |*p, i| {
+                    const g = &topo.groups[i % topo.ng];
+                    if (g.n == 0) continue;
+                    p.* = g.cpus[(i / topo.ng) % g.n];
+                }
+            },
+        }
+    }
+
     fn poolWorker(
         self: *Cluster,
         pool: *Pool,
         i: usize,
+        pin: ?usize,
         results: []?machine.StopReason,
         errs: []?anyerror,
     ) void {
+        if (pin) |cpu| topology.pinToCpu(cpu);
         var seen: u64 = 0;
         while (true) {
             pool.mutex.lock();
@@ -331,8 +381,11 @@ pub const Cluster = struct {
             for (threads[0..spawned]) |t| t.join();
         };
         if (threaded) {
+            var pins: [256]?usize = @splat(null);
+            planPins(self.cfg.pin, pins[0..@min(n, pins.len)]);
             for (threads, 0..) |*t, i| {
-                t.* = try std.Thread.spawn(.{}, poolWorker, .{ self, &pool, i, results, errs });
+                const pin = if (i < pins.len) pins[i] else null;
+                t.* = try std.Thread.spawn(.{}, poolWorker, .{ self, &pool, i, pin, results, errs });
                 spawned += 1;
             }
         }

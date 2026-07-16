@@ -28,6 +28,9 @@ pub const Options = struct {
     /// so this is what makes host threads earn their keep.
     busy: u64 = 0, // 0..100_000
     parallel: bool = true,
+    /// Thread placement on asymmetric hosts (X3D): wall-clock only,
+    /// results identical by construction.
+    pin: cluster.PinPolicy = .none,
     trace: bool = false,
 };
 
@@ -70,6 +73,7 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
         },
         .plane = .{ .base_latency = 2000, .jitter = 500 },
         .parallel = parallel,
+        .pin = opts.pin,
     });
     defer cl.deinit();
 

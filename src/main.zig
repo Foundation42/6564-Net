@@ -62,6 +62,8 @@ const usage_text =
     \\      tell (programs/ring_node.asm, unmodified). Default 4x50x10.
     \\      busy_laps > 0 adds a local ring per die so every host thread
     \\      has work (the lone global token is Amdahl's law incarnate).
+    \\      On asymmetric hosts (Zen X3D), add spread | vcache | freq to
+    \\      pin die threads by L3 domain — wall-clock only, same bits.
     \\
     \\  sim6564 measure
     \\      Run every demo at its frozen baseline config and emit the
@@ -137,6 +139,8 @@ pub fn main() !void {
                 opts.parallel = false;
             } else if (std.mem.eql(u8, s, "trace")) {
                 opts.trace = true;
+            } else if (std.meta.stringToEnum(sim.cluster.PinPolicy, s)) |p| {
+                opts.pin = p;
             } else {
                 opts.busy = @min(100_000, parseOr(u64, s, "busy_laps"));
             }

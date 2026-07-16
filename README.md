@@ -80,7 +80,9 @@ thread, exchanging datagrams at conservative-horizon barriers, **bit-
 identical to the sequential run at any thread count**. The ring program
 is byte-for-byte the single-die one: remoteness is one route byte in a
 PTT entry. `sim6564 dies 16 100 10 2000` keeps all 16 host threads hot
-with die-local rings (3.7× wall-clock over sequential in ReleaseFast).
+with die-local rings — **6.1× wall-clock over sequential** in
+ReleaseFast with `spread`/`vcache`/`freq` L3-domain pinning
+(`src/topology.zig`; placement changes seconds, never bits).
 
 Everything decodes from one declarative ISA table (`src/isa.zig`): the
 simulator, the assembler, and the disassembly of intent. Adding an

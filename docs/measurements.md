@@ -233,3 +233,31 @@ deliveries consult another die's pending map (send-ids are per-die
 counters; the origin die wasn't stamped). The plane's own counters
 exposed it — 1,510 acks for 40 datagrams. Datagrams now carry src_die,
 and foreign acks ride the plane home.
+
+## Thread placement on the 9950X3D (2026-07-16, topology.zig vendored)
+
+Host: Ryzen 9 9950X3D — asymmetric: CCD0 = 96 MB V-cache (cpus 0-7,
+16-23), CCD1 = 32 MB, higher clocks (8-15, 24-31). `sim6564 dies …
+spread|vcache|freq` pins die threads by L3 domain (topology.zig,
+vendored from substr). All five placements produce md5-identical
+output — placement is wall-clock only, as the windows guarantee.
+
+Best of 3, ReleaseFast, busy workload:
+
+| config | none | spread | vcache | freq | seq |
+|---|---:|---:|---:|---:|---:|
+| 16 dies (16 threads) | 0.207 s | 0.164 s | **0.160 s** | 0.167 s | 0.978 s |
+| 8 dies (8 threads) | 0.224 s | 0.217 s | 0.190 s | **0.187 s** | 0.992 s |
+
+Findings, in order of size:
+
+1. **Pinning at all is the win (~20-25% over unpinned)** — it stops the
+   scheduler migrating die threads across CCDs mid-run. With pinning,
+   16 threads reach **6.1x** over sequential (was 3.7x unpinned).
+2. **8 threads: one CCD beats two.** Keeping every die on a single CCD
+   (either one) beats spreading across both by ~14% — barrier traffic
+   stays in one L3 instead of crossing the Infinity Fabric.
+3. **V-cache buys nothing here — honestly.** freq edges vcache at 8
+   dies: the whole cluster's working set (~1 MB of die RAM plus queues)
+   fits in either L3, so clocks win. The X3D asymmetry will only speak
+   when per-die footprints outgrow 32 MB; the knob is ready for it.
