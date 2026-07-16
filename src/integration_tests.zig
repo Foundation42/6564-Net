@@ -722,3 +722,27 @@ test "scatter-gather: full fan-out saturates the cap-8 fan-in ring" {
     try testing.expectEqual(o.expected_sum, o.sum);
     try testing.expect(o.coordinator_halted);
 }
+
+// ── Armstrong's ring (Programming Erlang, ch. 12) ────────────────────────
+
+test "armstrong ring: N x M passes, message comes home to node 0" {
+    const o = try @import("demo_ring.zig").simulate(testing.allocator, .{
+        .nodes = 8,
+        .laps = 4,
+    });
+    try testing.expectEqual(@as(u64, 32), o.passes);
+    try testing.expect(o.exactly_one_finisher);
+    try testing.expect(o.finisher_is_node0);
+    try testing.expectEqual(machine.StopReason.deadlock, o.reason); // quiesced
+}
+
+test "armstrong ring: steady-state cost per pass stays two-digit" {
+    const o = try @import("demo_ring.zig").simulate(testing.allocator, .{
+        .nodes = 64,
+        .laps = 20,
+    });
+    try testing.expect(o.exactly_one_finisher and o.finisher_is_node0);
+    // The §2.2 claim, as a regression guard: actor-to-actor messaging on one
+    // core, scheduler included, stays under 100 cycles per pass.
+    try testing.expect(o.cycles_per_pass < 100);
+}

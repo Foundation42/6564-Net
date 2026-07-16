@@ -37,6 +37,12 @@ square it by shift-add multiply and reply; results converge on one
 capacity-8 RX ring. The result is the ack: stragglers are simply re-asked
 on timer ticks, and idempotent workers make duplicates harmless.
 
+**ring** is Joe Armstrong's challenge (Programming Erlang, ch. 12): N
+processes in a ring, a message around M times (`sim6564 ring 200 1000` =
+200,000 passes). Processes are banked contexts, the message is one TXR
+register-datagram, and a pass costs **66 cycles** at steady state —
+scheduler, completion queue, and zero-cycle context switch included.
+
 **supervise** runs a one-for-one supervision tree on one core: exit links
 post a dead worker's obituary to the supervisor's completion queue as an
 ordinary completion record, and `SPWN` resurrects it with fresh registers

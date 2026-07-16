@@ -210,3 +210,11 @@ takes `trace` as its 4th CLI arg.
   result burst (`sim6564 scatter`). The spec's three representative
   workloads all run, entirely from CQ feedback and the primitives of §5–§7
   — no ISA additions were needed beyond §5.4's supervision pair.
+- **Measured claims** (`sim6564 ring` — Joe Armstrong's N-processes-in-a-ring
+  challenge from Programming Erlang ch. 12, run as N banked contexts on one
+  core passing a single-register TXR): **66 cycles per message pass** at
+  steady state, receive-to-forward, scheduler and completion handling
+  included, flat from 64×100 to 200×1000 passes. A "process" costs one
+  41-byte register bank plus its near page; 200 of them fit on a core with
+  room to spare. This is §2.2's "minimalism as a concurrency superpower"
+  with a number attached, guarded by a <100-cycle regression test.
