@@ -379,3 +379,41 @@ Null-cost: frozen v2.5 table reproduces byte-identically with the
 extended page present and unused (2820 / 171,112 / 479,273). 81 tests
 green (75 → 81: exact-bits, FCMP/FTOI/ITOF vocabulary, FP32 round
 trip, prefix discipline, the mandel oracle, extended-page decode).
+
+## joe v1: the language draws first breath (2026-07-16, handoff item 3)
+
+`src/joe.zig` — lex → parse → check → emit, no IR, ~950 lines, output
+is .asm text fed to the existing assembler. v1 compiles the pingpong
+subset of the sketch: `message`/`actor`/`var`/params, `send`,
+`serve`/`case`/`where`/`after`, `if`/`else`, `halt`, `bounded` (lowers
+to WDEX), `=`/`+=`/`-=`. Everything deferred parses to an honest
+"unsupported in v1" error — including `let`, because park-point
+liveness IS handoff item 4 and should not arrive early half-done.
+
+Wire format: word0 low 16 = message tag (declaration order), fields
+packed at their own alignment (never straddling a word); ≤ 8 bytes
+rides TXR — so `Ping{seq u32}` is still a single register datagram
+and the 60-cycle messaging path survives the language. The v1 runtime
+ABI is ping.asm's proven wiring verbatim (desc 0/1/2 SQ/CQ/RX, timer
+SQ 5, AUTO_REARM black-hole timer, cookie $77 reserved).
+
+**pingpong.joe vs the hand-written protocol** (same fabric, same
+seeds, 8 rounds at 25% loss + duplication):
+
+| | code bytes | instructions | cycles |
+|---|---:|---:|---:|
+| ping.asm + pong.asm (hand) | 606 | 688 | 11,022 |
+| pingpong.joe (compiled) | 665 | 1,056 | 11,125 |
+
+A naive tree-walking compiler lands at +10% code, +53% instructions,
++1% wall-clock cycles (the fabric dominates) — and the deep-loss
+gauntlet passes: at 73% loss, 12 rounds complete with 121 datagrams
+lost and the sequence intact. The end-to-end protocol is compiler
+OUTPUT: joe has no syntax for transport acks, so the reliability had
+to come from retransmission + sequence discipline, which is the point
+of the whole language. Deterministic seed-for-seed (test-guarded).
+
+Null-cost trivially holds (the compiler is a new module; the frozen
+table doesn't move). 85 tests green. Next: convert the rest of the
+demo corpus, then item 4 — flip the bank-collapse convention in
+compiled output and read this same table.

@@ -49,6 +49,15 @@ const usage_text =
     \\      device on the peripheral row (§7) — SEND is the only I/O
     \\      instruction there is (programs/hello.asm).
     \\
+    \\  sim6564 joe [seed] [loss_ppm4k] [rounds] [trace]
+    \\      pingpong.joe compiled by the joe v1 compiler (src/joe.zig) and
+    \\      run across the same hostile fabric as the hand-written demo.
+    \\      Go's clothes, Erlang's soul, occam's discipline — the language
+    \\      cannot express a transport ack (docs/joe-v1-sketch.md).
+    \\
+    \\  sim6564 joec <file.joe> <Actor>
+    \\      Compile one actor to 6564 assembly on stdout.
+    \\
     \\  sim6564 mandel [seed] [trace]
     \\      The Mandelbrot set in IEEE 754 doubles — Tier 0 scalar FP on
     \\      the extended page (prefix $42), one console line per row,
@@ -154,6 +163,40 @@ pub fn main() !void {
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
         return sim.demo_hello.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "joe")) {
+        var opts = sim.demo_joe.Options{};
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        if (args.next()) |s| opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+        if (args.next()) |s| opts.rounds = parseOr(u64, s, "rounds");
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_joe.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "joec")) {
+        const path = args.next() orelse {
+            std.debug.print("usage: sim6564 joec <file.joe> <Actor>\n", .{});
+            std.process.exit(2);
+        };
+        const actor = args.next() orelse {
+            std.debug.print("usage: sim6564 joec <file.joe> <Actor>\n", .{});
+            std.process.exit(2);
+        };
+        const src = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch |err| {
+            std.debug.print("joec: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        };
+        defer alloc.free(src);
+        var diag = sim.joe.Diagnostic{};
+        var r = sim.joe.compile(alloc, src, actor, 0x1000, &diag) catch |err| {
+            std.debug.print("joec: {s} line {d}: {s}\n", .{ @errorName(err), diag.line, diag.message });
+            std.process.exit(1);
+        };
+        defer r.deinit();
+        const stdout = std.io.getStdOut().writer();
+        try stdout.print("{s}", .{r.asm_text});
+        return;
     }
 
     if (std.mem.eql(u8, first, "mandel")) {

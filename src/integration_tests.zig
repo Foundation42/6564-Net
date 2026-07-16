@@ -788,6 +788,30 @@ test "Tier 0 FP: FP32 narrows on store, widens on load — rounding is visible o
     try testing.expectEqual(@as(u64, 0x3FF8000000000000), resultAt(&m, 0x22A0));
 }
 
+test "joe: compiled pingpong survives the hostile fabric, sequence-checked" {
+    const demo_joe = @import("demo_joe.zig");
+    // The same gauntlet the hand-written protocol runs: 25% loss with
+    // duplication, and then deep loss. joe cannot say "transport ack" —
+    // the end-to-end protocol the compiler emits must carry it anyway.
+    for ([_]u16{ 1024, 3000 }) |loss| {
+        const o = try demo_joe.simulate(testing.allocator, .{
+            .loss_ppm4k = loss,
+            .rounds = 8,
+        });
+        try testing.expect(o.ping_halted);
+        try testing.expectEqual(@as(u64, 8), o.seq);
+    }
+}
+
+test "joe: compiled pingpong is deterministic, seed for seed" {
+    const demo_joe = @import("demo_joe.zig");
+    const a = try demo_joe.simulate(testing.allocator, .{ .seed = 0xBEEF, .rounds = 6 });
+    const b = try demo_joe.simulate(testing.allocator, .{ .seed = 0xBEEF, .rounds = 6 });
+    try testing.expectEqual(a.cycles, b.cycles);
+    try testing.expectEqual(a.stats.instructions, b.stats.instructions);
+    try testing.expectEqual(a.stats.lost, b.stats.lost);
+}
+
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {
     // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
     // FSUB/FCMP results, every one of which must round exactly as the

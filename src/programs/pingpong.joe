@@ -1,0 +1,37 @@
+// pingpong.joe — the sketch's §2.1, verbatim in spirit: a reliable
+// end-to-end protocol over a lossy fabric, with no transport-ack
+// handling anywhere, because joe cannot say "transport ack".
+//
+// The Pinger accepts only the echo it expects, retransmits on a fabric
+// timer, and halts after `rounds` confirmed round trips. The Ponger
+// echoes forever; the machine quiesces around it.
+
+message Ping { seq u32 }
+message Pong { seq u32 }
+
+actor Pinger(peer addr, rounds u32) {
+    var seq u32 = 0
+
+    send peer, Ping{seq}              // opening move
+
+    serve {
+        case Pong(p) where p.seq == seq:
+            seq += 1
+            if seq == rounds { halt ok }
+            send peer, Ping{seq}
+
+        case Pong(_):
+            // stale duplicate: the buffer is already reposted,
+            // there is nothing to do and nothing to forget to do
+
+        after 2500:
+            send peer, Ping{seq}      // retransmit; the timer re-arms itself
+    }
+}
+
+actor Ponger(peer addr) {
+    serve {
+        case Ping(p):
+            send peer, Pong{p.seq}
+    }
+}
