@@ -335,6 +335,18 @@ L3); vcache vs freq is a wash until per-die footprints outgrow the
 small CCD's 32 MB. Placement never changes results — md5-identical
 output across all five policies.
 
+`sim6564 churn` is the experiment that makes the X3D asymmetry speak:
+each die read-modify-writes a multi-MB stripe in maximal-period LFSR
+order (programs/mem_churn.asm). The order matters — a linear +64 stride
+measured *nothing* at 64 MB live because the host prefetcher hid all
+capacity effects; defeat the prefetcher first, then measure the cache.
+Result: parity at 16 MB live, **1.40x for the V-cache CCD at 64 MB**
+(fits 96 MB, thrashes 32 MB), narrowing to 1.15x at 128 MB when both
+CCDs overflow. Cluster runs now end with a per-die retirement table
+(`cluster.writeStatsTable`): cycles, instructions, sends, delivered,
+rejects, timeouts, context switches per die plus totals and plane
+traffic.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

@@ -113,6 +113,60 @@ const Outbox = struct {
     stats: PlaneStats = .{},
 };
 
+/// One die's end-of-run accounting, snapshotted before the cluster dies.
+pub const DieStat = struct {
+    cycles: u64,
+    stats: machine.Stats,
+};
+
+/// Snapshot per-die stats for reporting after deinit. Caller frees.
+pub fn snapshot(cl: *Cluster, alloc: std.mem.Allocator) ![]DieStat {
+    const out = try alloc.alloc(DieStat, cl.dies.len);
+    for (out, cl.dies) |*s, *d| {
+        var clock: u64 = 0;
+        for (d.cores) |*c| clock = @max(clock, c.clock);
+        s.* = .{ .cycles = clock, .stats = d.stats };
+    }
+    return out;
+}
+
+/// The retirement table: what each die actually did, and what the plane
+/// carried. `messages retired` = deliveries that landed in an RX ring
+/// (device deliveries included); every send resolves as exactly one of
+/// delivered / rejected / timed out.
+pub fn writeStatsTable(writer: anytype, dies: []const DieStat, plane: PlaneStats) !void {
+    try writer.print(
+        "  die       cycles  instructions       sends   delivered     rejects    timeouts  ctx-switches\n",
+        .{},
+    );
+    var t = DieStat{ .cycles = 0, .stats = .{} };
+    for (dies, 0..) |d, i| {
+        try writer.print("  {d:>3} {d:>12} {d:>13} {d:>11} {d:>11} {d:>11} {d:>11} {d:>13}\n", .{
+            i,                 d.cycles,
+            d.stats.instructions, d.stats.sends,
+            d.stats.delivered, d.stats.rejects,
+            d.stats.timeouts,  d.stats.context_switches,
+        });
+        t.cycles = @max(t.cycles, d.cycles);
+        t.stats.instructions += d.stats.instructions;
+        t.stats.sends += d.stats.sends;
+        t.stats.delivered += d.stats.delivered;
+        t.stats.rejects += d.stats.rejects;
+        t.stats.timeouts += d.stats.timeouts;
+        t.stats.context_switches += d.stats.context_switches;
+    }
+    try writer.print("  all {d:>12} {d:>13} {d:>11} {d:>11} {d:>11} {d:>11} {d:>13}\n", .{
+        t.cycles,             t.stats.instructions,
+        t.stats.sends,        t.stats.delivered,
+        t.stats.rejects,      t.stats.timeouts,
+        t.stats.context_switches,
+    });
+    try writer.print(
+        "  plane: {d} datagrams, {d} acks, {d} lost, {d} duplicated, {d} unroutable\n",
+        .{ plane.grams, plane.acks, plane.lost, plane.duplicated, plane.unroutable },
+    );
+}
+
 pub const Outcome = struct {
     /// Per-die stop reasons. A die whose actors park forever (a service
     /// die still listening when the work ends) reads `.deadlock` — at

@@ -65,6 +65,13 @@ const usage_text =
     \\      On asymmetric hosts (Zen X3D), add spread | vcache | freq to
     \\      pin die threads by L3 domain — wall-clock only, same bits.
     \\
+    \\  sim6564 churn [dies] [stripe_mb] [sweeps] [spread|vcache|freq] [seq]
+    \\      The cache-footprint experiment: each die read-modify-writes a
+    \\      multi-MB stripe in prefetcher-proof LFSR order
+    \\      (programs/mem_churn.asm) so thread placement on an X3D host
+    \\      has something to disagree about. stripe_mb rounds down to
+    \\      {2,8,16,64}. Default 8x8MB x12 = 64 MB live working set.
+    \\
     \\  sim6564 measure
     \\      Run every demo at its frozen baseline config and emit the
     \\      instructions / cycles / code-bytes table (the MAC & chains
@@ -146,6 +153,23 @@ pub fn main() !void {
             }
         }
         return sim.demo_dies.run(alloc, opts);
+    }
+
+    if (std.mem.eql(u8, first, "churn")) {
+        var opts = sim.demo_churn.Options{};
+        if (args.next()) |s| opts.dies = @min(16, parseOr(u16, s, "dies"));
+        if (args.next()) |s| opts.stripe_mb = @min(64, parseOr(u64, s, "stripe_mb"));
+        if (args.next()) |s| opts.sweeps = @min(1000, parseOr(u64, s, "sweeps"));
+        while (args.next()) |s| {
+            if (std.mem.eql(u8, s, "seq")) {
+                opts.parallel = false;
+            } else if (std.mem.eql(u8, s, "trace")) {
+                opts.trace = true;
+            } else if (std.meta.stringToEnum(sim.cluster.PinPolicy, s)) |p| {
+                opts.pin = p;
+            }
+        }
+        return sim.demo_churn.run(alloc, opts);
     }
 
     if (std.mem.eql(u8, first, "periph")) {

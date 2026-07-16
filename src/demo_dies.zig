@@ -35,7 +35,8 @@ pub const Options = struct {
 };
 
 pub const Outcome = struct {
-    reasons: []machine.StopReason, // caller frees
+    reasons: []machine.StopReason,
+    die_stats: []cluster.DieStat,
     passes: u64,
     busy_passes: u64,
     crossings: u64,
@@ -48,6 +49,11 @@ pub const Outcome = struct {
     exactly_one_finisher: bool,
     busy_rings_finished: bool,
     parallel: bool,
+
+    pub fn deinit(self: *const Outcome, alloc: std.mem.Allocator) void {
+        alloc.free(self.reasons);
+        alloc.free(self.die_stats);
+    }
 };
 
 pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
@@ -155,6 +161,8 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
 
     var out = try cl.run();
     errdefer out.deinit(alloc);
+    const die_stats = try cluster.snapshot(cl, alloc);
+    errdefer alloc.free(die_stats);
 
     var global_finishers: u32 = 0;
     var local_finishers: u32 = 0;
@@ -178,6 +186,7 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
 
     return .{
         .reasons = out.reasons,
+        .die_stats = die_stats,
         .passes = passes,
         .busy_passes = busy_passes,
         .crossings = crossings,
@@ -195,7 +204,7 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
 
 pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
     const o = try simulate(alloc, opts);
-    defer alloc.free(o.reasons);
+    defer o.deinit(alloc);
     const d_count: u16 = @max(2, @min(16, opts.dies));
     const busy: u64 = @min(100_000, opts.busy);
     const cap: u16 = if (busy > 0) 100 else 200;
@@ -235,5 +244,7 @@ pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
         \\  {d} local passes keeping all {d} host threads hot
         \\
     , .{ n, busy, o.busy_passes, d_count });
+    try stdout.print("\n", .{});
+    try cluster.writeStatsTable(stdout, o.die_stats, o.plane);
     if (!complete) std.process.exit(1);
 }

@@ -9,6 +9,7 @@ pub const machine = @import("machine.zig");
 pub const cluster = @import("cluster.zig");
 pub const topology = @import("topology.zig");
 pub const demo_dies = @import("demo_dies.zig");
+pub const demo_churn = @import("demo_churn.zig");
 pub const asm6564 = @import("asm.zig");
 pub const demo_pingpong = @import("demo_pingpong.zig");
 pub const demo_hello = @import("demo_hello.zig");

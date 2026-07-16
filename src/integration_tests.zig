@@ -1456,7 +1456,7 @@ test "io plane: the dies ring — same program bytes, one route byte" {
         .laps = 3,
         .parallel = false,
     });
-    defer testing.allocator.free(o.reasons);
+    defer o.deinit(testing.allocator);
     try testing.expect(o.exactly_one_finisher);
     try testing.expect(o.finisher_is_origin);
     try testing.expectEqual(@as(u64, 48), o.passes);
@@ -1472,14 +1472,14 @@ test "io plane: bit-identical at any thread count" {
         .laps = 5,
         .parallel = false,
     });
-    defer testing.allocator.free(seq.reasons);
+    defer seq.deinit(testing.allocator);
     const par = try @import("demo_dies.zig").simulate(testing.allocator, .{
         .dies = 4,
         .nodes = 20,
         .laps = 5,
         .parallel = true,
     });
-    defer testing.allocator.free(par.reasons);
+    defer par.deinit(testing.allocator);
     try testing.expectEqual(seq.cycles, par.cycles);
     try testing.expectEqual(seq.windows, par.windows);
     try testing.expectEqual(seq.instructions, par.instructions);
@@ -1529,7 +1529,7 @@ test "io plane: busy mode — local rings finish on every die, still bit-identic
         .busy = 20,
         .parallel = false,
     });
-    defer testing.allocator.free(seq.reasons);
+    defer seq.deinit(testing.allocator);
     const par = try @import("demo_dies.zig").simulate(testing.allocator, .{
         .dies = 3,
         .nodes = 10,
@@ -1537,11 +1537,35 @@ test "io plane: busy mode — local rings finish on every die, still bit-identic
         .busy = 20,
         .parallel = true,
     });
-    defer testing.allocator.free(par.reasons);
+    defer par.deinit(testing.allocator);
     try testing.expect(seq.exactly_one_finisher and seq.finisher_is_origin);
     try testing.expect(seq.busy_rings_finished);
     try testing.expectEqual(seq.cycles, par.cycles);
     try testing.expectEqual(seq.instructions, par.instructions);
     try testing.expectEqual(seq.windows, par.windows);
     try testing.expect(par.busy_rings_finished);
+}
+
+test "churn: LFSR sweep counts every line, threaded same as sequential" {
+    const seq = try @import("demo_churn.zig").simulate(testing.allocator, .{
+        .dies = 2,
+        .stripe_mb = 2,
+        .sweeps = 2,
+        .parallel = false,
+    });
+    defer seq.deinit(testing.allocator);
+    try testing.expect(seq.verified);
+    const par = try @import("demo_churn.zig").simulate(testing.allocator, .{
+        .dies = 2,
+        .stripe_mb = 2,
+        .sweeps = 2,
+        .parallel = true,
+    });
+    defer par.deinit(testing.allocator);
+    try testing.expect(par.verified);
+    try testing.expectEqual(seq.cycles, par.cycles);
+    try testing.expectEqual(
+        seq.die_stats[0].stats.instructions,
+        par.die_stats[0].stats.instructions,
+    );
 }

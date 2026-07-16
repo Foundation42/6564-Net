@@ -261,3 +261,31 @@ Findings, in order of size:
    dies: the whole cluster's working set (~1 MB of die RAM plus queues)
    fits in either L3, so clocks win. The X3D asymmetry will only speak
    when per-die footprints outgrow 32 MB; the knob is ready for it.
+
+## The V-cache speaks (2026-07-16, `sim6564 churn`)
+
+The placement table above showed vcache ≈ freq because the whole
+cluster fit in either L3. `churn` gives each die a stripe of megabytes
+to read-modify-write so placement has something to disagree about —
+and the first draft measured **nothing at 64 MB live**: it walked the
+stripe at a linear +64 stride, which is a hardware prefetcher's
+breakfast. Capacity never got a vote. Lesson kept: **a cache
+experiment must defeat the prefetcher before it measures the cache.**
+The walk is now a maximal-period Galois LFSR over the line index
+(stripe sizes {2,8,16,64} MB — the ones with two-tap maximal
+polynomials); verification is unchanged in spirit: every visited line
+holds exactly `sweeps`, and line 0 (the LFSR's fixed point) holds 0.
+
+Best of 3, ReleaseFast, 8 dies / 8 threads, LFSR walk:
+
+| live set | spread | vcache | freq | vcache advantage |
+|---|---:|---:|---:|---:|
+| 16 MB (fits either CCD) | 0.199 s | 0.197 s | 0.203 s | 1.03x — parity |
+| 64 MB (fits 96 MB, thrashes 32 MB) | 0.225 s | **0.215 s** | 0.302 s | **1.40x** |
+| 128 MB (overflows both) | 0.302 s | 0.278 s | 0.321 s | 1.15x |
+
+The curve is the textbook one: parity while everything fits, a 1.40x
+win for the V-cache CCD exactly in the band where 96 MB holds what
+32 MB cannot, narrowing again once both overflow to DRAM (96 MB still
+catches ~3/4 of a 128 MB set). Placement changes seconds, never bits —
+verified counts and cycle totals are identical under every policy.
