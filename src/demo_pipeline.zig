@@ -42,13 +42,14 @@ pub const Outcome = struct {
 
 fn wireNode(m: *machine.Machine, core: u16) void {
     const mk = struct {
-        fn desc(base: u64, cap_log2: u5, entry: u16, token: u64) ring.Desc {
+        fn desc(base: u64, cap_log2: u5, entry: u16, token: u64, flags: u8) ring.Desc {
             return .{
                 .base = base,
                 .cap_log2 = cap_log2,
                 .entry_size = entry,
                 .watermark = 0,
                 .companion_cq = ring.slot_cq,
+                .flags = flags,
                 .head = 0,
                 .tail = 0,
                 .token = token,
@@ -59,11 +60,12 @@ fn wireNode(m: *machine.Machine, core: u16) void {
     // $2A00/$2A40, clear of it. (The first draft overlapped them; completion
     // records overwrote the staged RX entries once the CQ wrapped. Memory
     // maps: the oldest bug there is.)
-    m.setRing(core, 0, ring.slot_sq, mk(0x2400, 0, ring.sq_entry_size, 0)); // items out
-    m.setRing(core, 0, ring.slot_cq, mk(0x2000, 5, ring.cq_entry_size, 0));
-    m.setRing(core, 0, ring.slot_rx, mk(0x2A00, 0, ring.rx_entry_size, 0x6564)); // items in
-    m.setRing(core, 0, 3, mk(0x2A40, 0, ring.rx_entry_size, 0x6564)); // acks in
-    m.setRing(core, 0, 4, mk(0x2440, 0, ring.sq_entry_size, 0)); // acks out
+    const rp = ring.desc_flag_auto_repost;
+    m.setRing(core, 0, ring.slot_sq, mk(0x2400, 0, ring.sq_entry_size, 0, 0)); // items out
+    m.setRing(core, 0, ring.slot_cq, mk(0x2000, 5, ring.cq_entry_size, 0, 0));
+    m.setRing(core, 0, ring.slot_rx, mk(0x2A00, 1, ring.rx_entry_size, 0x6564, rp)); // items in
+    m.setRing(core, 0, 3, mk(0x2A40, 1, ring.rx_entry_size, 0x6564, rp)); // acks in
+    m.setRing(core, 0, 4, mk(0x2440, 0, ring.sq_entry_size, 0, 0)); // acks out
 }
 
 /// Build, run, and measure — shared by the CLI demo and the test suite.

@@ -20,15 +20,23 @@
         STA $890            ; nothing in flight
         LDA ##$FF00_0100_0000_0000
         STA $838            ; timer pointer
-        ; stage the ack landing entry (RX ring 3, cap 1)
+        ; stage both ack landing entries (cap-2 AUTO_REPOST ring;
+        ; cookie = buffer address)
         LDA ##$2240
         STA !$2A40
-        LDA #64
+        STA !$2A58
+        LDA #8
         STA !$2A48
         LDA #0
         STA !$2A50
-        LDA #$4C
-        STA !$2A58
+        LDA ##$2248
+        STA !$2A60
+        STA !$2A78
+        LDA #8
+        STA !$2A68
+        LDA #0
+        STA !$2A70
+        RECV 3
         RECV 3
         ; stage the item transmit entry (SQ 0 → PTT 0)
         LDA #1
@@ -83,13 +91,11 @@ del:    TYA                 ; a delivery: clean, and on the ack ring?
         LSR
         AND #$FF
         CMP #0
-        BNE wait            ; rejected: nothing landed, nothing to repost
-        CPX #$4C
-        BNE wait
-        LDA !$2240          ; acked seq
+        BNE wait            ; rejected: nothing landed
+        STX $8E0            ; cookie = where the ack landed
+        LDA ($8E0)          ; acked seq
         CMP $898
         BNE redo            ; stale duplicate ack: ignore
         LDA #0
         STA $890            ; item delivered downstream: slot free
-redo:   RECV 3
-        BRA main
+redo:   BRA main

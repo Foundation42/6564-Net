@@ -195,6 +195,22 @@ vectors travel with the actor and survive SPWN. Null vector →
 docs/measurements.md: the current corpus can't feed it (3.6% max code-byte
 saving), so it awaits the chain features and richer workloads.
 
+**32-byte SQE** (sketch §2, now the only submission format): op | flags
+(bit 7 OWNED) | link | hint, target, buf/value, len | cookie_lo. SEND
+dispatches by op (`send`, `txr`; others fault). Completion cookies carry
+the hardware stamp (cookie_lo | staging-slot<<32 | incarnation<<48);
+completion word0 bits 16..24 carry the source-ring slot. Verified no-op
+dynamically.
+
+**AUTO_REPOST** (ring-descriptor flag): on CQPOP of a landed delivery
+from a flagged RX ring, hardware re-enqueues the consumed landing buffer
+(+1 countable cycle, `stats.auto_reposts`). Capacity-1 rings fault at
+first trigger (zero-width validity window). Measured flat-to-negative on
+this corpus (see measurements.md) — its real value is making the
+missed-repost bug class unrepresentable, which is exactly the class both
+of Phase 3's real deadlocks belonged to. Recommendation: optional
+implementation feature, not architectural.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

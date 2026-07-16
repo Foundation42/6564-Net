@@ -42,3 +42,41 @@ chain features land (AUTO_REPOST/LINK reshape every serve loop, changing
 both numerator and denominator), and after any richer workload joins the
 suite. If the picture holds, MAC parks as an optional implementation
 feature per the sketch's middle band.
+
+## SQE format + AUTO_REPOST landed (2026-07-16)
+
+| demo | code bytes | instructions | cycles | ctx switches | verified |
+|---|---:|---:|---:|---:|---|
+| pingpong (0x6564/1024/8) | 560 | 819 | 11067 | 39 | yes |
+| supervise (fixed) | 175 | 1458 | 4104 | 0 | yes |
+| pipeline (0x6564/1024/16/2) | 1318 | 8946 | 68757 | 345 | yes |
+| scatter (0x6564/1024/6) | 556 | 1897 | 13097 | 44 | yes |
+| ring (64x100) | 77 | 205120 | 425278 | 12863 | yes |
+| **total** | 2686 | 218240 | 522303 | 13291 | yes |
+
+**SQE format (32-byte, op/flags/link, hw cookie stamp): verified no-op.**
+Executed instructions identical to baseline; +56 code bytes; the chain
+prerequisite is in place at null dynamic cost.
+
+**AUTO_REPOST: flat-to-negative on this corpus — prediction wrong again,
+in the other direction.** vs baseline: instructions +0.3%, code bytes
++11% (double-buffer staging + cookie indirection), cycles +0.4%, ring
+still 66/pass. The arithmetic: the eliminated `RECV` is one instruction,
+and the cap-≥2 requirement forces a `STX` cookie-save plus indirect loads
+that cost exactly as much — a serial actor with one outstanding message
+was already optimal on a cap-1 ring with a fixed landing address. The
+sketch's "biggest single win" assumed the RECV carried bookkeeping weight
+it doesn't have on straight-line protocol loops.
+
+**What the numbers don't capture, recorded for the verdict:** both real
+deadlocks hit during Phase 3 development (pong's dup-repost wedge, ping's
+stale-echo wedge) were precisely missed-repost bugs — the bug class
+AUTO_REPOST makes unrepresentable. And the conversion surfaced a third
+memory-map overlap (ring demo's widened entry stripe crossing its cell
+region at N=200), now regression-tested.
+
+**Recommendation: park as an optional implementation feature** (the
+sketch's middle band) — not architectural, but permitted: its value is
+robustness-by-construction for receive loops, not instructions saved.
+Demos keep it (the code is simpler and self-heals); the spec doesn't
+require it. Remaining to measure: AUTO_REARM, LINK.

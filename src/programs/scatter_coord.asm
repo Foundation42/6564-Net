@@ -78,8 +78,7 @@ del:    TYA                 ; a delivery: clean?
         ADC $8C0
         STA $8C0            ; sum += result
         INC $8C8
-dup:    RECV 2              ; repost this landing slot
-        LDA $8C8
+dup:    LDA $8C8            ; (AUTO_REPOST already re-armed the slot)
         CMP $8A8
         BNE wait
         HLT                 ; gathered all W: done (timer chain dies with us)

@@ -11,15 +11,23 @@
 ;   near: $850 served count (harness reads; > 1 per task = duplicates seen)
 
         .org $1000
-        ; stage the task landing entry (RX ring 2, cap 1)
+        ; stage both task landing entries (cap-2 AUTO_REPOST ring;
+        ; cookie = buffer address)
         LDA ##$2200
         STA !$2A00
-        LDA #64
+        STA !$2A18
+        LDA #16
         STA !$2A08
         LDA #0
         STA !$2A10
-        LDA #$2A
-        STA !$2A18
+        LDA ##$2220
+        STA !$2A20
+        STA !$2A38
+        LDA #16
+        STA !$2A28
+        LDA #0
+        STA !$2A30
+        RECV 2
         RECV 2
         ; stage the reply transmit descriptor (SQ 0 → PTT 0)
         LDA #1
@@ -49,14 +57,13 @@ serve:  LSTN 1
         AND #$FF
         CMP #0
         BNE serve           ; rejected: nothing landed
-        CPX #$2A
-        BNE serve
         ; reply {id, v·v}
-        LDA !$2200
+        STX $8E0            ; cookie = where the task landed
+        LDA ($8E0)
         STA !$2280          ; echo the worker id
-        LDA !$2208
+        LDY #8
+        LDA ($8E0),Y
         STA $8F0            ; multiplicand (walks left)
-        LDA !$2208
         STA $8F8            ; multiplier (walks right)
         LDA #0
         STA $8E8            ; product
@@ -77,5 +84,4 @@ mdone:  LDA $8E8
         STA !$2288
         INC $850            ; count requests served
         SEND 0
-        RECV 2
         BRA serve

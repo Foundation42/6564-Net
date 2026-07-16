@@ -21,15 +21,23 @@
         STA $880
         STA $8C0
         STA $8C8
-        ; RX 2: items from upstream
+        ; RX 2: items from upstream — two landing buffers (AUTO_REPOST),
+        ; cookie = buffer address
         LDA ##$2200
         STA !$2A00
-        LDA #64
+        STA !$2A18
+        LDA #16
         STA !$2A08
         LDA #0
         STA !$2A10
-        LDA #$2A
-        STA !$2A18
+        LDA ##$2220
+        STA !$2A20
+        STA !$2A38
+        LDA #16
+        STA !$2A28
+        LDA #0
+        STA !$2A30
+        RECV 2
         RECV 2
         ; SQ 4: acks to upstream (PTT 2)
         LDA #1
@@ -59,21 +67,19 @@ wait:   LSTN 1
         AND #$FF
         CMP #0
         BNE wait            ; rejected: nothing landed
-        CPX #$2A
-        BNE wait
-        LDA !$2200          ; inbound seq
+        STX $8E0            ; cookie = where the item landed
+        LDA ($8E0)          ; inbound seq
         CMP $880
         BEQ fresh
         ; duplicate of a consumed item: our ack was lost — re-ack it
         STA !$2260
         SEND 4
-        RECV 2
         BRA wait
 fresh:  CMP !$2600
         BCS accept          ; the DONE item: no data to verify
         ; verify val == (seq+1)·2^n − 1
         CLC
-        LDA !$2200
+        LDA ($8E0)
         ADC #1
         LDX !$2608
         BEQ vdone
@@ -82,16 +88,17 @@ vloop:  ASL
         BNE vloop
 vdone:  SEC
         SBC #1
-        CMP !$2208
+        LDY #8
+        CMP ($8E0),Y
         BEQ vok
         INC $8C8            ; a corrupted transform would show here
 vok:    CLC
         LDA $8C0
-        ADC !$2208
+        LDY #8
+        ADC ($8E0),Y
         STA $8C0            ; checksum += val
-accept: LDA !$2200
+accept: LDA ($8E0)
         STA !$2260
         SEND 4              ; ack it
         INC $880
-        RECV 2
         BRA wait            ; and serve forever

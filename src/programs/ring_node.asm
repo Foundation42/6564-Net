@@ -9,15 +9,21 @@
 ; reliable (§3.2), so there is no retransmission protocol: this is the bare
 ; cost of actor-to-actor messaging.
 ;
+; The receive ring is AUTO_REPOST (capacity 2): hardware re-enqueues the
+; landing buffer as we pop the delivery, so the loop never issues RECV. The
+; completion cookie is the landing buffer's address — where THIS message
+; landed.
+;
 ; Harness contract (per node):
 ;   near $840 = window pointer to the next node's ring (own PTT slot)
-;   near $848 = own landing buffer address
-;   desc slots: 1 CQ, 2 RX (entry staged by harness in RAM)
+;   desc slots: 1 CQ, 2 RX (cap 2, AUTO_REPOST, entries staged by harness,
+;   cookie = buffer address)
 ;   spawn arg (A): N·M for the injecting node, 0 for everyone else
 ;   near $850 = finisher flag (set by whoever completes the final pass)
 
         .org $1000
-        RECV 2              ; grant landing space before anything moves
+        RECV 2              ; grant landing space before anything moves…
+        RECV 2              ; …both buffers; AUTO_REPOST sustains them
         CMP #0
         BEQ serve           ; not the injector
         TXR ($840),A        ; light the fuse: pass 1 departs
@@ -40,11 +46,11 @@ serve:  LSTN 1
         AND #$FF
         CMP #0
         BNE serve           ; rejected: nothing landed
-        LDA ($848)          ; the counter, fresh off the fabric
+        STX $848            ; cookie = where the counter landed
+        LDA ($848)
         DEC
         BEQ fin             ; that was pass N·M
         TXR ($840),A        ; pass it on
-        RECV 2
         BRA serve
 fin:    INC $850            ; for the harness: the ring ended here
         HLT

@@ -858,3 +858,59 @@ test "MAC vectors survive SPWN: a restarted actor keeps its bindings" {
         std.mem.readInt(u64, m.cores[0].contexts[1].near[0x870..][0..8], .little),
     );
 }
+
+test "AUTO_REPOST on a capacity-1 ring faults: zero-width validity window" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 2,
+        .ram_size = 0x8000,
+    });
+    defer m.deinit();
+    m.setPtt(0, 0, .{
+        .prefix_lo = ring.PttEntry.loFrom(0, 1, ring.slot_rx),
+        .rights = .{ .send = true },
+        .token = 0,
+    });
+    wireSender(&m, 0, 0, 0x2300, 0x2400);
+    wireReceiver(&m, 0, 1, 0x2000, 0x2100, 0);
+    // Force the receiver's cap-1 RX ring into AUTO_REPOST — architecturally
+    // meaningless, must fault at the CQPOP that would trigger it.
+    var d = ring.Desc{
+        .base = 0x2100,
+        .cap_log2 = 0,
+        .entry_size = ring.rx_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .flags = ring.desc_flag_auto_repost,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    };
+    m.setRing(0, 1, ring.slot_rx, d);
+    _ = &d;
+
+    const sender_src =
+        \\        .org $1000
+        \\        LDA ##$FF00_0000_0000_0000
+        \\        STA $800
+        \\        LDA #9
+        \\        TXR ($800),A
+        \\        HLT
+    ;
+    try assembleInto(&m, 0, sender_src);
+    try assembleInto(&m, 0, receiver_src);
+    try m.spawn(0, 1, 0x1400, 0x3800, 0);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.faulted, try m.run());
+    try testing.expectEqual(machine.Fault.bad_descriptor, m.cores[0].contexts[1].fault);
+}
+
+test "armstrong ring at full scale: 200 nodes, layout stripes stay disjoint" {
+    const o = try @import("demo_ring.zig").simulate(testing.allocator, .{
+        .nodes = 200,
+        .laps = 10,
+    });
+    try testing.expectEqual(@as(u64, 2000), o.passes);
+    try testing.expect(o.exactly_one_finisher and o.finisher_is_node0);
+    try testing.expect(o.cycles_per_pass < 100);
+}

@@ -78,27 +78,32 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
             .token = 0,
         });
         mach.setRing(0, ctx, ring.slot_rx, .{
-            .base = 0x4000 + 32 * @as(u64, i),
-            .cap_log2 = 0,
+            .base = 0x4000 + 64 * @as(u64, i),
+            .cap_log2 = 1, // two buffers: AUTO_REPOST's validity window
             .entry_size = ring.rx_entry_size,
             .watermark = 0,
             .companion_cq = ring.slot_cq,
+            .flags = ring.desc_flag_auto_repost,
             .head = 0,
             .tail = 0,
             .token = 0x6564,
         });
-        // The RX entry: an 8-byte landing cell, exactly one TXR payload.
-        const cell: u64 = 0x6000 + 8 * @as(u64, i);
-        const entry = ring.RxEntry{ .buf = cell, .cap = 8, .filled = 0, .cookie = cell };
-        var entry_bytes: [32]u8 = undefined;
-        for (entry.pack(), 0..) |word, wi|
-            std.mem.writeInt(u64, entry_bytes[wi * 8 ..][0..8], word, .little);
-        mach.load(0, 0x4000 + 32 * @as(u64, i), &entry_bytes);
-        // Near config: where to send, where messages land.
+        // Two RX entries: 8-byte landing cells, cookie = cell address.
+        // Layout note: entries stripe $4000..$71FF at N=200 and CQs stripe
+        // $8000..$B1FF, so cells live at $C000 — clear of both. (The first
+        // draft put them at $6000, inside the entry stripe. Memory maps.)
+        var slot_i: u64 = 0;
+        while (slot_i < 2) : (slot_i += 1) {
+            const cell: u64 = 0xC000 + 16 * @as(u64, i) + 8 * slot_i;
+            const entry = ring.RxEntry{ .buf = cell, .cap = 8, .filled = 0, .cookie = cell };
+            var entry_bytes: [32]u8 = undefined;
+            for (entry.pack(), 0..) |word, wi|
+                std.mem.writeInt(u64, entry_bytes[wi * 8 ..][0..8], word, .little);
+            mach.load(0, 0x4000 + 64 * @as(u64, i) + 32 * slot_i, &entry_bytes);
+        }
+        // Near config: where to send.
         std.mem.writeInt(u64, &buf8, ring.windowAddr(i, 0), .little);
         mach.writeNear(0, ctx, 0x840, &buf8);
-        std.mem.writeInt(u64, &buf8, cell, .little);
-        mach.writeNear(0, ctx, 0x848, &buf8);
         // Everyone but node 0 starts now; the injector goes last so every
         // landing buffer is posted before pass 1 departs.
         if (i != 0) try mach.spawn(0, ctx, 0x1000, 0x3000, 0);

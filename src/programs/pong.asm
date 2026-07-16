@@ -1,19 +1,33 @@
 ; pong.asm — the echo server: receive a value, add one, send it back.
 ; Serves forever; the machine quiesces around it when ping finishes.
 ;
-; Harness contract: PTT 0 → peer's RX ring; desc slots 0 SQ / 1 CQ / 2 RX;
-; $2200 landing buffer, $2500 outgoing echo buffer, $820 served counter.
+; The receive ring is AUTO_REPOST (capacity 2): hardware re-enqueues the
+; landing buffer as we pop each delivery, which erases the old serve0/serve
+; repost bookkeeping outright — rejected duplicates and clean deliveries
+; need no distinction here anymore. The completion cookie is the landing
+; buffer's address.
+;
+; Harness contract: PTT 0 → peer's RX ring; desc slots 0 SQ / 1 CQ / 2 RX
+; (cap 2, AUTO_REPOST); $2500 outgoing echo buffer, $820 served counter.
 
         .org $1000
-        ; stage RX landing entry
+        ; stage both RX landing entries (cookie = buffer address)
         LDA ##$2200
         STA !$2100
+        STA !$2118
         LDA #64
         STA !$2108
         LDA #0
         STA !$2110
-        LDA #$BB
-        STA !$2118
+        LDA ##$2240
+        STA !$2120
+        STA !$2138
+        LDA #64
+        STA !$2128
+        LDA #0
+        STA !$2130
+        RECV 2
+        RECV 2
         ; stage the echo transmit entry (SQE)
         LDA #1
         STA !$2400          ; op = send
@@ -23,7 +37,6 @@
         STA !$2410          ; buffer
         LDA ##$2_0000_0008
         STA !$2418          ; len 8 | cookie 2
-serve0: RECV 2
 serve:  LSTN 1
         CQPOP 1
         BEQ serve
@@ -42,11 +55,11 @@ serve:  LSTN 1
         LSR
         AND #$FF
         CMP #0
-        BNE serve           ; rejected dup / noise: our buffer is still
-                            ; posted, so do NOT repost — just listen
-echo:   LDA !$2200
+        BNE serve           ; rejected dup / noise: just listen
+echo:   STX $8E0            ; cookie = where it landed
+        LDA ($8E0)
         INC
         STA !$2500
         INC $820            ; count served deliveries
         SEND 0
-        BRA serve0
+        BRA serve

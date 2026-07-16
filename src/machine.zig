@@ -161,6 +161,8 @@ pub const Stats = struct {
     watchdog_trips: u64 = 0,
     /// MAC vectored calls executed (pre-normative mechanism; see sketch).
     macro_calls: u64 = 0,
+    /// Landing buffers re-enqueued by AUTO_REPOST rings at CQPOP time.
+    auto_reposts: u64 = 0,
     cq_overflows: u64 = 0,
 };
 
@@ -987,6 +989,27 @@ pub const Machine = struct {
                     ctx.a = words[0];
                     ctx.x = words[1];
                     ctx.p.z = false;
+                    // AUTO_REPOST (sketch §3.3): popping a LANDED delivery
+                    // record from a flagged RX ring re-enqueues the consumed
+                    // landing buffer. Pop-time, not delivery-time, so the
+                    // payload stays valid until the ring's other N−1 buffers
+                    // are consumed. Capacity-1 rings have a zero-width
+                    // validity window: architecturally meaningless, fault.
+                    const rec = ring.Completion.fromWords(words[0], words[1]);
+                    if (rec.tag == .deliver and
+                        (rec.status == .ok or rec.status == .truncated))
+                    {
+                        var rx = readDesc(ctx, rec.slot);
+                        if (rx.flags & ring.desc_flag_auto_repost != 0) {
+                            if (rx.capacity() == 1) return error.BadDescriptor;
+                            if (!rx.isFull()) {
+                                rx.tail +%= 1;
+                                writeDesc(ctx, rec.slot, rx);
+                                self.stats.auto_reposts += 1;
+                                core.clock += 1; // countable, not free
+                            }
+                        }
+                    }
                 } else {
                     ctx.p.z = true;
                 }

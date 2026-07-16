@@ -17,15 +17,24 @@
         STA $810
         LDA ##$FF00_0100_0000_0000
         STA $838            ; black-hole window pointer = our timer
-        ; stage the RX landing entry (ring cap 1: constant address)
+        ; stage both RX landing entries (cap-2 AUTO_REPOST ring;
+        ; cookie = buffer address, so we know where each echo landed)
         LDA ##$2200
         STA !$2100
+        STA !$2118
         LDA #64
         STA !$2108
         LDA #0
         STA !$2110
-        LDA #$AA
-        STA !$2118
+        LDA ##$2240
+        STA !$2120
+        STA !$2138
+        LDA #64
+        STA !$2128
+        LDA #0
+        STA !$2130
+        RECV 2
+        RECV 2
         ; stage the transmit entry (SQE: op / target / buf / len+cookie)
         LDA #1
         STA !$2400          ; word0: op = send
@@ -38,7 +47,6 @@
         LDA #0
         STA !$2500          ; first message value
         TXR ($838),A        ; arm the retransmit timer chain
-loop:   RECV 2              ; landing space for the reply
 send:   SEND 0
 wait:   LSTN 1
         CQPOP 1
@@ -66,17 +74,16 @@ got:    TYA                 ; a delivery completion: clean?
         AND #$FF
         CMP #0
         BNE wait            ; rejected inbound (dup noise): keep waiting
+        STX $8E0            ; cookie = where this echo landed
         LDA !$2500          ; sequence check: the only echo we accept
         INC                 ; is (value we sent) + 1 — stale duplicates
-        STA $828            ; of earlier echoes are ignored
-        LDA !$2200
+        STA $828            ; of earlier echoes are ignored (AUTO_REPOST
+        LDA ($8E0)          ; already re-armed their buffers)
         CMP $828
-        BNE stale
+        BNE wait
         STA !$2500          ; the echo becomes the next message
         DEC $810
-        BNE loop
-        LDA !$2200
+        BNE send
+        LDA ($8E0)
         STA !$2280          ; final value, for the harness
         HLT
-stale:  RECV 2              ; it landed, so it ate our buffer: repost
-        BRA wait

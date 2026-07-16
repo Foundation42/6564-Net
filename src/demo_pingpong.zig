@@ -40,10 +40,11 @@ fn wire(m: *machine.Machine, core: u16) void {
     });
     m.setRing(core, 0, ring.slot_rx, .{
         .base = 0x2100,
-        .cap_log2 = 0,
+        .cap_log2 = 1, // two landing buffers: AUTO_REPOST's validity window
         .entry_size = ring.rx_entry_size,
         .watermark = 0,
         .companion_cq = ring.slot_cq,
+        .flags = ring.desc_flag_auto_repost,
         .head = 0,
         .tail = 0,
         .token = 0x6564,

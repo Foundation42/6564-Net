@@ -34,25 +34,40 @@
         STA $8B8
         LDA ##$FF00_0100_0000_0000
         STA $838            ; timer pointer
-        ; RX 2: items from upstream
+        ; RX 2: items from upstream — two landing buffers (AUTO_REPOST),
+        ; cookie = buffer address
         LDA ##$2200
         STA !$2A00
-        LDA #64
+        STA !$2A18
+        LDA #16
         STA !$2A08
         LDA #0
         STA !$2A10
-        LDA #$2A
-        STA !$2A18
+        LDA ##$2220
+        STA !$2A20
+        STA !$2A38
+        LDA #16
+        STA !$2A28
+        LDA #0
+        STA !$2A30
         RECV 2
-        ; RX 3: acks from downstream
+        RECV 2
+        ; RX 3: acks from downstream — same discipline
         LDA ##$2240
         STA !$2A40
-        LDA #64
+        STA !$2A58
+        LDA #8
         STA !$2A48
         LDA #0
         STA !$2A50
-        LDA #$4C
-        STA !$2A58
+        LDA ##$2248
+        STA !$2A60
+        STA !$2A78
+        LDA #8
+        STA !$2A68
+        LDA #0
+        STA !$2A70
+        RECV 3
         RECV 3
         ; SQ 0: items to downstream (PTT 0)
         LDA #1
@@ -129,12 +144,31 @@ del:    TYA                 ; clean delivery? which ring?
         AND #$FF
         CMP #0
         BNE wait            ; rejected: nothing landed
-        CPX #$2A
-        BEQ item
-        CPX #$4C
-        BEQ ack
+        STX $8E0            ; cookie = the landing buffer's address…
+        TXA                 ; …which also names the ring: item buffers sit
+        CMP ##$2240         ; below $2240, ack buffers at and above it
+        BCS ack
+item:   LDA ($8E0)          ; inbound seq
+        CMP $880
+        BEQ fresh
+        ; a duplicate of something we already own: our ack was lost — re-ack
+        STA !$2260
+        SEND 4
         BRA wait
-ack:    LDA !$2240          ; downstream acked which seq?
+fresh:  LDA $888
+        BNE wait            ; HOLD full: drop silently — backpressure
+take:   LDA ($8E0)
+        STA $898            ; own it
+        STA !$2260
+        LDY #8
+        LDA ($8E0),Y
+        STA $890
+        LDA #1
+        STA $888
+        SEND 4              ; ack upstream: your slot is free
+        INC $880            ; expect the next
+        BRA main
+ack:    LDA ($8E0)          ; downstream acked which seq?
         CMP !$2280
         BNE ackrp           ; stale duplicate ack
         LDA #0
@@ -143,28 +177,4 @@ ack:    LDA !$2240          ; downstream acked which seq?
         BEQ ackrp
         LDA #2
         STA $8B8            ; DONE has moved on: go lame duck
-ackrp:  RECV 3
-        BRA main
-item:   LDA !$2200          ; inbound seq
-        CMP $880
-        BEQ fresh
-        ; a duplicate of something we already own: our ack was lost — re-ack
-        STA !$2260
-        SEND 4
-        RECV 2
-        BRA wait
-fresh:  LDA $888
-        BEQ take
-        RECV 2              ; HOLD full: drop silently — backpressure
-        BRA wait
-take:   LDA !$2200
-        STA $898            ; own it
-        STA !$2260
-        LDA !$2208
-        STA $890
-        LDA #1
-        STA $888
-        SEND 4              ; ack upstream: your slot is free
-        INC $880            ; expect the next
-        RECV 2
-        BRA main
+ackrp:  BRA main

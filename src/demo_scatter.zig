@@ -71,13 +71,14 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
     defer worker.deinit();
 
     const mk = struct {
-        fn desc(base: u64, cap_log2: u5, entry: u16, token: u64) ring.Desc {
+        fn desc(base: u64, cap_log2: u5, entry: u16, token: u64, flags: u8) ring.Desc {
             return .{
                 .base = base,
                 .cap_log2 = cap_log2,
                 .entry_size = entry,
                 .watermark = 0,
                 .companion_cq = ring.slot_cq,
+                .flags = flags,
                 .head = 0,
                 .tail = 0,
                 .token = token,
@@ -87,9 +88,9 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
 
     // ── Coordinator (core 0) ─────────────────────────────────────────────
     m.load(0, coord.origin, coord.code);
-    m.setRing(0, 0, ring.slot_sq, mk(0x2400, 0, ring.sq_entry_size, 0));
-    m.setRing(0, 0, ring.slot_cq, mk(0x2000, 5, ring.cq_entry_size, 0));
-    m.setRing(0, 0, ring.slot_rx, mk(0x2A00, 3, ring.rx_entry_size, 0x6564)); // cap 8
+    m.setRing(0, 0, ring.slot_sq, mk(0x2400, 0, ring.sq_entry_size, 0, 0));
+    m.setRing(0, 0, ring.slot_cq, mk(0x2000, 5, ring.cq_entry_size, 0, 0));
+    m.setRing(0, 0, ring.slot_rx, mk(0x2A00, 3, ring.rx_entry_size, 0x6564, ring.desc_flag_auto_repost)); // cap 8
     // Timer black hole at PTT 0; workers at PTT 1..W.
     m.setPtt(0, 0, .{
         .prefix_lo = ring.PttEntry.loFrom(0xFFFF, 0, ring.slot_rx),
@@ -131,9 +132,9 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
     idx = 1;
     while (idx <= w) : (idx += 1) {
         m.load(idx, worker.origin, worker.code);
-        m.setRing(idx, 0, ring.slot_sq, mk(0x2400, 0, ring.sq_entry_size, 0));
-        m.setRing(idx, 0, ring.slot_cq, mk(0x2000, 5, ring.cq_entry_size, 0));
-        m.setRing(idx, 0, ring.slot_rx, mk(0x2A00, 0, ring.rx_entry_size, 0x6564));
+        m.setRing(idx, 0, ring.slot_sq, mk(0x2400, 0, ring.sq_entry_size, 0, 0));
+        m.setRing(idx, 0, ring.slot_cq, mk(0x2000, 5, ring.cq_entry_size, 0, 0));
+        m.setRing(idx, 0, ring.slot_rx, mk(0x2A00, 1, ring.rx_entry_size, 0x6564, ring.desc_flag_auto_repost));
         m.setPtt(idx, 0, .{
             .prefix_hi = 0xfd65_6400_0000_0000,
             .prefix_lo = ring.PttEntry.loFrom(0, 0, ring.slot_rx),
