@@ -15,8 +15,6 @@
         .org $1000
         LDA !$2600          ; rounds
         STA $810
-        LDA ##$FF00_0100_0000_0000
-        STA $838            ; black-hole window pointer = our timer
         ; stage both RX landing entries (cap-2 AUTO_REPOST ring;
         ; cookie = buffer address, so we know where each echo landed)
         LDA ##$2200
@@ -46,7 +44,18 @@
         STA !$2418          ; word3: len 8 | cookie 1
         LDA #0
         STA !$2500          ; first message value
-        TXR ($838),A        ; arm the retransmit timer chain
+        ; the eternal timer (SQ 5 → black hole, AUTO_REARM: each timeout
+        ; resubmits the entry — stage once, tick forever, disarm by
+        ; clearing the flag byte)
+        LDA ##$202
+        STA !$2480          ; op = txr | flags = AUTO_REARM
+        LDA ##$FF00_0100_0000_0000
+        STA !$2488          ; target: the black hole (PTT 1)
+        LDA #0
+        STA !$2490          ; tick payload
+        LDA ##$77_0000_0000
+        STA !$2498          ; cookie $77
+        SEND 5              ; arm the chain
 send:   SEND 0
 wait:   LSTN 1
         CQPOP 1
@@ -59,9 +68,7 @@ wait:   LSTN 1
         BEQ got
         BRA wait            ; transport acks: end-to-end only, ignore
 timer:  INC $818            ; count a retransmission
-        LDA #0
-        TXR ($838),A        ; re-arm the chain
-        BRA send            ; and resend whatever we're waiting on
+        BRA send            ; resend; AUTO_REARM keeps the clock ticking
 got:    TYA                 ; a delivery completion: clean?
         LSR
         LSR
@@ -86,4 +93,6 @@ got:    TYA                 ; a delivery completion: clean?
         BNE send
         LDA ($8E0)
         STA !$2280          ; final value, for the harness
+        LDA #2
+        STA !$2480          ; disarm the timer: clear AUTO_REARM
         HLT

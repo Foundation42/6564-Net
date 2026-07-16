@@ -163,6 +163,12 @@ pub const Stats = struct {
     macro_calls: u64 = 0,
     /// Landing buffers re-enqueued by AUTO_REPOST rings at CQPOP time.
     auto_reposts: u64 = 0,
+    /// Timer entries resubmitted by AUTO_REARM on timeout.
+    auto_rearms: u64 = 0,
+    /// Chain entries fired by LINK on ok completions.
+    chain_fires: u64 = 0,
+    /// Staged entries cancelled by an upstream chain break.
+    chain_cancels: u64 = 0,
     cq_overflows: u64 = 0,
 };
 
@@ -431,16 +437,17 @@ pub const Machine = struct {
         // capability to send there (§6.4). Reported via the CQ, as always.
         const entry = if (ptt_index < ptt.len) ptt[ptt_index] else ring.PttEntry{};
         if (!entry.rights.send) {
-            // No capability: the failure is local and synchronous-ish — the
-            // RBC rejects at the PTT. Still reported via the CQ, never as an
-            // exception (§4.2).
+            // No capability: the RBC rejects at the PTT. Routed through the
+            // normal completion path (an immediate ack event) so the OWNED
+            // clear, the release fence, and chain cancellation all behave
+            // exactly as for any other failed copy.
             self.stats.rejects += 1;
-            self.cqPost(reply.core, reply.ctx, reply.cq_slot, .{
-                .tag = reply.tag,
-                .status = .reject_capability,
-                .slot = reply.src_slot,
-                .byte_count = 0,
-                .cookie = reply.cookie,
+            const send_id = self.nextSeq();
+            try self.pending.put(send_id, .{ .reply = reply });
+            try self.events.add(.{
+                .due = self.cores[src_core].clock,
+                .seq = self.nextSeq(),
+                .kind = .{ .ack = .{ .send_id = send_id, .status = .reject_capability, .byte_count = 0 } },
             });
             return;
         }
@@ -593,17 +600,22 @@ pub const Machine = struct {
         }
     }
 
-    fn completeSend(self: *Machine, send_id: u64, status: ring.Status, byte_count: u32) void {
+    fn completeSend(self: *Machine, send_id: u64, status: ring.Status, byte_count: u32) !void {
         const kv = self.pending.fetchRemove(send_id) orelse return;
         const reply = kv.value.reply;
         if (status == .timeout) self.stats.timeouts += 1;
         // Release the transmit buffer: clear the OWNED bit (§6.2) — byte 1
-        // bit 7 of the staged entry, one byte store. The completion record
-        // below is the release fence software observes.
+        // bit 7 of the staged entry (near page or RAM), one byte store. The
+        // completion record below is the release fence software observes.
+        var staged: ?ring.SqEntry = null;
         if (reply.sqe_addr != 0) {
             const core = &self.cores[reply.core];
-            if (ramSlice(core, reply.sqe_addr + 1, 1)) |b| {
-                b[0] &= ~ring.SqEntry.flag_owned;
+            const ctx = &core.contexts[reply.ctx];
+            if (bytesAt(core, ctx, reply.sqe_addr, ring.sq_entry_size)) |mem| {
+                mem[1] &= ~ring.SqEntry.flag_owned;
+                var words: [4]u64 = undefined;
+                for (&words, 0..) |*w, i| w.* = std.mem.readInt(u64, mem[i * 8 ..][0..8], .little);
+                staged = ring.SqEntry.unpack(words);
             } else |_| {}
         }
         self.cqPost(reply.core, reply.ctx, reply.cq_slot, .{
@@ -613,13 +625,105 @@ pub const Machine = struct {
             .byte_count = byte_count,
             .cookie = reply.cookie,
         });
+        // Autonomous descriptor behavior (sketch §3): the RBC re-reads the
+        // STAGED entry — its current bytes are the contract, which is what
+        // makes clearing a flag the disarm mechanism.
+        const sqe = staged orelse return;
+        if (status == .timeout and sqe.flags & ring.SqEntry.flag_auto_rearm != 0) {
+            // AUTO_REARM: a timeout is a tick; resubmit. Takes precedence
+            // over LINK — a rearming entry's chain gets another chance
+            // rather than a cancellation.
+            const stamp: u16 = @truncate(reply.cookie >> 32);
+            if (try self.submitStaged(reply.core, reply.ctx, reply.sqe_addr, reply.cq_slot, reply.src_slot, stamp)) {
+                self.stats.auto_rearms += 1;
+                self.trace("c{d}x{d} rearm @0x{X}", .{ reply.core, reply.ctx, reply.sqe_addr });
+            }
+        } else if (sqe.flags & ring.SqEntry.flag_link != 0 and sqe.link != 0) {
+            if (status == .ok or status == .truncated) {
+                // LINK: fire the next staged entry (near-page offset).
+                if (try self.submitStaged(reply.core, reply.ctx, sqe.link, reply.cq_slot, reply.src_slot, sqe.link)) {
+                    self.stats.chain_fires += 1;
+                    self.trace("c{d}x{d} chain fire → ${X}", .{ reply.core, reply.ctx, sqe.link });
+                } else {
+                    // Malformed next entry: the chain breaks loudly.
+                    self.cancelChain(reply.core, reply.ctx, sqe.link, reply.cq_slot, reply.src_slot);
+                }
+            } else {
+                // Chain break: every remaining staged entry gets its record.
+                self.cancelChain(reply.core, reply.ctx, sqe.link, reply.cq_slot, reply.src_slot);
+            }
+        }
+    }
+
+    /// The RBC submits a staged SQE on software's behalf: chain fires and
+    /// AUTO_REARM resubmissions. `stamp16` identifies the staging location
+    /// in the completion cookie's high half. Returns false when the entry
+    /// is malformed (bad op, non-window target, unreadable buffer).
+    fn submitStaged(self: *Machine, core_idx: u16, ctx_idx: u8, addr: u64, cq_slot: u8, src_slot: u8, stamp16: u16) !bool {
+        const core = &self.cores[core_idx];
+        const ctx = &core.contexts[ctx_idx];
+        const mem = bytesAt(core, ctx, addr, ring.sq_entry_size) catch return false;
+        var words: [4]u64 = undefined;
+        for (&words, 0..) |*w, i| w.* = std.mem.readInt(u64, mem[i * 8 ..][0..8], .little);
+        const sqe = ring.SqEntry.unpack(words);
+        if (!ring.isWindow(sqe.target)) return false;
+        var txr_payload: [8]u8 = undefined;
+        const payload: []const u8 = switch (sqe.op) {
+            .send => bytesAt(core, ctx, sqe.buf, sqe.len) catch return false,
+            .txr => blk: {
+                std.mem.writeInt(u64, &txr_payload, sqe.buf, .little);
+                break :blk &txr_payload;
+            },
+            else => return false,
+        };
+        mem[1] |= ring.SqEntry.flag_owned;
+        const cookie = @as(u64, sqe.cookie_lo) |
+            (@as(u64, stamp16) << 32) |
+            (@as(u64, @as(u16, @truncate(ctx.gen))) << 48);
+        try self.sendDatagram(core_idx, ring.windowPtt(sqe.target), ring.windowOffset(sqe.target), payload, .{
+            .core = core_idx,
+            .ctx = ctx_idx,
+            .cq_slot = cq_slot,
+            .tag = if (sqe.op == .txr) .txr else .send,
+            .cookie = cookie,
+            .sqe_addr = addr,
+            .src_slot = src_slot,
+        });
+        return true;
+    }
+
+    /// A chain broke: post `chain_cancelled` for every remaining staged
+    /// entry, cookies intact — stage N, collect N records, always. The walk
+    /// is capped so a mis-linked cycle can't spin the RBC forever.
+    fn cancelChain(self: *Machine, core_idx: u16, ctx_idx: u8, first: u16, cq_slot: u8, src_slot: u8) void {
+        const ctx = &self.cores[core_idx].contexts[ctx_idx];
+        var off: u16 = first;
+        var hops: u8 = 0;
+        while (off != 0 and hops < 16) : (hops += 1) {
+            if (@as(u32, off) + ring.sq_entry_size > near_size) break;
+            var words: [4]u64 = undefined;
+            for (&words, 0..) |*w, i| w.* = std.mem.readInt(u64, ctx.near[off + i * 8 ..][0..8], .little);
+            const sqe = ring.SqEntry.unpack(words);
+            self.trace("c{d}x{d} chain cancel ${X}", .{ core_idx, ctx_idx, off });
+            self.cqPost(core_idx, ctx_idx, cq_slot, .{
+                .tag = if (sqe.op == .txr) .txr else .send,
+                .status = .chain_cancelled,
+                .slot = src_slot,
+                .byte_count = 0,
+                .cookie = @as(u64, sqe.cookie_lo) |
+                    (@as(u64, off) << 32) |
+                    (@as(u64, @as(u16, @truncate(ctx.gen))) << 48),
+            });
+            self.stats.chain_cancels += 1;
+            off = if (sqe.flags & ring.SqEntry.flag_link != 0) sqe.link else 0;
+        }
     }
 
     fn handleEvent(self: *Machine, ev: mesh.Event) !void {
         switch (ev.kind) {
             .deliver => |gram| try self.deliver(ev.due, gram),
-            .ack => |a| self.completeSend(a.send_id, a.status, a.byte_count),
-            .timeout => |t| self.completeSend(t.send_id, .timeout, 0),
+            .ack => |a| try self.completeSend(a.send_id, a.status, a.byte_count),
+            .timeout => |t| try self.completeSend(t.send_id, .timeout, 0),
         }
     }
 

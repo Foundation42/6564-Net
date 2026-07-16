@@ -32,8 +32,6 @@
         STA $888
         STA $8A0
         STA $8B8
-        LDA ##$FF00_0100_0000_0000
-        STA $838            ; timer pointer
         ; RX 2: items from upstream — two landing buffers (AUTO_REPOST),
         ; cookie = buffer address
         LDA ##$2200
@@ -87,8 +85,18 @@
         STA !$2450          ; buffer
         LDA ##$2_0000_0008
         STA !$2458          ; len 8 | cookie 2
+        ; the eternal timer (SQ 5 → black hole, AUTO_REARM: each timeout
+        ; resubmits the entry — stage once, tick forever, disarm by
+        ; clearing the flag byte)
+        LDA ##$202
+        STA !$2480          ; op = txr | flags = AUTO_REARM
+        LDA ##$FF00_0100_0000_0000
+        STA !$2488          ; target: the black hole (PTT 1)
         LDA #0
-        TXR ($838),A        ; arm the timer chain
+        STA !$2490          ; tick payload
+        LDA ##$77_0000_0000
+        STA !$2498          ; cookie $77
+        SEND 5              ; arm the chain
 main:   LDA $8A0
         BNE wait            ; a forward is in flight
         LDA $888
@@ -122,13 +130,8 @@ wait:   LSTN 1
         CMP #3
         BEQ del
         BRA wait            ; transport acks: ignore
-timer:  LDA $8B8
-        CMP #2
-        BEQ wait            ; lame duck: let the chain die
-        LDA #0
-        TXR ($838),A        ; re-arm
-        LDA $8A0
-        BEQ wait
+timer:  LDA $8A0
+        BEQ wait            ; nothing in flight (lame duck disarmed anyway)
         INC $8D0            ; count a retransmission
         SEND 0
         BRA wait
@@ -176,5 +179,6 @@ ack:    LDA ($8E0)          ; downstream acked which seq?
         LDA $8B8
         BEQ ackrp
         LDA #2
-        STA $8B8            ; DONE has moved on: go lame duck
+        STA $8B8            ; DONE has moved on: go lame duck…
+        STA !$2480          ; …and disarm the timer (clear AUTO_REARM)
 ackrp:  BRA main

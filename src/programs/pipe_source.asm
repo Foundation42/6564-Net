@@ -18,8 +18,6 @@
         LDA #0
         STA $888            ; next seq to send
         STA $890            ; nothing in flight
-        LDA ##$FF00_0100_0000_0000
-        STA $838            ; timer pointer
         ; stage both ack landing entries (cap-2 AUTO_REPOST ring;
         ; cookie = buffer address)
         LDA ##$2240
@@ -47,13 +45,25 @@
         STA !$2410          ; buffer
         LDA ##$1_0000_0010
         STA !$2418          ; len 16 (items are {seq, val}) | cookie 1
+        ; the eternal timer (SQ 5 → black hole, AUTO_REARM: each timeout
+        ; resubmits the entry — stage once, tick forever, disarm by
+        ; clearing the flag byte)
+        LDA ##$202
+        STA !$2480          ; op = txr | flags = AUTO_REARM
+        LDA ##$FF00_0100_0000_0000
+        STA !$2488          ; target: the black hole (PTT 1)
         LDA #0
-        TXR ($838),A        ; arm the timer chain
+        STA !$2490          ; tick payload
+        LDA ##$77_0000_0000
+        STA !$2498          ; cookie $77
+        SEND 5              ; arm the chain
 main:   LDA $890
         BNE wait            ; an item is in flight: wait for its ack
         LDA $888
         CMP $880
         BNE fill
+        LDA #2
+        STA !$2480          ; disarm the timer: clear AUTO_REARM
         HLT                 ; every item acked, DONE included
 fill:   LDA $888
         STA !$2280          ; seq
@@ -73,9 +83,7 @@ wait:   LSTN 1
         CMP #3
         BEQ del
         BRA wait            ; transport acks: end-to-end only, ignore
-timer:  LDA #0
-        TXR ($838),A        ; re-arm the chain
-        LDA $890
+timer:  LDA $890
         BEQ main            ; idle: maybe there's a next item to fill
         INC $818            ; count a retransmission
         SEND 0

@@ -66,6 +66,7 @@ fn wireNode(m: *machine.Machine, core: u16) void {
     m.setRing(core, 0, ring.slot_rx, mk(0x2A00, 1, ring.rx_entry_size, 0x6564, rp)); // items in
     m.setRing(core, 0, 3, mk(0x2A40, 1, ring.rx_entry_size, 0x6564, rp)); // acks in
     m.setRing(core, 0, 4, mk(0x2440, 0, ring.sq_entry_size, 0, 0)); // acks out
+    m.setRing(core, 0, 5, mk(0x2480, 0, ring.sq_entry_size, 0, 0)); // timer
 }
 
 /// Build, run, and measure — shared by the CLI demo and the test suite.

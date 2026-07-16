@@ -914,3 +914,304 @@ test "armstrong ring at full scale: 200 nodes, layout stripes stay disjoint" {
     try testing.expect(o.exactly_one_finisher and o.finisher_is_node0);
     try testing.expect(o.cycles_per_pass < 100);
 }
+
+// ── LINK chains and AUTO_REARM (sketch §3.1, §3.2) ───────────────────────
+
+// A sender that collects exactly three send-tagged completion records,
+// storing each status byte at $868+8k, then halts. Shared by the chain
+// tests: "stage N, collect N records" is the property under test.
+const chain_sender_src =
+    \\        .org $1000
+    \\        SEND 0              ; fire the chain head
+    \\loop:   LSTN 1
+    \\        CQPOP 1
+    \\        BEQ loop
+    \\        TAY
+    \\        AND #$FF
+    \\        CMP #2
+    \\        BNE loop            ; only send records count
+    \\        TYA
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        AND #$FF
+    \\        STA $8F8            ; status, parked
+    \\        LDA $860
+    \\        ASL
+    \\        ASL
+    \\        ASL
+    \\        TAX
+    \\        LDA $8F8
+    \\        STA $868,X          ; statuses land at $868, $870, $878
+    \\        INC $860
+    \\        LDA $860
+    \\        CMP #3
+    \\        BNE loop
+    \\        HLT
+;
+
+// An immortal receiver on an AUTO_REPOST ring: counts deliveries in $860,
+// sums the delivered words in $868.
+const chain_receiver_src =
+    \\        .org $1000
+    \\serve:  LSTN 1
+    \\        CQPOP 1
+    \\        BEQ serve
+    \\        TAY
+    \\        AND #$FF
+    \\        CMP #3
+    \\        BNE serve
+    \\        TYA
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        LSR
+    \\        AND #$FF
+    \\        CMP #0
+    \\        BNE serve
+    \\        STX $8E0
+    \\        INC $860            ; count it
+    \\        CLC
+    \\        LDA ($8E0)
+    \\        ADC $868
+    \\        STA $868            ; sum it
+    \\        BRA serve
+;
+
+fn wireChainPair(m: *Machine) !void {
+    // Sender core 0: SQ 0 (head at $2400), CQ 1. Receiver core 1: CQ 1 and
+    // a cap-2 AUTO_REPOST RX with cookie-addressed cells.
+    wireSender(m, 0, 0, 0x2300, 0x2400);
+    m.setRing(1, 0, ring.slot_cq, .{
+        .base = 0x2000,
+        .cap_log2 = 3,
+        .entry_size = ring.cq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    });
+    m.setRing(1, 0, ring.slot_rx, .{
+        .base = 0x2A00,
+        .cap_log2 = 1,
+        .entry_size = ring.rx_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .flags = ring.desc_flag_auto_repost,
+        .head = 0,
+        .tail = 2, // both landing buffers granted by the loader
+        .token = 0,
+    });
+    var slot_i: u64 = 0;
+    while (slot_i < 2) : (slot_i += 1) {
+        const cell: u64 = 0x2200 + 8 * slot_i;
+        const entry = ring.RxEntry{ .buf = cell, .cap = 8, .filled = 0, .cookie = cell };
+        var eb: [32]u8 = undefined;
+        for (entry.pack(), 0..) |word, wi|
+            std.mem.writeInt(u64, eb[wi * 8 ..][0..8], word, .little);
+        m.load(1, 0x2A00 + 32 * slot_i, &eb);
+    }
+}
+
+fn stageChainEntry(m: *Machine, addr: u64, sqe: ring.SqEntry) void {
+    var eb: [32]u8 = undefined;
+    for (sqe.pack(), 0..) |word, wi|
+        std.mem.writeInt(u64, eb[wi * 8 ..][0..8], word, .little);
+    if (addr < machine.near_size) {
+        m.writeNear(0, 0, @intCast(addr), &eb);
+    } else {
+        m.load(0, addr, &eb);
+    }
+}
+
+test "LINK: a three-entry chain fires in order from one doorbell" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 2,
+        .contexts_per_core = 1,
+        .ram_size = 0x8000,
+    });
+    defer m.deinit();
+    m.setPtt(0, 0, .{
+        .prefix_lo = ring.PttEntry.loFrom(1, 0, ring.slot_rx),
+        .rights = .{ .send = true },
+        .token = 0,
+    });
+    try wireChainPair(&m);
+    // Payload words 1, 2, 3 at distinct buffers.
+    var wbuf: [8]u8 = undefined;
+    for ([_]u64{ 1, 2, 3 }, 0..) |v, i| {
+        std.mem.writeInt(u64, &wbuf, v, .little);
+        m.load(0, 0x2500 + 16 * @as(u64, i), &wbuf);
+    }
+    stageChainEntry(&m, 0x2400, .{ // head, in the SQ ring
+        .op = .send,
+        .flags = ring.SqEntry.flag_link,
+        .link = 0xC00,
+        .target = ring.windowAddr(0, 0),
+        .buf = 0x2500,
+        .len = 8,
+        .cookie_lo = 1,
+    });
+    stageChainEntry(&m, 0xC00, .{
+        .op = .send,
+        .flags = ring.SqEntry.flag_link,
+        .link = 0xC20,
+        .target = ring.windowAddr(0, 0),
+        .buf = 0x2510,
+        .len = 8,
+        .cookie_lo = 2,
+    });
+    stageChainEntry(&m, 0xC20, .{
+        .op = .send,
+        .target = ring.windowAddr(0, 0),
+        .buf = 0x2520,
+        .len = 8,
+        .cookie_lo = 3,
+    });
+    try assembleInto(&m, 0, chain_sender_src);
+    try assembleInto(&m, 1, chain_receiver_src);
+    try m.spawn(1, 0, 0x1000, 0x3000, 0);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    _ = try m.run();
+
+    try testing.expectEqual(@as(u64, 2), m.stats.chain_fires);
+    try testing.expectEqual(@as(u64, 0), m.stats.chain_cancels);
+    const rn = &m.cores[1].contexts[0].near;
+    try testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, rn[0x860..][0..8], .little));
+    try testing.expectEqual(@as(u64, 6), std.mem.readInt(u64, rn[0x868..][0..8], .little));
+    // Sender collected three ok records.
+    const sn = &m.cores[0].contexts[0].near;
+    for (0..3) |k| {
+        try testing.expectEqual(
+            @as(u64, @intFromEnum(ring.Status.ok)),
+            std.mem.readInt(u64, sn[0x868 + 8 * k ..][0..8], .little),
+        );
+    }
+}
+
+test "LINK: a broken chain cancels loudly — stage N, collect N records" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 2,
+        .contexts_per_core = 1,
+        .ram_size = 0x8000,
+    });
+    defer m.deinit();
+    m.setPtt(0, 0, .{
+        .prefix_lo = ring.PttEntry.loFrom(1, 0, ring.slot_rx),
+        .rights = .{ .send = true },
+        .token = 0,
+    });
+    // PTT 1 stays empty: entry 2 sends through it and rejects at the RBC.
+    try wireChainPair(&m);
+    var wbuf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &wbuf, 9, .little);
+    m.load(0, 0x2500, &wbuf);
+    stageChainEntry(&m, 0x2400, .{
+        .op = .send,
+        .flags = ring.SqEntry.flag_link,
+        .link = 0xC00,
+        .target = ring.windowAddr(0, 0),
+        .buf = 0x2500,
+        .len = 8,
+        .cookie_lo = 1,
+    });
+    stageChainEntry(&m, 0xC00, .{ // the doomed entry: no capability
+        .op = .send,
+        .flags = ring.SqEntry.flag_link,
+        .link = 0xC20,
+        .target = ring.windowAddr(1, 0),
+        .buf = 0x2500,
+        .len = 8,
+        .cookie_lo = 2,
+    });
+    stageChainEntry(&m, 0xC20, .{ // never submitted: cancelled
+        .op = .send,
+        .target = ring.windowAddr(0, 0),
+        .buf = 0x2500,
+        .len = 8,
+        .cookie_lo = 3,
+    });
+    try assembleInto(&m, 0, chain_sender_src);
+    try assembleInto(&m, 1, chain_receiver_src);
+    try m.spawn(1, 0, 0x1000, 0x3000, 0);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    _ = try m.run();
+
+    try testing.expectEqual(@as(u64, 1), m.stats.chain_fires);
+    try testing.expectEqual(@as(u64, 1), m.stats.chain_cancels);
+    // Only the head's payload arrived.
+    const rn = &m.cores[1].contexts[0].near;
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, rn[0x860..][0..8], .little));
+    // Sender saw exactly: ok, reject_capability, chain_cancelled.
+    const sn = &m.cores[0].contexts[0].near;
+    const expected = [_]ring.Status{ .ok, .reject_capability, .chain_cancelled };
+    for (expected, 0..) |st, k| {
+        try testing.expectEqual(
+            @as(u64, @intFromEnum(st)),
+            std.mem.readInt(u64, sn[0x868 + 8 * k ..][0..8], .little),
+        );
+    }
+}
+
+test "AUTO_REARM: stage once, tick forever, disarm by clearing the flag" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x8000,
+    });
+    defer m.deinit();
+    // PTT 0: unroutable — the black-hole timer target.
+    m.setPtt(0, 0, .{
+        .prefix_lo = ring.PttEntry.loFrom(0xFFFF, 0, ring.slot_rx),
+        .rights = .{ .send = true },
+        .token = 0,
+    });
+    wireSender(&m, 0, 0, 0x2300, 0x2400);
+    stageChainEntry(&m, 0x2400, .{
+        .op = .txr,
+        .flags = ring.SqEntry.flag_auto_rearm,
+        .target = ring.windowAddr(0, 0),
+        .buf = 0,
+        .len = 0,
+        .cookie_lo = 0x77,
+    });
+    const src =
+        \\        .org $1000
+        \\        LDA #3
+        \\        STA $860            ; ticks to observe
+        \\        SEND 0              ; arm: one doorbell, then never again
+        \\loop:   LSTN 1
+        \\        CQPOP 1
+        \\        BEQ loop
+        \\        AND #$FF
+        \\        CMP #1              ; tag txr: a tick
+        \\        BNE loop
+        \\        DEC $860
+        \\        BNE loop
+        \\        LDA #2
+        \\        STA !$2400          ; disarm: clear AUTO_REARM in the entry
+        \\        HLT
+    ;
+    try assembleInto(&m, 0, src);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    // Three ticks observed = two rearms at least (the disarm race allows
+    // one more in-flight tick after the flag clears; it must NOT rearm).
+    try testing.expect(m.stats.auto_rearms >= 2);
+    try testing.expect(m.stats.auto_rearms <= 3);
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(
+        u64,
+        m.cores[0].contexts[0].near[0x860..][0..8],
+        .little,
+    ));
+}

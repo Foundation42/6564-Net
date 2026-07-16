@@ -70,6 +70,10 @@ pub const Status = enum(u8) {
     /// Exit notifications only: the linked context faulted (byte_count
     /// carries the fault code).
     fault = 5,
+    /// This staged chain entry was never submitted: an upstream entry in
+    /// its LINK chain completed non-ok. Extends the mandatory-completion
+    /// guarantee to chains — stage N entries, collect N records, always.
+    chain_cancelled = 6,
 };
 
 /// Operation tags for completion records.

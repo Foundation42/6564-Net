@@ -19,23 +19,26 @@
 ;   RAM: $2280 task out {id, value}
 
         .org $1000
-        LDA ##$FF00_0000_0000_0000
-        STA $838            ; timer pointer (PTT 0)
-        ; task SQE constants; the target is rewritten per scatter
-        LDA #1
-        STA !$2400          ; op = send
-        LDA ##$2280
-        STA !$2410          ; buffer
-        LDA ##$1_0000_0010
-        STA !$2418          ; len 16 | cookie 1
         ; post all result landing buffers (entries pre-staged in RAM)
         LDX $8A8
 rposts: RECV 2
         DEX
         BNE rposts
+        ; the eternal timer (SQ 5 → black hole PTT 0, AUTO_REARM)
+        LDA ##$202
+        STA !$2480          ; op = txr | flags = AUTO_REARM
+        LDA ##$FF00_0000_0000_0000
+        STA !$2488          ; target: the black hole (PTT 0)
         LDA #0
-        TXR ($838),A        ; arm the timer chain
-        JSR scatter         ; initial fan-out
+        STA !$2490          ; tick payload
+        LDA ##$77_0000_0000
+        STA !$2498          ; cookie $77
+        SEND 5              ; arm the chain
+        SEND 0              ; initial fan-out: the whole task chain, one
+                            ; doorbell — LINK fires worker j+1's entry when
+                            ; worker j's copy resolves ok; a lost task
+                            ; breaks the chain loudly (chain_cancelled) and
+                            ; the timer re-scatters the stragglers
 wait:   LSTN 1
         CQPOP 1
         BEQ wait
@@ -46,9 +49,7 @@ wait:   LSTN 1
         CMP #3
         BEQ del
         BRA wait            ; transport acks: ignore
-timer:  LDA #0
-        TXR ($838),A        ; re-arm
-        JSR scatter         ; nudge whoever hasn't answered
+timer:  JSR scatter         ; nudge whoever hasn't answered
         BRA wait
 del:    TYA                 ; a delivery: clean?
         LSR
@@ -81,10 +82,16 @@ del:    TYA                 ; a delivery: clean?
 dup:    LDA $8C8            ; (AUTO_REPOST already re-armed the slot)
         CMP $8A8
         BNE wait
-        HLT                 ; gathered all W: done (timer chain dies with us)
+        LDA #2
+        STA !$2480          ; disarm the timer: clear AUTO_REARM
+        HLT                 ; gathered all W: done
 
 ; Send the task to every worker whose done flag is still clear.
 scatter:
+        LDA #1
+        STA !$2400          ; plain send: the fan-out chain is spent
+        LDA ##$2380
+        STA !$2410          ; stragglers use their own payload buffer
         LDX #8              ; worker 1 → table offset 8
 sloop:  LDA $900,X
         BNE snext           ; already answered
@@ -94,9 +101,9 @@ sloop:  LDA $900,X
         LSR
         LSR
         LSR
-        STA !$2280          ; task word0: worker id
+        STA !$2380          ; task word0: worker id
         LDA $B00,X
-        STA !$2288          ; task word1: the value to square
+        STA !$2388          ; task word1: the value to square
         SEND 0
         INC $8D0
 snext:  TXA

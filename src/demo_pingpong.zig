@@ -38,6 +38,16 @@ fn wire(m: *machine.Machine, core: u16) void {
         .tail = 0,
         .token = 0,
     });
+    m.setRing(core, 0, 5, .{
+        .base = 0x2480,
+        .cap_log2 = 0,
+        .entry_size = ring.sq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    }); // the timer SQ (AUTO_REARM entry lives at $2480)
     m.setRing(core, 0, ring.slot_rx, .{
         .base = 0x2100,
         .cap_log2 = 1, // two landing buffers: AUTO_REPOST's validity window

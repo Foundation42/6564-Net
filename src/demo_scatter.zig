@@ -91,6 +91,7 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
     m.setRing(0, 0, ring.slot_sq, mk(0x2400, 0, ring.sq_entry_size, 0, 0));
     m.setRing(0, 0, ring.slot_cq, mk(0x2000, 5, ring.cq_entry_size, 0, 0));
     m.setRing(0, 0, ring.slot_rx, mk(0x2A00, 3, ring.rx_entry_size, 0x6564, ring.desc_flag_auto_repost)); // cap 8
+    m.setRing(0, 0, 5, mk(0x2480, 0, ring.sq_entry_size, 0, 0)); // timer
     // Timer black hole at PTT 0; workers at PTT 1..W.
     m.setPtt(0, 0, .{
         .prefix_lo = ring.PttEntry.loFrom(0xFFFF, 0, ring.slot_rx),
@@ -108,6 +109,34 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
             .rights = .{ .send = true },
             .token = 0x6564,
         });
+        // Fan-out chain: worker 1's entry is the ring-staged head at
+        // $2400; workers 2..W are LINK-chained near-page entries at
+        // $C00+32(j−1). Each entry carries its own payload buffer.
+        {
+            const payload_addr: u64 = 0x2280 + 16 * @as(u64, idx - 1);
+            var payload: [16]u8 = undefined;
+            std.mem.writeInt(u64, payload[0..8], idx, .little);
+            std.mem.writeInt(u64, payload[8..16], idx + 3, .little);
+            m.load(0, payload_addr, &payload);
+            const has_next = idx < w;
+            const entry = ring.SqEntry{
+                .op = .send,
+                .flags = if (has_next) ring.SqEntry.flag_link else 0,
+                .link = if (has_next) @intCast(0xC00 + 32 * @as(u16, idx)) else 0,
+                .target = ring.windowAddr(idx, 0),
+                .buf = payload_addr,
+                .len = 16,
+                .cookie_lo = idx,
+            };
+            var entry_bytes: [32]u8 = undefined;
+            for (entry.pack(), 0..) |word, wi|
+                std.mem.writeInt(u64, entry_bytes[wi * 8 ..][0..8], word, .little);
+            if (idx == 1) {
+                m.load(0, 0x2400, &entry_bytes); // the head, in the SQ ring
+            } else {
+                m.writeNear(0, 0, @intCast(0xC00 + 32 * @as(u16, idx - 1)), &entry_bytes);
+            }
+        }
         // Worker window pointer and task value tables in the near page.
         std.mem.writeInt(u64, &buf8, ring.windowAddr(idx, 0), .little);
         m.writeNear(0, 0, @intCast(0xA00 + 8 * idx), &buf8);

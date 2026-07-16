@@ -80,3 +80,57 @@ sketch's middle band) — not architectural, but permitted: its value is
 robustness-by-construction for receive loops, not instructions saved.
 Demos keep it (the code is simpler and self-heals); the spec doesn't
 require it. Remaining to measure: AUTO_REARM, LINK.
+
+## AUTO_REARM + LINK landed (2026-07-16) — the sketch's final data
+
+| demo | code bytes | instructions | cycles | ctx switches | verified |
+|---|---:|---:|---:|---:|---|
+| pingpong (0x6564/1024/8) | 618 | 821 | 11034 | 39 | yes |
+| supervise (fixed) | 175 | 1458 | 4104 | 0 | yes |
+| pipeline (0x6564/1024/16/2) | 1420 | 8696 | 72034 | 357 | yes |
+| scatter (0x6564/1024/6) | 587 | 1442 | 10628 | 35 | yes |
+| ring (64x100) | 77 | 205120 | 425278 | 12863 | yes |
+| **total** | 2877 | 217537 | 523078 | 13294 | yes |
+
+**AUTO_REARM: adopt-leaning on simplicity, flat on count — as predicted.**
+All four timer chains (ping, pipe source/stage, scatter) became stage-once
+entries: the per-tick software rearm (2 instructions) is gone, the arm is
+one doorbell, and the disarm is one word store that doubles as the
+lame-duck/shutdown transition (`LDA #2 / STA !$2480` — op preserved, flag
+cleared). Ticks are rare so instruction counts barely move; what improves
+is the protocol text: no rearm handler to forget, and a stray final tick
+is bounded by construction. The sketch's "borderline by count, wins on
+protocol simplicity" prediction — finally one that held.
+
+**LINK: the surprise winner.** Scatter's fan-out became a real chain (ring
+head + near-page entries, one doorbell) and the demo dropped from 1897 to
+1442 instructions (−24%) and 13097 → 10628 cycles (−19%) — the software
+scatter loop's per-worker rewrite executed zero times on the happy path.
+Under loss the chain breaks honestly: `chain_cancelled` records post for
+every unstarted entry (deterministically tested: ok / reject_capability /
+chain_cancelled — stage 3, collect 3), and the straggler timer picks up
+the cancelled workers individually. My prediction ("little to grab") was
+wrong in the good direction — the corpus had exactly one fan-out shape,
+and LINK ate it whole.
+
+**Fixed en route:** local PTT rights-rejects previously bypassed the
+completion path — leaving OWNED set forever and, once chains existed,
+silently skipping cancellation. They now post through the normal ack
+machinery.
+
+### Final scoreboard vs the sketch's §6 predictions
+
+| mechanism | predicted | measured | verdict |
+|---|---|---|---|
+| MAC | clears code-byte bar | 3.6% max on this corpus | **deferred** (needs richer workloads) |
+| AUTO_REPOST | biggest single win | flat count, +11% bytes; kills a real deadlock class | **park as optional** |
+| AUTO_REARM | borderline count, simplicity win | exactly that | **adopt-leaning**; spec call is Christian's |
+| LINK | genuinely open (I said: little to grab) | −24% instructions where a fan-out exists | **adopt-leaning**, with chain_cancelled as the load-bearing guarantee |
+| ECHO | never gets built | never built | **correct by omission** |
+
+Corpus totals vs original baseline: instructions 217,672 → 217,537 (flat),
+code 2412 → 2877 (+19%, mostly double-buffer and SQE staging), ring
+constant at 66 cycles/pass throughout. The honest summary: the chain
+machinery pays for itself exactly where autonomous hardware behavior
+replaces *executed software loops* (LINK, AUTO_REARM), and not where it
+merely relocates one instruction (AUTO_REPOST) or one call (MAC).

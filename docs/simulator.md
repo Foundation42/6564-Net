@@ -211,6 +211,27 @@ missed-repost bug class unrepresentable, which is exactly the class both
 of Phase 3's real deadlocks belonged to. Recommendation: optional
 implementation feature, not architectural.
 
+**AUTO_REARM** (SQE flag bit 1): an entry completing with `timeout` is
+re-read from its staging bytes and resubmitted by the RBC — a timeout is
+a tick. The re-read is the disarm: clear the flag (one word store; the
+demos fold it into their shutdown/lame-duck transition) and the chain
+dies at its next firing, at most one stray tick later. Fires on status
+alone; on a routable target this is retransmit-until-acked, permitted
+but subject to §6.1's copies-not-messages caveat. All four demo timer
+chains use it: stage once, one arming doorbell, no rearm handler.
+
+**LINK + `chain_cancelled`** (SQE flag bit 0 + status 6): on an ok
+completion, the RBC submits the staged entry at the near-page offset in
+`link`; on any other outcome it posts `chain_cancelled` for every
+remaining entry (walk capped at 16) — stage N, collect N records,
+always. Rearm takes precedence over cancellation on the same entry.
+Scatter's fan-out is a live chain: one doorbell sends all W tasks
+sequentially on transport-ok, a lost task breaks the chain loudly, and
+the straggler timer re-scatters the cancelled. −24% instructions on
+that demo. Fixed en route: local PTT rights-rejects now route through
+the normal completion path (they previously leaked OWNED and would have
+skipped cancellation).
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,
