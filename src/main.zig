@@ -24,6 +24,11 @@ const usage_text =
     \\      poison-pill shutdown (programs/pipe_source.asm, pipe_stage.asm,
     \\      pipe_sink.asm). Defaults: seed 0x6564, loss 1024, 16 items, 2 stages.
     \\
+    \\  sim6564 scatter [seed] [loss_ppm4k] [workers] [trace]
+    \\      Fan a task out to up to 8 workers, gather squared results through
+    \\      one cap-8 RX ring; the result is the ack, stragglers are re-asked
+    \\      on timer ticks (programs/scatter_coord.asm, scatter_worker.asm).
+    \\
     \\  sim6564 help | --help | -h
     \\
 ;
@@ -59,6 +64,15 @@ pub fn main() !void {
     if (std.mem.eql(u8, first, "supervise")) {
         const trace = if (args.next()) |s| std.mem.eql(u8, s, "trace") else false;
         return sim.demo_supervise.run(alloc, .{ .trace = trace });
+    }
+
+    if (std.mem.eql(u8, first, "scatter")) {
+        var opts = sim.demo_scatter.Options{};
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        if (args.next()) |s| opts.loss_ppm4k = @min(4096, parseOr(u16, s, "loss_ppm4k"));
+        if (args.next()) |s| opts.workers = @min(8, parseOr(u16, s, "workers"));
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.demo_scatter.run(alloc, opts);
     }
 
     if (std.mem.eql(u8, first, "pipeline")) {

@@ -32,6 +32,11 @@ ack on *ownership* so hops overlap, backpressure is the absence of an ack,
 and shutdown is a poison-pill item with lame-duck draining — every item
 arrives checksum-verified at any loss rate below total.
 
+**scatter** fans a task out to up to 8 workers (`sim6564 scatter`), which
+square it by shift-add multiply and reply; results converge on one
+capacity-8 RX ring. The result is the ack: stragglers are simply re-asked
+on timer ticks, and idempotent workers make duplicates harmless.
+
 **supervise** runs a one-for-one supervision tree on one core: exit links
 post a dead worker's obituary to the supervisor's completion queue as an
 ordinary completion record, and `SPWN` resurrects it with fresh registers

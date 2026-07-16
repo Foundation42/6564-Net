@@ -694,3 +694,31 @@ test "pipeline: zero stages (source direct to sink)" {
     try testing.expect(o.source_halted);
     try testing.expectEqual(machine.StopReason.deadlock, o.reason);
 }
+
+// ── Phase 3: scatter-gather ──────────────────────────────────────────────
+
+test "scatter-gather: all results gathered and verified over a lossy fabric" {
+    const o = try @import("demo_scatter.zig").simulate(testing.allocator, .{
+        .seed = 0x6564,
+        .loss_ppm4k = 1024,
+        .workers = 6,
+    });
+    try testing.expectEqual(@as(u64, 6), o.gathered);
+    try testing.expectEqual(o.expected_sum, o.sum);
+    try testing.expect(o.coordinator_halted);
+    try testing.expectEqual(machine.StopReason.deadlock, o.reason); // quiesced
+    // The fabric was hostile and the retry loop actually worked for a living.
+    try testing.expect(o.stats.lost > 0);
+    try testing.expect(o.scatter_sends >= 6);
+}
+
+test "scatter-gather: full fan-out saturates the cap-8 fan-in ring" {
+    const o = try @import("demo_scatter.zig").simulate(testing.allocator, .{
+        .seed = 1,
+        .loss_ppm4k = 0,
+        .workers = 8,
+    });
+    try testing.expectEqual(@as(u64, 8), o.gathered);
+    try testing.expectEqual(o.expected_sum, o.sum);
+    try testing.expect(o.coordinator_halted);
+}

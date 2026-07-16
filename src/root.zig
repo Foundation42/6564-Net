@@ -9,6 +9,7 @@ pub const asm6564 = @import("asm.zig");
 pub const demo_pingpong = @import("demo_pingpong.zig");
 pub const demo_supervise = @import("demo_supervise.zig");
 pub const demo_pipeline = @import("demo_pipeline.zig");
+pub const demo_scatter = @import("demo_scatter.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

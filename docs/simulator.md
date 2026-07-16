@@ -172,6 +172,12 @@ Hardware validates tokens and rights but not ring-storage overlap — it
 can't; RAM layout is software's contract. Worth remembering when the OS
 layer arrives.
 
+**Idempotence beats acknowledgment.** Scatter-gather needs no ack protocol
+at all: the result is the ack, workers recompute on duplicate requests, and
+the coordinator dedups by worker id. Where the pipeline had to build
+ownership transfer, request-response just needs a retry timer and stateless
+servers. Choosing *what* to make reliable is the protocol design.
+
 **Duplicate reject acks race genuine ok acks.** When a duplicated datagram's
 second copy finds no buffer, its reject ack can overtake the first copy's ok
 ack; first-ack-wins means a sender can be told "no buffer" about a message
@@ -193,10 +199,14 @@ takes `trace` as its 4th CLI arg.
 - **Phase 2 — virtual mesh: done.** Multi-core, PTT routing, seeded
   loss/latency/reorder/duplication on off-chip paths (acks included —
   two-generals is live), deterministic replay verified by test.
-- **Phase 3 — actor workloads: in progress.** Ping-pong with end-to-end
+- **Phase 3 — actor workloads: complete.** Ping-pong with end-to-end
   reliability (`sim6564 pingpong`); a one-for-one supervision tree with
   exit links, SPWN restarts, per-child budgets, and watchdog-caught hangs
   (`sim6564 supervise`); pipeline dataflow over N cores with per-hop
   stop-and-wait, ack-on-ownership overlap, backpressure by silence, and
   lame-duck shutdown — every item checksum-verified through 73% loss
-  (`sim6564 pipeline`). Scatter-gather: next.
+  (`sim6564 pipeline`); scatter-gather fan-out/fan-in with idempotent
+  workers, straggler re-scatter, and a capacity-8 RX ring absorbing the
+  result burst (`sim6564 scatter`). The spec's three representative
+  workloads all run, entirely from CQ feedback and the primitives of §5–§7
+  — no ISA additions were needed beyond §5.4's supervision pair.
