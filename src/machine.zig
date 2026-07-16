@@ -57,6 +57,11 @@ pub const CtxState = enum {
     faulted,
 };
 
+/// An exit link (§5 of the spec, added in Phase 3): when this context halts
+/// or faults, hardware posts an exit completion to a supervisor's CQ — the
+/// Erlang monitor, in silicon. Survives SPWN restarts.
+pub const SupLink = struct { ctx: u8, cq_slot: u8 };
+
 pub const Context = struct {
     a: u64 = 0,
     x: u64 = 0,
@@ -69,10 +74,15 @@ pub const Context = struct {
     park_slot: u8 = 0,
     fault: Fault = .none,
     fault_addr: u64 = 0,
+    /// Incarnation counter, bumped by SPWN. Run-queue entries from a previous
+    /// life carry the old value and are skipped at dispatch — a restarted
+    /// actor is never resumed at its dead predecessor's continuation.
+    gen: u32 = 0,
+    sup_link: ?SupLink = null,
     instructions: u64 = 0,
 };
 
-const RunEntry = struct { ctx: u8, ip: u64 };
+const RunEntry = struct { ctx: u8, gen: u32, ip: u64 };
 
 pub const Core = struct {
     id: u16,
@@ -94,7 +104,9 @@ pub const Core = struct {
         if (self.current != null) return;
         while (self.runq.readItem()) |entry| {
             const ctx = &self.contexts[entry.ctx];
-            if (ctx.state != .ready) continue; // stale entry (ctx faulted)
+            // Stale entries: the context faulted/halted/parked since this was
+            // queued, or SPWN started a new incarnation.
+            if (ctx.state != .ready or ctx.gen != entry.gen) continue;
             ctx.ip = entry.ip;
             self.current = entry.ctx;
             return;
@@ -217,14 +229,16 @@ pub const Machine = struct {
         @memcpy(core.ram[off..][0..bytes.len], bytes);
     }
 
-    /// Start a context: set its entry point and stack, push its first
-    /// continuation onto the core's run queue.
-    pub fn spawn(self: *Machine, core_idx: u16, ctx_idx: u8, entry: u64, sp: u64) !void {
+    /// Start a context: set its entry point, stack, and argument (lands in
+    /// A, mirroring SPWN), and push its first continuation onto the core's
+    /// run queue.
+    pub fn spawn(self: *Machine, core_idx: u16, ctx_idx: u8, entry: u64, sp: u64, arg: u64) !void {
         const core = &self.cores[core_idx];
         const ctx = &core.contexts[ctx_idx];
         ctx.sp = sp;
+        ctx.a = arg;
         ctx.state = .ready;
-        try core.runq.writeItem(.{ .ctx = ctx_idx, .ip = entry });
+        try core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = entry });
     }
 
     /// Write a ring descriptor into a context's near-page descriptor table.
@@ -245,6 +259,19 @@ pub const Machine = struct {
     /// Install a PTT entry directly (the privileged path around CAPLD).
     pub fn setPtt(self: *Machine, core_idx: u16, slot: u16, entry: ring.PttEntry) void {
         self.cores[core_idx].ptt[slot] = entry;
+    }
+
+    /// Pre-stage bytes into a context's near page (config blocks, spawn
+    /// tables — the loader's job in a real system).
+    pub fn writeNear(self: *Machine, core_idx: u16, ctx_idx: u8, offset: u16, bytes: []const u8) void {
+        const ctx = &self.cores[core_idx].contexts[ctx_idx];
+        @memcpy(ctx.near[offset..][0..bytes.len], bytes);
+    }
+
+    /// Link a context to a supervisor on the same core: when the child halts
+    /// or faults, hardware posts an exit completion to the supervisor's CQ.
+    pub fn linkSupervisor(self: *Machine, core_idx: u16, child: u8, sup: u8, cq_slot: u8) void {
+        self.cores[core_idx].contexts[child].sup_link = .{ .ctx = sup, .cq_slot = cq_slot };
     }
 
     // ── Memory ───────────────────────────────────────────────────────────
@@ -356,7 +383,7 @@ pub const Machine = struct {
         if (ctx.state != .parked or ctx.park_slot != slot) return;
         self.trace("c{d}x{d} @{d} wake (was parked on slot{d})", .{ core_idx, ctx_idx, core.clock, slot });
         ctx.state = .ready;
-        core.runq.writeItem(.{ .ctx = ctx_idx, .ip = ctx.ip }) catch {
+        core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = ctx.ip }) catch {
             ctx.state = .faulted; // OOM on the run queue: fail loud
             ctx.fault = .bad_descriptor;
         };
@@ -591,6 +618,7 @@ pub const Machine = struct {
             };
             ctx.fault_addr = ctx.ip;
             core.current = null;
+            self.notifyExit(core, ctx_idx, ctx);
             return;
         };
         switch (dispo) {
@@ -599,8 +627,27 @@ pub const Machine = struct {
                 core.current = null;
                 self.stats.context_switches += 1;
             },
-            .halted => core.current = null,
+            .halted => {
+                core.current = null;
+                self.notifyExit(core, ctx_idx, ctx);
+            },
         }
+    }
+
+    /// Fire the exit link, if any (§5): a completion record is the one and
+    /// only obituary — status ok for a clean HLT, fault (with the fault code
+    /// in byte_count) for a crash; cookie = the child's context id.
+    fn notifyExit(self: *Machine, core: *Core, ctx_idx: u8, ctx: *Context) void {
+        const link = ctx.sup_link orelse return;
+        self.trace("c{d}x{d} @{d} exit ({s}) → supervisor x{d}", .{
+            core.id, ctx_idx, core.clock, @tagName(ctx.state), link.ctx,
+        });
+        self.cqPost(core.id, link.ctx, link.cq_slot, .{
+            .tag = .exit,
+            .status = if (ctx.state == .faulted) .fault else .ok,
+            .byte_count = @intFromEnum(ctx.fault),
+            .cookie = ctx_idx,
+        });
     }
 
     fn exec(self: *Machine, core: *Core, ctx_idx: u8, ctx: *Context) StepError!Disposition {
@@ -865,10 +912,10 @@ pub const Machine = struct {
             },
             .cont => {
                 const target = next_ip +% @as(u64, @bitCast(@as(i64, rel)));
-                try core.runq.writeItem(.{ .ctx = ctx_idx, .ip = target });
+                try core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = target });
             },
             .yld => {
-                try core.runq.writeItem(.{ .ctx = ctx_idx, .ip = ctx.ip });
+                try core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = ctx.ip });
                 return .switched_out;
             },
             .cqpop => {
@@ -888,6 +935,37 @@ pub const Machine = struct {
                 const base = near_off & (near_size - 1);
                 for (&words, 0..) |*w, i| w.* = try read64(core, ctx, base + i * 8);
                 core.ptt[cap_slot] = ring.PttEntry.unpack(words);
+            },
+            .spwn => {
+                // (Re)start a sibling from a spawn block at ea:
+                //   word0 target ctx id   word1 entry IP
+                //   word2 stack pointer   word3 arg (lands in A)
+                // The target gets fresh registers and a new generation; its
+                // near page (ring wiring, its mailbox) survives, as does its
+                // exit link. Also privileged in real silicon.
+                var words: [4]u64 = undefined;
+                for (&words, 0..) |*w, i| w.* = try read64(core, ctx, ea + i * 8);
+                const target_idx = words[0];
+                if (target_idx >= core.contexts.len or target_idx == ctx_idx)
+                    return error.BadDescriptor;
+                const target = &core.contexts[@intCast(target_idx)];
+                self.trace("c{d}x{d} @{d} SPWN x{d} gen{d} entry=0x{X}", .{
+                    core.id, ctx_idx, core.clock, target_idx, target.gen + 1, words[1],
+                });
+                target.a = words[3];
+                target.x = 0;
+                target.y = 0;
+                target.sp = words[2];
+                target.p = .{};
+                target.fault = .none;
+                target.fault_addr = 0;
+                target.gen +%= 1;
+                target.state = .ready;
+                try core.runq.writeItem(.{
+                    .ctx = @intCast(target_idx),
+                    .gen = target.gen,
+                    .ip = words[1],
+                });
             },
         }
         return .keep;
@@ -1031,7 +1109,7 @@ test "arithmetic, flags, branches: countdown loop" {
         0xDB, // HLT
     };
     m.load(0, ram_base, &prog);
-    try m.spawn(0, 0, ram_base, ram_base + 0x800);
+    try m.spawn(0, 0, ram_base, ram_base + 0x800, 0);
     const reason = try m.run();
     try testing.expectEqual(StopReason.all_halted, reason);
     try testing.expectEqual(@as(u64, 0), m.cores[0].contexts[0].x);
@@ -1042,7 +1120,7 @@ test "undefined opcode faults honestly" {
     var m = try testMachine(.{ .cores = 1, .contexts_per_core = 1, .ram_size = 0x1000 });
     defer m.deinit();
     m.load(0, ram_base, &.{0xFF});
-    try m.spawn(0, 0, ram_base, ram_base + 0x800);
+    try m.spawn(0, 0, ram_base, ram_base + 0x800, 0);
     _ = try m.run();
     try testing.expectEqual(CtxState.faulted, m.cores[0].contexts[0].state);
     try testing.expectEqual(Fault.bad_opcode, m.cores[0].contexts[0].fault);

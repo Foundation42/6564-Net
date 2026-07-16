@@ -6,6 +6,8 @@ pub const ring = @import("ring.zig");
 pub const mesh = @import("mesh.zig");
 pub const machine = @import("machine.zig");
 pub const asm6564 = @import("asm.zig");
+pub const demo_pingpong = @import("demo_pingpong.zig");
+pub const demo_supervise = @import("demo_supervise.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

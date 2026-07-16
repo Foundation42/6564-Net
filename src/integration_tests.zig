@@ -147,8 +147,8 @@ test "phase 1: TXR datagram between contexts on one core" {
     try assembleInto(&m, 0, receiver_src);
     // Receiver first: it must post its landing buffer before the TXR fires,
     // or the datagram honestly rejects with no_buffer (an actor race).
-    try m.spawn(0, 1, 0x1400, 0x3800);
-    try m.spawn(0, 0, 0x1000, 0x3000);
+    try m.spawn(0, 1, 0x1400, 0x3800, 0);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
 
     try testing.expectEqual(machine.StopReason.all_halted, try m.run());
 
@@ -221,8 +221,8 @@ test "capability token mismatch rejects at both ends, no data moves" {
     ;
     try assembleInto(&m, 0, sender_src);
     try assembleInto(&m, 0, victim_src);
-    try m.spawn(0, 0, 0x1000, 0x3000);
-    try m.spawn(0, 1, 0x1400, 0x3800);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try m.spawn(0, 1, 0x1400, 0x3800, 0);
 
     try testing.expectEqual(machine.StopReason.all_halted, try m.run());
 
@@ -310,8 +310,8 @@ test "phase 2: SEND across a lossy link, retransmit from CQ feedback" {
     ;
     try assembleInto(&m, 0, sender_src);
     try assembleInto(&m, 1, receiver_src);
-    try m.spawn(0, 0, 0x1000, 0x3000);
-    try m.spawn(1, 0, 0x1400, 0x3800);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try m.spawn(1, 0, 0x1400, 0x3800, 0);
 
     try testing.expectEqual(machine.StopReason.all_halted, try m.run());
 
@@ -353,7 +353,7 @@ test "phase 2: total loss reports honest timeouts, never blocks the core" {
         \\        HLT
     ;
     try assembleInto(&m, 0, src);
-    try m.spawn(0, 0, 0x1000, 0x3000);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
 
     try testing.expectEqual(machine.StopReason.all_halted, try m.run());
     const w0 = std.mem.readInt(u64, m.cores[0].ram[0x2298 - machine.ram_base ..][0..8], .little);
@@ -384,7 +384,7 @@ test "CONT and YLD: continuations rotate through the run queue" {
         \\        HLT
     ;
     try assembleInto(&m, 0, src);
-    try m.spawn(0, 0, 0x1000, 0x2000);
+    try m.spawn(0, 0, 0x1000, 0x2000, 0);
     try testing.expectEqual(machine.StopReason.all_halted, try m.run());
 
     const ctx = &m.cores[0].contexts[0];
@@ -450,10 +450,128 @@ test "determinism: identical seeds produce identical runs" {
         ;
         try assembleInto(&m, 0, sender_src);
         try assembleInto(&m, 1, receiver_src);
-        try m.spawn(0, 0, 0x1000, 0x3000);
-        try m.spawn(1, 0, 0x1400, 0x3800);
+        try m.spawn(0, 0, 0x1000, 0x3000, 0);
+        try m.spawn(1, 0, 0x1400, 0x3800, 0);
         _ = try m.run();
         r.* = m.stats;
     }
     try testing.expectEqualDeep(results[0], results[1]);
+}
+
+// ── Phase 3: supervision ─────────────────────────────────────────────────
+
+test "supervision tree: restarts, budget, accumulated work (full demo)" {
+    const o = try @import("demo_supervise.zig").simulate(testing.allocator, false);
+    // Reliable workers met quota and exited clean.
+    try testing.expectEqual(@as(u64, 12), o.progress[1]);
+    try testing.expectEqual(@as(u64, 12), o.progress[3]);
+    // The flaky worker produced 5 items per incarnation across 4 lives
+    // (initial + 3 restarts) — its RAM progress cell survived every SPWN.
+    try testing.expectEqual(@as(u64, 20), o.progress[2]);
+    try testing.expectEqual(@as(u64, 3), o.restarts);
+    try testing.expect(o.supervisor_halted);
+    // Abandoned honestly: the crasher's last incarnation stays faulted.
+    try testing.expectEqual(machine.CtxState.faulted, o.flaky_state);
+    try testing.expectEqual(machine.StopReason.faulted, o.reason);
+}
+
+test "SPWN invalidates the dead incarnation's queued continuations" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 2,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+
+    // Child queues a continuation, then crashes. The supervisor restarts it
+    // at `alive`. The stale continuation (`dead`, from generation 0) must
+    // never run.
+    const child_src =
+        \\        .org $1000
+        \\        CONT dead
+        \\        BRK
+        \\alive:  LDA #2
+        \\        STA $808
+        \\        HLT
+        \\dead:   LDA #$FF
+        \\        STA $810
+        \\        HLT
+    ;
+    const sup_src =
+        \\        .org $1100
+        \\wait1:  LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wait1
+        \\        SPWN $900       ; restart the child at `alive`
+        \\wait2:  LSTN 1          ; then wait for its clean exit
+        \\        CQPOP 1
+        \\        BEQ wait2
+        \\        HLT
+    ;
+    var child_out = try asm6564.assemble(testing.allocator, child_src, null);
+    defer child_out.deinit();
+    var sup_out = try asm6564.assemble(testing.allocator, sup_src, null);
+    defer sup_out.deinit();
+    m.load(0, child_out.origin, child_out.code);
+    m.load(0, sup_out.origin, sup_out.code);
+
+    m.setRing(0, 0, ring.slot_cq, .{
+        .base = 0x2000,
+        .cap_log2 = 3,
+        .entry_size = ring.cq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    });
+    var blk: [32]u8 = undefined;
+    std.mem.writeInt(u64, blk[0..8], 1, .little); // target ctx 1
+    std.mem.writeInt(u64, blk[8..16], child_out.symbol("alive").?, .little);
+    std.mem.writeInt(u64, blk[16..24], 0x3800, .little);
+    std.mem.writeInt(u64, blk[24..32], 0, .little);
+    m.writeNear(0, 0, 0x900, &blk);
+    m.linkSupervisor(0, 1, 0, ring.slot_cq);
+
+    try m.spawn(0, 1, 0x1000, 0x3000, 0);
+    try m.spawn(0, 0, 0x1100, 0x2800, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+
+    const child = &m.cores[0].contexts[1];
+    try testing.expectEqual(machine.CtxState.halted, child.state);
+    try testing.expectEqual(@as(u32, 1), child.gen);
+    // The new incarnation ran…
+    try testing.expectEqual(
+        @as(u64, 2),
+        std.mem.readInt(u64, child.near[0x808..][0..8], .little),
+    );
+    // …and the dead one's continuation never did.
+    try testing.expectEqual(
+        @as(u64, 0),
+        std.mem.readInt(u64, child.near[0x810..][0..8], .little),
+    );
+}
+
+test "SPWN of self or a nonexistent context faults the spawner" {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 2,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    const src =
+        \\        .org $1000
+        \\        SPWN $900
+        \\        HLT
+    ;
+    var out = try asm6564.assemble(testing.allocator, src, null);
+    defer out.deinit();
+    m.load(0, out.origin, out.code);
+    var blk: [32]u8 = undefined;
+    std.mem.writeInt(u64, blk[0..8], 0, .little); // ctx 0 = the spawner itself
+    @memset(blk[8..], 0);
+    m.writeNear(0, 0, 0x900, &blk);
+    try m.spawn(0, 0, 0x1000, 0x2000, 0);
+    try testing.expectEqual(machine.StopReason.faulted, try m.run());
+    try testing.expectEqual(machine.Fault.bad_descriptor, m.cores[0].contexts[0].fault);
 }

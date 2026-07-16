@@ -132,6 +132,7 @@ pub const Mnemonic = enum {
     yld,
     cqpop,
     capld,
+    spwn,
 
     /// Assembly spelling ("and_" is spelled "AND").
     pub fn spelling(self: Mnemonic) []const u8 {
@@ -250,6 +251,10 @@ pub const table = [_]Encoding{
     e(.yld, .impl, 0x57, 1), //  YLD        — rotate to next runnable
     e(.cqpop, .desc, 0x67, 3), // CQPOP desc — pop completion into A, X
     e(.capld, .caps, 0x77, 6), // CAPLD slot,(near) — privileged PTT load
+    // SPWN near — (re)start a sibling context from a near-page spawn block
+    // {ctx, entry IP, SP, arg→A}; near,X enables indexed spawn-block tables.
+    e(.spwn, .near, 0x87, 6),
+    e(.spwn, .near_x, 0x97, 6),
 };
 
 /// 256-entry decode table, generated at comptime. `null` = undefined opcode

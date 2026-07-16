@@ -15,10 +15,13 @@ what building it taught us. Zig 0.14.1.
 | `src/machine.zig` | Contexts, cores, memory decode, the interpreter, the hardware scheduler, the discrete-event loop. |
 | `src/asm.zig` | Two-pass assembler driven by the same ISA table. |
 | `src/integration_tests.zig` | Assembled programs run end-to-end, §6 semantics exercised. |
-| `src/main.zig` | Demo: ping-pong actors with an end-to-end protocol over a hostile fabric. |
+| `src/programs/*.asm` | The actual 6564 programs: ping/pong, supervisor/worker. |
+| `src/demo_pingpong.zig`, `src/demo_supervise.zig` | Demo harnesses (wiring, staging, reporting); also driven by the test suite. |
+| `src/main.zig` | CLI dispatcher over the demos. |
 
-`zig build test` runs everything; `zig build run` (or
-`./zig-out/bin/sim6564 [seed] [loss_ppm4k] [rounds] [trace]`) runs the demo.
+`zig build test` runs everything. Demos:
+`sim6564 [pingpong] [seed] [loss_ppm4k] [rounds] [trace]` and
+`sim6564 supervise [trace]`.
 
 ## Concrete decisions (spec-compatible, but v0.1 chose)
 
@@ -59,6 +62,15 @@ mesh coordinates the simulator routes by: dst core [0..16), dst context
 advance private clocks; the machine steps whichever busy core is furthest
 behind, and events fire when virtual time passes them. Ties break by core
 index / event sequence number → bit-identical replay from a seed.
+
+**Supervision (Phase 3, spec §5.4).** Exit links are per-context
+`(supervisor ctx, CQ slot)` pairs set by the harness (`linkSupervisor`); on
+halt/fault the machine posts the exit completion. `SPWN` resets the target's
+registers, bumps its incarnation counter, and queues its continuation; the
+near page and exit link survive. Run-queue entries carry the incarnation
+number, so a dead life's continuations are skipped at dispatch. `SPWN` of
+self or an out-of-range context faults the spawner (`bad_descriptor`).
+Same-core only — cross-core supervision is a software protocol.
 
 ## Deliberate v0.1 simplifications
 
@@ -113,6 +125,18 @@ end-to-end evidence (the echo) plus timers. This is the end-to-end argument
 reproduced from first principles in ~60 instructions. The CQ ack still
 matters for one thing: buffer ownership release (§6.2).
 
+**Supervision cannot reach the compute-hung.** Exit links catch halts and
+faults, but a worker spinning in a pure compute loop starves the whole core —
+including its supervisor, which can then neither observe nor restart it. The
+supervision demo works precisely because workers `YLD` between items; delete
+that one instruction and the tree is helpless. This is now spec open
+question 7 (watchdog-into-exit-link looks like the cheapest honest fix).
+
+**One program, many actors.** All three demo workers execute the same code at
+one RAM address with per-actor config blocks passed via the spawn argument —
+shared read-only code pages in practice, which is the "stated position"
+spec open question 3 asks for.
+
 **Duplicate reject acks race genuine ok acks.** When a duplicated datagram's
 second copy finds no buffer, its reject ack can overtake the first copy's ok
 ack; first-ack-wins means a sender can be told "no buffer" about a message
@@ -134,6 +158,7 @@ takes `trace` as its 4th CLI arg.
 - **Phase 2 — virtual mesh: done.** Multi-core, PTT routing, seeded
   loss/latency/reorder/duplication on off-chip paths (acks included —
   two-generals is live), deterministic replay verified by test.
-- **Phase 3 — actor workloads: started.** Ping-pong with end-to-end
-  reliability is in `main.zig` with cycle/utilization stats. Supervision
-  trees, pipelines, scatter-gather: next.
+- **Phase 3 — actor workloads: in progress.** Ping-pong with end-to-end
+  reliability (`sim6564 pingpong`) and a one-for-one supervision tree with
+  exit links, SPWN restarts, and a restart budget (`sim6564 supervise`).
+  Pipelines and scatter-gather: next.

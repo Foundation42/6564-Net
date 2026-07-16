@@ -14,14 +14,23 @@ zig build test          # full suite: unit + assembled end-to-end programs
 zig build run           # ping-pong actors across a 25%-lossy fabric
 ./zig-out/bin/sim6564 [seed] [loss_ppm4k] [rounds] [trace]
 ./zig-out/bin/sim6564 0xBEEF 3000 12      # 73% packet loss; still finishes
+./zig-out/bin/sim6564 supervise           # supervision tree demo
 ```
 
-The demo runs two actors on two simulated cores joined by a fabric that
+The 6564 programs themselves live in `src/programs/*.asm`.
+
+**pingpong** runs two actors on two simulated cores joined by a fabric that
 loses, delays, reorders and duplicates datagrams (deterministically, from the
 seed). The ping actor implements an end-to-end reliable protocol — sequence
 checking plus a retransmission timer built from the fabric itself (a send to
-an unroutable prefix is a guaranteed timeout completion) — and completes its
-rounds at any loss rate below total.
+an unroutable prefix is a guaranteed timeout completion, spec §6.3) — and
+completes its rounds at any loss rate below total.
+
+**supervise** runs a one-for-one supervision tree on one core: exit links
+post a crashed worker's obituary to the supervisor's completion queue as an
+ordinary completion record, and `SPWN` resurrects it with fresh registers
+while its work survives in RAM — Erlang's supervisors, in silicon (spec
+§5.4). The restart budget runs out; the crasher is abandoned, honestly.
 
 Everything decodes from one declarative ISA table (`src/isa.zig`): the
 simulator, the assembler, and the disassembly of intent. Adding an

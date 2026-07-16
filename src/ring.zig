@@ -67,6 +67,9 @@ pub const Status = enum(u8) {
     reject_capability = 2,
     reject_no_buffer = 3,
     timeout = 4,
+    /// Exit notifications only: the linked context faulted (byte_count
+    /// carries the fault code).
+    fault = 5,
 };
 
 /// Operation tags for completion records.
@@ -75,6 +78,9 @@ pub const Tag = enum(u8) {
     send = 2,
     /// Inbound delivery landed in one of our posted RX buffers.
     deliver = 3,
+    /// A context linked to this CQ exited: status ok = clean HLT,
+    /// status fault = it crashed; cookie = the child's context id.
+    exit = 4,
 };
 
 pub const Desc = struct {
