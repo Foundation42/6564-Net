@@ -473,6 +473,53 @@ matter for extending it:
   handoff item 4's experiment and should arrive as a measured change,
   not a freebie.
 
+## joe Amendment 1: iteration (docs/joe-v1-ammendment-1.md)
+
+The amendment's verdict — *`while` dies, `for` becomes replicated PAR,
+`bounded` becomes checkable, `map` stays pure* — landed as follows:
+
+- **`while` is a targeted compile error**, not an unknown keyword: "joe
+  has no `while` (Amendment 1): unbounded iteration is a self-send
+  loop, one park per slice." The replacement construct is real:
+  **`send self`** resolves to a compiler-internal near slot holding a
+  capability to the actor's own RX ring, staged by the loader like any
+  other capability (`Result.self_slot`). The physics make A1.1 sound:
+  same-core delivery is on-chip (fixed 4-cycle latency, no loss roll,
+  machine.zig's `onchip` path), so a self-send loop needs no retry
+  discipline — `crunch.joe` sums 1..1000 in 20 parked slices under the
+  default 25%-loss fabric with zero losses.
+- **`for` was already A1.2-shaped** (collection/range only, no mutation
+  of the iteration space, no loop-carried accumulator in expressions) —
+  no change needed; the grammar delta was satisfied on arrival.
+- **`bounded` is enforced, not requested (A1.3).** The compiler now
+  runs a cost accountant during emission: every line `Gen.w()` writes
+  is charged its ISA-table cycles (mode-exact — the operand shapes the
+  generator emits form a closed set, classified back to addressing
+  modes and billed from the same table the machine bills from).
+  Constant-extent `for` ranges multiply the once-emitted body into the
+  bound; a group's count or a variable range marks the burst
+  *data-dependent*. Each burst — init, and every handler body plus the
+  serve loop's dispatch overhead — is then checked against the
+  strictest watchdog any spawn site imposes on the actor:
+  - bound computable and within budget → no declaration allowed
+    (a gratuitous `bounded` is rejected);
+  - bound computable and over budget → `bounded N` required, and
+    rejected if N understates the computed body cost;
+  - bound data-dependent → `bounded N` required and *trusted* — the
+    runtime WDEX makes the watchdog the judge of data the analysis
+    cannot see;
+  - no watchdog anywhere → no budget exists, and any `bounded` is
+    rejected ("nobody is counting").
+  supervise.joe's Sleeper is the living example: its old `bounded 40`
+  over five straight-line adds is now a *compile error* (arithmetic is
+  checked), so the hang moved to where hangs still live — an honest-
+  looking `bounded 64` over a loop whose extent is a variable the
+  analysis cannot see. Same observable behavior (watchdog fault,
+  `hung`, respawn, abandonment), but the lie is now about data.
+- **The vector package (A1.4) and pure `map` (A1.5) ride with Tier 1**
+  (handoff item 5) — they are surface syntax for a vector unit the
+  machine does not have yet, and joe does not front-run silicon.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

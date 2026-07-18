@@ -883,6 +883,23 @@ test "joe: supervision — spawn, respawn, hung, abandoned, all from the system 
     try testing.expectEqual(machine.Fault.watchdog, sleeper.fault);
 }
 
+test "joe A1.1: crunch — unbounded work is a self-send loop, one park per slice" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/crunch.joe");
+    var o = try joe_run.simulate(testing.allocator, src, .{});
+    defer o.deinit();
+    // Sum 1..1000 in slices of 50: twenty parks, one exact total.
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cr").?.state);
+    try testing.expectEqual(@as(u64, 500500), o.varOf("cr", "acc").?);
+    try testing.expectEqual(@as(u64, 500500), o.varOf("sink", "total").?);
+    // Under the default 25%-loss fabric, nothing was lost: a message to
+    // yourself is on-chip — same core never rides the mesh — so the
+    // self-send loop needs no retry discipline. That is why A1.1 can
+    // replace `while` with it.
+    try testing.expectEqual(@as(u64, 0), o.stats.lost);
+    try testing.expectEqual(o.stats.sends, o.stats.delivered);
+}
+
 test "joe: scatter — the result is the ack; re-asks converge through loss" {
     const joe_run = @import("joe_run.zig");
     const src = @embedFile("programs/scatter.joe");

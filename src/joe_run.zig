@@ -427,6 +427,12 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                 },
             }
         }
+        if (c.r.self_slot) |soff| {
+            // `send self` (Amendment 1): a capability to your own RX ring.
+            // Same core, so delivery is on-chip — never rides the mesh.
+            const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(p.core, p.ctx, ring.slot_rx));
+            std.mem.writeInt(u64, near[soff..][0..8], ring.windowAddr(slot, 0), .little);
+        }
         if (c.r.uses_timer) {
             m.setPtt(p.core, 255, .{
                 .prefix_lo = ring.PttEntry.loFrom(0xFFFF, 0, ring.slot_rx),

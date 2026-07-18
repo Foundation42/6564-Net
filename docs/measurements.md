@@ -596,3 +596,49 @@ Corpus: pingpong, ring, supervise, scatter, pipeline, hello, forkjoin
 — **seven of eight protocols compile from joe** (bigbrother
 inexpressible by design, documented). 93 tests green; frozen table
 intact. Next: item 4, park-point liveness, against ring.joe's 110.
+
+## Amendment 1: the language gets smaller, the promise gets larger (2026-07-18)
+
+Christian's `docs/joe-v1-ammendment-1.md` (worked out with Claude Chat,
+status: adopted) — *`while` dies, `for` becomes replicated PAR,
+`bounded` becomes checkable, `map` stays pure* — implemented the same
+day. What the machine had to say about it:
+
+**A1.1, the self-send loop, is physically free of caveats.** `send
+self` compiles to a TXR through a loader-staged capability to the
+actor's own RX ring, and same-core delivery is ON-CHIP: fixed 4-cycle
+latency, no loss roll, never touches the mesh. `crunch.joe` (the new
+demo) sums 1..1000 in 20 parked slices of 50: **acc = 500,500 exact,
+21 sends, 21 delivered, 0 lost — under the default 25%-loss fabric.**
+The construct A1.1 promises ("preemptible, budgeted, fairly scheduled,
+observable in the CQ") costs nothing to trust: the loop's messages
+cannot be lost, so no retry protocol is smuggled in.
+
+**A1.3 turned out to be almost free to enforce exactly.** The
+generator's emitted operand shapes are a closed set, so every line can
+be classified back to its addressing mode and charged from the same
+ISA table the machine bills from — the computed bound is the
+machine's own arithmetic, not an estimate. Constant loops multiply;
+group counts and variable ranges flag the burst data-dependent. The
+check itself is the amendment's table, verbatim: required iff over
+budget or unseeable, rejected if understated, rejected if gratuitous
+(including any `bounded` in an actor nobody watches — "nobody is
+counting").
+
+**The Sleeper's lie had to move, and where it moved is the finding.**
+The old hang — `bounded 40` over five adds the compiler can now sum —
+is a compile error today. The only joe-expressible hang left is a
+declaration whose *data* is dishonest: `bounded 64` over `for i in
+0..spin` where spin is a variable. Arithmetic lies die at compile
+time; data lies die at the watchdog; there is no third place to lie.
+supervise.joe's observable behavior is unchanged (crashes=2 hangs=1
+lost=2), which is the point — the amendment removed a way to write
+the bug without removing the demo of catching it.
+
+A1.2 required no work (joe's `for` was born in the amendment's shape)
+and A1.4/A1.5 ride with Tier 1 (item 5) — vector syntax without a
+vector unit would be front-running silicon.
+
+101 tests green (8 new: 6 checker rejections/acceptances, `while`'s
+targeted error, crunch end-to-end). Frozen table intact; ring.joe
+still 110 cy/pass, still item 4's starting line.

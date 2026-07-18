@@ -7,9 +7,12 @@
 // it should) while the near page's ring wiring rebuilds itself.
 //
 // The Griefer crashes on its third tick, every life, until its budget
-// runs out. The Sleeper demonstrates the only hang joe can express:
-// a `bounded` declaration its own body fails to honor — the watchdog
-// makes the lie an ordinary fault, and `hung` is just its fault code.
+// runs out. The Sleeper demonstrates the only hang joe can still
+// express: since Amendment 1 the compiler checks `bounded` arithmetic
+// (an understated constant bound is a compile error), so the lie has to
+// be about DATA — a loop extent the analysis cannot see. The declared
+// budget is honest-looking; the data makes it false; the watchdog makes
+// the lie an ordinary fault, and `hung` is just its fault code.
 
 actor Boss() {
     var crashes u64 = 0
@@ -43,14 +46,13 @@ actor Griefer() {
 
 actor Sleeper() {
     var acc u64 = 0
+    var spin u64 = 4000
     serve {
         after 500:
-            bounded 40 {
-                acc += 1
-                acc += 2
-                acc += 3
-                acc += 4
-                acc += 5
+            bounded 64 {
+                for i in 0..spin {
+                    acc += 1
+                }
             }
     }
 }

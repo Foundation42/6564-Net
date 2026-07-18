@@ -89,7 +89,13 @@ PTT capabilities, parameter staging and timers are all loader work:
 any `.joe` file runs without a harness. The capstone is
 `src/programs/forkjoin.joe`: a 1,009-actor fork-join tree, every hop
 acked through the tree because joe cannot see transport verdicts,
-joining to the exact sum at 25% packet loss.
+joining to the exact sum at 25% packet loss. Amendment 1
+(`docs/joe-v1-ammendment-1.md`) made the language smaller and the
+promise larger: `while` is gone — unbounded work is a `send self`
+loop, on-chip and lossless, one park per slice (`crunch.joe`) — and
+`bounded` is *checked*: the compiler charges every emitted instruction
+its ISA-table cycles, so an understated budget is a compile error and
+the watchdog remains judge only of the data-dependent claims.
 
 **mandel** renders the Mandelbrot set in IEEE 754 double precision on
 a 6502 descendant (`sim6564 mandel`): Tier 0 scalar FP lives on the

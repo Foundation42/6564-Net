@@ -9,13 +9,24 @@
 //! real specification: no shared state, no synchronous calls, no
 //! transport-ack visibility.
 //!
-//! v1 compiles the pingpong subset: `message`, `actor`, `var`, params,
-//! `send`, `serve`/`case`/`where`/`after`, `if`/`else`, `halt`, `bounded`,
-//! assignment (`=`, `+=`, `-=`). Deferred to later items (they parse to an
-//! honest "unsupported in v1" error): `let` liveness (that IS handoff item
-//! 4), `spawn`, `chain`, `for`, `quiesce`, `region`/`grant`, floats in
-//! messages. The compiler is four passes in one file — lex → parse →
-//! check → emit — producing .asm text for asm.zig. No IR.
+//! v1 speaks: `message`, `actor`, `var` (scalars and `[N]u64` arrays),
+//! params (incl. `[]addr` groups), `send` (incl. `send self` — Amendment
+//! 1's self-send loop), `serve`/`case`/`where`/`after`, `if`/`else`,
+//! `halt`, `bounded` (checked — see below), `for` (bounded replication,
+//! A1.2), `quiesce`, `spawn`…`restarts`…`watchdog`, and the `system`
+//! block. Deferred to later items (they parse to an honest "unsupported
+//! in v1" error): `let` liveness (that IS handoff item 4), `chain`,
+//! `region`/`grant`, `log`; the A1.4 vector package rides with Tier 1.
+//! `while` is not deferred — it is not in the language (A1.1). The
+//! compiler is four passes in one file — lex → parse → check → emit —
+//! producing .asm text for asm.zig. No IR.
+//!
+//! Amendment 1 (docs/joe-v1-ammendment-1.md) makes `bounded` CHECKED:
+//! every emitted instruction is charged its ISA-table cycles, so every
+//! burst has a computed worst case, and `bounded N` is required exactly
+//! when that bound exceeds the spawn-site watchdog (or is data-dependent),
+//! rejected when N understates a computable body, and rejected as
+//! gratuitous when the handler already fits.
 //!
 //! ## The v1 runtime ABI (matches ping.asm/pong.asm's proven wiring)
 //!
@@ -178,7 +189,7 @@ const Stmt = union(enum) {
     send_str: struct { target: []const u8, text: []const u8, line: usize },
     if_: struct { cond: *Expr, then: []Stmt, els: []Stmt },
     halt: struct { ok: bool },
-    bounded: struct { n: u64, body: []Stmt },
+    bounded: struct { n: u64, body: []Stmt, line: usize },
     /// Enter the lame-duck phase: timers die, the quiesce case set takes
     /// over. Termination is a phase, not an instruction.
     quiesce,
@@ -201,7 +212,7 @@ const Handler = union(enum) {
         body: []Stmt,
         line: usize,
     },
-    after: struct { n: u64, body: []Stmt },
+    after: struct { n: u64, body: []Stmt, line: usize },
     exit_case: struct {
         bind: []const u8,
         cause: ExitCause,
@@ -685,9 +696,10 @@ const Parser = struct {
             } };
         }
         if (try self.eatKw("after")) {
+            const line = self.tok.line;
             const n = try self.expect(.int, "cycle count");
             _ = try self.expect(.colon, ":");
-            return .{ .after = .{ .n = n.value, .body = try self.parseHandlerBody() } };
+            return .{ .after = .{ .n = n.value, .body = try self.parseHandlerBody(), .line = line } };
         }
         return self.fail("expected `case` or `after`", Error.Syntax);
     }
@@ -805,7 +817,7 @@ const Parser = struct {
         }
         if (try self.eatKw("bounded")) {
             const n = try self.expect(.int, "cycle count");
-            return .{ .bounded = .{ .n = n.value, .body = try self.parseBlock() } };
+            return .{ .bounded = .{ .n = n.value, .body = try self.parseBlock(), .line = line } };
         }
         if (try self.eatKw("spawn")) {
             const actor = try self.expect(.ident, "actor name");
@@ -830,6 +842,11 @@ const Parser = struct {
             } };
         }
         if (try self.eatKw("quiesce")) return .quiesce;
+        if (self.isKw("while"))
+            return self.fail(
+                "joe has no `while` (Amendment 1): unbounded iteration is a self-send loop, one park per slice",
+                Error.Semantics,
+            );
         inline for (.{ "chain", "let", "region", "grant", "log" }) |kw| {
             if (self.isKw(kw))
                 return self.fail("`" ++ kw ++ "` is not in v1 yet", Error.Unsupported);
@@ -960,6 +977,86 @@ const Parser = struct {
 
 // ── Codegen ──────────────────────────────────────────────────────────────
 
+// ── The cost accountant (Amendment 1, A1.3) ─────────────────────────────
+//
+// With `while` gone and `for` bounded by construction, every burst — init,
+// and each handler body plus its share of the serve loop — has a worst-case
+// cycle count the compiler can add up. It does: every emitted line is
+// charged its ISA-table cycles (mode-exact, the same table the machine
+// bills from), constant-extent loops multiply, and an extent the analysis
+// cannot see (a group's count, a variable range) marks the burst
+// data-dependent. Then `bounded N` is REQUIRED exactly when the computed
+// bound exceeds the spawn-site watchdog (or cannot be computed), REJECTED
+// when N understates a computable body, and REJECTED as gratuitous when
+// the handler already fits. The watchdog remains judge of the
+// data-dependent claims — the only lies left are about data.
+
+/// Classify an emitted operand into its addressing mode. The generator's
+/// output is a closed set of shapes; anything unrecognized falls back to
+/// the mnemonic's worst-case encoding.
+fn operandMode(op: []const u8) ?isa.Mode {
+    if (op.len == 0) return null; // impl (or acc) — resolved in cycFor
+    if (std.mem.startsWith(u8, op, "##")) return .imm64;
+    if (op[0] == '#') return .imm8;
+    if (std.mem.startsWith(u8, op, "!$")) return .abs;
+    if (op[0] == '(') return if (std.mem.endsWith(u8, op, ",Y")) .ind_y else .ind;
+    if (op[0] == '$') return .near;
+    if (op[0] == 'L') return .rel16; // branch target label
+    return .desc; // bare descriptor index: SEND 0, RECV 2, LSTN 1, CQPOP 1
+}
+
+fn cycFor(mn: isa.Mnemonic, mode: ?isa.Mode) u64 {
+    if (mode) |md| {
+        for (isa.table) |enc| {
+            if (enc.mnemonic == mn and enc.mode == md) return enc.cycles;
+        }
+    } else {
+        for (isa.table) |enc| {
+            if (enc.mnemonic == mn and (enc.mode == .impl or enc.mode == .acc)) return enc.cycles;
+        }
+    }
+    var worst: u64 = 0;
+    for (isa.table) |enc| {
+        if (enc.mnemonic == mn) worst = @max(worst, enc.cycles);
+    }
+    return worst;
+}
+
+/// The cycle charge for one emitted line of assembly. Labels, comments
+/// and directives are free; an instruction costs what the ISA table says.
+fn lineCost(full: []const u8) u64 {
+    var line = full;
+    if (line.len > 1 and line[0] == 'L') {
+        var j: usize = 1;
+        while (j < line.len and std.ascii.isDigit(line[j])) j += 1;
+        if (j > 1 and j < line.len and line[j] == ':') line = line[j + 1 ..];
+    }
+    line = std.mem.trim(u8, line, " ");
+    if (line.len == 0 or line[0] == ';' or line[0] == '.') return 0;
+    var j: usize = 0;
+    while (j < line.len and std.ascii.isAlphabetic(line[j])) j += 1;
+    const word = line[0..j];
+    if (word.len == 0 or word.len > 7) return 0;
+    var buf: [8]u8 = undefined;
+    const lower = std.ascii.lowerString(&buf, word);
+    const mn: isa.Mnemonic = if (std.mem.eql(u8, lower, "and"))
+        .and_
+    else
+        std.meta.stringToEnum(isa.Mnemonic, lower) orelse return 0;
+    var rest = std.mem.trim(u8, line[j..], " ");
+    if (std.mem.indexOfScalar(u8, rest, ';')) |semi|
+        rest = std.mem.trim(u8, rest[0..semi], " ");
+    return cycFor(mn, operandMode(rest));
+}
+
+/// One accounted burst: init, or one handler body. `cost` excludes the
+/// serve loop's dispatch overhead, which is added at check time.
+const Burst = struct { line: usize, cost: u64, dyn: bool, is_init: bool, nbounded: usize };
+
+/// One `bounded N { … }` as accounted: the declared budget against the
+/// computed (or uncomputable) body cost.
+const BoundedRec = struct { line: usize, n: u64, body_cost: u64, body_dyn: bool };
+
 const Gen = struct {
     arena: std.mem.Allocator,
     out: std.ArrayList(u8),
@@ -980,9 +1077,20 @@ const Gen = struct {
     exit_code_bind: ?[]const u8 = null,
     in_handler: bool = false,
     uses_timer: bool = false,
+    uses_self: bool = false,
     timer_period: u64 = 0,
     spawn_count: u16 = 0,
     spawn_seen: u16 = 0,
+
+    /// A1.3 accounting: running cycle total of everything emitted, the
+    /// data-dependent flag for the burst in progress, the bursts and
+    /// bounded declarations collected for the end-of-emit check, and the
+    /// strictest watchdog any spawn site imposes on this actor (0 = none).
+    cost: u64 = 0,
+    cost_dyn: bool = false,
+    bursts: std.ArrayList(Burst),
+    brecs: std.ArrayList(BoundedRec),
+    watchdog: u64 = 0,
 
     /// String literals staged after the code, one label each.
     strings: std.ArrayList(struct { label: usize, text: []const u8 }),
@@ -999,6 +1107,9 @@ const Gen = struct {
     off_ecode: u16 = 0,
     off_tarmed: u16 = 0,
     off_elem: u16 = 0,
+    /// `send self` ships through this slot: a capability to the actor's
+    /// own RX ring, loader-staged (Amendment 1's self-send loop).
+    off_self: u16 = 0,
     /// First free near slot after the fixed layout — loop variables and
     /// bindings are handed out from here.
     next_slot: u16 = 0,
@@ -1020,7 +1131,29 @@ const Gen = struct {
     }
 
     fn w(self: *Gen, comptime fmt: []const u8, args: anytype) Error!void {
+        const start = self.out.items.len;
         self.out.writer().print(fmt ++ "\n", args) catch return Error.OutOfMemory;
+        // A1.3: charge the line its ISA-table cycles as it is written.
+        self.cost +|= lineCost(self.out.items[start .. self.out.items.len - 1]);
+    }
+
+    const BurstMark = struct { cost: u64, dyn: bool, nb: usize };
+
+    fn beginBurst(self: *Gen) BurstMark {
+        const m = BurstMark{ .cost = self.cost, .dyn = self.cost_dyn, .nb = self.brecs.items.len };
+        self.cost_dyn = false;
+        return m;
+    }
+
+    fn endBurst(self: *Gen, m: BurstMark, line: usize, is_init: bool) Error!void {
+        self.bursts.append(.{
+            .line = line,
+            .cost = self.cost - m.cost,
+            .dyn = self.cost_dyn,
+            .is_init = is_init,
+            .nbounded = self.brecs.items.len - m.nb,
+        }) catch return Error.OutOfMemory;
+        self.cost_dyn = m.dyn;
     }
 
     fn label(self: *Gen) usize {
@@ -1068,11 +1201,25 @@ const Gen = struct {
         self.off_ecode = off + 56;
         self.off_tarmed = off + 64;
         self.off_elem = off + 72;
-        self.spawn_base = off + 80;
+        self.off_self = off + 80;
+        self.spawn_base = off + 88;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
                 self.timer_period = h.after.n;
+            }
+        }
+        // A1.3: the strictest watchdog any spawn site imposes on this
+        // actor is the budget its bursts must fit (0 = nobody counting).
+        for (self.prog.actors) |a| {
+            for (a.body) |s| {
+                if (s != .spawn) continue;
+                if (!std.mem.eql(u8, s.spawn.actor, self.actor.name)) continue;
+                if (s.spawn.watchdog == 0) continue;
+                self.watchdog = if (self.watchdog == 0)
+                    s.spawn.watchdog
+                else
+                    @min(self.watchdog, s.spawn.watchdog);
             }
         }
         for (self.actor.body) |s| {
@@ -1376,12 +1523,29 @@ const Gen = struct {
             },
             .bounded => |b| {
                 try self.w("        WDEX ##{d}", .{b.n});
+                const c0 = self.cost;
+                const d0 = self.cost_dyn;
+                self.cost_dyn = false;
                 try self.stmts(b.body);
+                self.brecs.append(.{
+                    .line = b.line,
+                    .n = b.n,
+                    .body_cost = self.cost - c0,
+                    .body_dyn = self.cost_dyn,
+                }) catch return Error.OutOfMemory;
+                self.cost_dyn = self.cost_dyn or d0;
             },
             .for_range => |f| {
                 const kslot = try self.getOrAddSlot(f.name);
                 const l_top = self.label();
                 const l_end = self.label();
+                // A1.3: a constant extent multiplies the once-emitted body
+                // into the bound; anything else is data-dependent.
+                const trips: ?u64 = if (f.from.* == .int and f.to.* == .int)
+                    f.to.int -| f.from.int
+                else
+                    null;
+                const c0 = self.cost;
                 try self.evalInto(f.from);
                 try self.w("        STA ${X}", .{kslot});
                 try self.w("L{d}:", .{l_top});
@@ -1394,6 +1558,9 @@ const Gen = struct {
                 try self.w("        INC ${X}", .{kslot});
                 try self.w("        BRA L{d}", .{l_top});
                 try self.w("L{d}:", .{l_end});
+                if (trips) |t| {
+                    self.cost +|= (self.cost - c0) *| t;
+                } else self.cost_dyn = true;
             },
             .for_group => |f| {
                 // for (k, w) in ws — count from the param slot, elements
@@ -1419,6 +1586,9 @@ const Gen = struct {
                 try self.w("        INC ${X}", .{kslot});
                 try self.w("        BRA L{d}", .{l_top});
                 try self.w("L{d}:", .{l_end});
+                // A group's count is the loader's runtime data — the
+                // analysis cannot see this extent.
+                self.cost_dyn = true;
             },
             .quiesce => {
                 // Termination is a phase: kill the clock, cross into the
@@ -1462,6 +1632,12 @@ const Gen = struct {
             try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
             try self.w("        STA ${X}", .{self.off_elem});
             break :blk self.off_elem;
+        } else if (std.mem.eql(u8, sd.target, "self")) blk: {
+            // Amendment 1: the self-send loop. A capability to your own
+            // RX ring, loader-staged; delivery is on-chip and lossless
+            // (dst_core == src_core never rides the mesh).
+            self.uses_self = true;
+            break :blk self.off_self;
         } else self.slots.get(sd.target) orelse
             return self.fail(sd.line, "unknown send target", Error.Semantics);
 
@@ -1536,6 +1712,7 @@ const Gen = struct {
 
     fn emit(self: *Gen) Error!void {
         try self.layoutSlots();
+        const m_init = self.beginBurst();
         try self.w("; joe v1 — actor {s} (compiled; do not edit)", .{self.actor.name});
         try self.w("        .org ${X}", .{self.layout.origin});
 
@@ -1626,14 +1803,17 @@ const Gen = struct {
 
         // opening statements
         try self.stmts(self.actor.body);
+        try self.endBurst(m_init, 0, true);
 
         if (self.actor.handlers.len == 0) {
             try self.w("        HLT", .{});
             try self.emitStrings();
+            try self.checkBounds(0);
             return;
         }
 
         // ── serve ──
+        const serve_cost_start = self.cost;
         self.serve_label = self.label();
         self.quiesce_label = self.label();
         const l_dispatch = self.label();
@@ -1662,7 +1842,9 @@ const Gen = struct {
             self.in_handler = true;
             for (self.actor.handlers) |*h| {
                 if (h.* == .after) {
+                    const bm = self.beginBurst();
                     try self.stmts(h.after.body);
+                    try self.endBurst(bm, h.after.line, false);
                     break;
                 }
             }
@@ -1692,7 +1874,9 @@ const Gen = struct {
             self.bind_msg = msg;
             if (c.where) |g| try self.branchIfFalse(g, l_next);
             self.in_handler = true;
+            const bm = self.beginBurst();
             try self.stmts(c.body);
+            try self.endBurst(bm, c.line, false);
             self.in_handler = false;
             self.bind = null;
             self.bind_msg = null;
@@ -1704,6 +1888,63 @@ const Gen = struct {
         if (self.spawn_count > 0) try self.emitExitRuntime(l_exit);
         if (self.has_quiesce) try self.emitQuiesce();
         try self.emitStrings();
+
+        // A1.3: everything in the serve region that is not a handler body
+        // is dispatch overhead — every burst pays it on top of its own.
+        var handler_costs: u64 = 0;
+        for (self.bursts.items) |b| {
+            if (!b.is_init) handler_costs +|= b.cost;
+        }
+        try self.checkBounds((self.cost - serve_cost_start) -| handler_costs);
+    }
+
+    /// Amendment 1, A1.3: the compiler checks your arithmetic.
+    fn checkBounds(self: *Gen, overhead: u64) Error!void {
+        if (self.watchdog == 0) {
+            // Nobody set a budget, so nothing needs declaring — and a
+            // declaration against no budget is noise the language rejects.
+            if (self.brecs.items.len > 0)
+                return self.fail(
+                    self.brecs.items[0].line,
+                    "gratuitous `bounded` (A1.3): this actor has no watchdog, nobody is counting",
+                    Error.Semantics,
+                );
+            return;
+        }
+        var bi: usize = 0;
+        for (self.bursts.items) |b| {
+            const total = b.cost +| (if (b.is_init) 0 else overhead);
+            const recs = self.brecs.items[bi .. bi + b.nbounded];
+            bi += b.nbounded;
+            for (recs) |r| {
+                if (!r.body_dyn and r.n < r.body_cost)
+                    return self.fail(
+                        r.line,
+                        "`bounded` understates the computed worst case (A1.3): you cannot understate your appetite",
+                        Error.Semantics,
+                    );
+            }
+            if (b.nbounded == 0) {
+                if (b.dyn)
+                    return self.fail(
+                        b.line,
+                        "this handler's worst case is data-dependent (A1.3): declare `bounded N`",
+                        Error.Semantics,
+                    );
+                if (total > self.watchdog)
+                    return self.fail(
+                        b.line,
+                        "computed worst case exceeds the watchdog budget (A1.3): declare `bounded N`",
+                        Error.Semantics,
+                    );
+            } else if (!b.dyn and total <= self.watchdog) {
+                return self.fail(
+                    b.line,
+                    "gratuitous `bounded` (A1.3): this handler fits the watchdog budget",
+                    Error.Semantics,
+                );
+            }
+        }
     }
 
     fn emitStrings(self: *Gen) Error!void {
@@ -1763,7 +2004,9 @@ const Gen = struct {
             self.bind_msg = msg;
             if (c.where) |g| try self.branchIfFalse(g, l_next);
             self.in_handler = true;
+            const bm = self.beginBurst();
             try self.stmts(c.body);
+            try self.endBurst(bm, c.line, false);
             self.in_handler = false;
             self.bind = null;
             self.bind_msg = null;
@@ -1837,7 +2080,9 @@ const Gen = struct {
                 self.exit_bind = h.exit_case.bind;
                 self.exit_code_bind = h.exit_case.code_bind;
                 self.in_handler = true;
+                const bm = self.beginBurst();
                 try self.stmts(h.exit_case.body);
+                try self.endBurst(bm, h.exit_case.line, false);
                 self.in_handler = false;
                 self.exit_bind = null;
                 self.exit_code_bind = null;
@@ -1885,6 +2130,9 @@ pub const Result = struct {
     /// The `after N` period — the harness wires it as the fabric's
     /// send_timeout until per-send timeouts land (open item, spec §10).
     timer_period: u64,
+    /// Set when the actor says `send self` (Amendment 1): the near slot
+    /// where the loader stages a capability to the actor's own RX ring.
+    self_slot: ?u16,
 
     pub fn deinit(self: *Result) void {
         for (self.params) |p| self.alloc.free(p.name);
@@ -2017,6 +2265,8 @@ pub fn compile(
         .slots = std.StringHashMap(u16).init(arena),
         .strings = .init(arena),
         .arrays = .init(arena),
+        .bursts = .init(arena),
+        .brecs = .init(arena),
     };
     errdefer gen.out.deinit();
     try gen.emit();
@@ -2063,6 +2313,7 @@ pub fn compile(
         .spawns = try spawns.toOwnedSlice(),
         .uses_timer = gen.uses_timer,
         .timer_period = gen.timer_period,
+        .self_slot = if (gen.uses_self) gen.off_self else null,
     };
 }
 
@@ -2102,6 +2353,114 @@ test "joe: v1 refuses what it cannot yet say, honestly" {
         Error.Unsupported,
         compile(testing.allocator, src, "A", .{}, &diag),
     );
+}
+
+test "joe A1.1: `while` is not deferred — it is not in the language" {
+    const src =
+        \\actor A(n u64) {
+        \\    var x u64 = 0
+        \\    while x < n { x += 1 }
+        \\    serve { }
+        \\}
+    ;
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator, src, "A", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "self-send loop") != null);
+}
+
+// A1.3 fixtures: W is spawned with a watchdog, so its bursts are checked.
+fn a13Src(comptime handler: []const u8, comptime watchdog: []const u8) []const u8 {
+    return
+        \\actor Boss() {
+        \\    spawn W() restarts 0 watchdog
+    ++ " " ++ watchdog ++
+        \\
+        \\    serve {
+        \\        case exit(w, abandoned):
+        \\            halt ok
+        \\    }
+        \\}
+        \\actor W(n u64) {
+        \\    var x u64 = 0
+        \\    serve {
+        \\        after 500:
+        \\
+    ++ handler ++
+        \\
+        \\    }
+        \\}
+    ;
+}
+
+test "joe A1.3: you cannot understate your appetite" {
+    // Five statements the compiler can add up exactly; `bounded 5` is a lie
+    // told in arithmetic, and arithmetic is checked now.
+    const src = comptime a13Src(
+        \\            bounded 5 {
+        \\                x += 1
+        \\                x += 2
+        \\            }
+    , "400");
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator, src, "W", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "understate") != null);
+}
+
+test "joe A1.3: a data-dependent extent demands a declaration" {
+    // n is runtime data — the analysis cannot see this bound, so the
+    // programmer must say it out loud (and the watchdog judges it).
+    const src = comptime a13Src(
+        \\            for i in 0..n { x += 1 }
+    , "400");
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator, src, "W", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "data-dependent") != null);
+}
+
+test "joe A1.3: a computed bound over budget demands a declaration" {
+    const src = comptime a13Src(
+        \\            for i in 0..100 { x += 1 }
+    , "400");
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator, src, "W", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "exceeds the watchdog") != null);
+}
+
+test "joe A1.3: an honest declaration over budget is accepted" {
+    const src = comptime a13Src(
+        \\            bounded 100000 {
+        \\                for i in 0..100 { x += 1 }
+        \\            }
+    , "400");
+    var r = try compile(testing.allocator, src, "W", .{}, null);
+    defer r.deinit();
+    try testing.expect(std.mem.indexOf(u8, r.asm_text, "WDEX ##100000") != null);
+}
+
+test "joe A1.3: a gratuitous bounded is rejected" {
+    // The handler fits the budget with room to spare: the declaration is
+    // noise, and the compiler will not accept it.
+    const src = comptime a13Src(
+        \\            bounded 300 { x += 1 }
+    , "100000");
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator, src, "W", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "gratuitous") != null);
+}
+
+test "joe A1.3: bounded without a watchdog is gratuitous too" {
+    const src =
+        \\actor A() {
+        \\    var x u64 = 0
+        \\    serve {
+        \\        after 500:
+        \\            bounded 100 { x += 1 }
+        \\    }
+        \\}
+    ;
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator, src, "A", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "nobody is counting") != null);
 }
 
 test "joe: the system block parses into a plan" {

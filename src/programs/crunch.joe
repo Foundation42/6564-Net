@@ -1,0 +1,51 @@
+// crunch.joe — Amendment 1's answer to `while`: the self-send loop.
+//
+// Unbounded compute fights the machine (parks, burst budgets, the
+// watchdog), so joe has no `while`. What it has instead is strictly
+// better: send yourself the next step. Every slice parks, so the work
+// is preemptible, budgeted, fairly scheduled, and visible in the CQ —
+// the watchdog never has to guess whether a loop is progress or a hang,
+// because each slice answers for itself. A message to yourself is
+// on-chip and lossless: same core, never rides the mesh.
+//
+// The Cruncher sums 1..n in slices of k per park. One thousand terms,
+// fifty per slice: twenty parks, one exact total.
+
+message Step { }
+message Total { v u64 }
+
+actor Cruncher(out addr, n u64, k u64) {
+    var i u64 = 0
+    var acc u64 = 0
+
+    send self, Step{}
+
+    serve {
+        case Step(_):
+            for j in 0..k {
+                if i < n {
+                    i += 1
+                    acc += i
+                }
+            }
+            if i < n { send self, Step{} }
+            else {
+                send out, Total{acc}
+                halt ok
+            }
+    }
+}
+
+actor Sink() {
+    var total u64 = 0
+    serve {
+        case Total(t):
+            total = t.v
+            quiesce
+    }
+}
+
+system {
+    cr = Cruncher(sink, 1000, 50) on 0
+    sink = Sink() on 0
+}
