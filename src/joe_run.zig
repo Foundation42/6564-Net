@@ -56,6 +56,9 @@ pub const Options = struct {
     jitter: u64 = 120,
     max_cycles: u64 = 50_000_000,
     trace: bool = false,
+    /// Item 4's verifier: poison registers at every real park. Compiled
+    /// joe must run identically — it never trusts the banked file.
+    scorch: bool = false,
 };
 
 pub const VarOut = struct { name: []const u8, value: u64 };
@@ -321,6 +324,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         },
         .max_cycles = opts.max_cycles,
         .trace = opts.trace,
+        .scorch_parks = opts.scorch,
     });
     defer m.deinit();
 

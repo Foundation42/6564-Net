@@ -49,7 +49,7 @@ const usage_text =
     \\      device on the peripheral row (§7) — SEND is the only I/O
     \\      instruction there is (programs/hello.asm).
     \\
-    \\  sim6564 joe [file.joe] [seed] [loss_ppm4k] [trace]
+    \\  sim6564 joe [file.joe] [seed] [loss_ppm4k] [trace] [scorch]
     \\      Compile and run any .joe file that carries a `system` block —
     \\      the deployment is data in the source, so there is no per-
     \\      program harness. Placement, capability wiring, parameter
@@ -189,7 +189,12 @@ pub fn main() !void {
             // teletype has no dedup, and doubled greetings help no one.
             if (opts.loss_ppm4k == 0) opts.dup_ppm4k = 0;
         }
-        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        while (args.next()) |s| {
+            if (std.mem.eql(u8, s, "trace")) opts.trace = true;
+            // Item 4's verifier: poison every register at every park.
+            // Compiled joe must not notice.
+            if (std.mem.eql(u8, s, "scorch")) opts.scorch = true;
+        }
         return sim.joe_run.run(alloc, source, opts);
     }
 

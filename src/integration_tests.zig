@@ -850,12 +850,76 @@ test "joe: the ring turns — 8 instances from one system block, token comes hom
         const name = try std.fmt.bufPrint(&name_buf, "n{d}", .{k});
         try testing.expectEqual(machine.CtxState.parked, o.instance(name).?.state);
     }
-    // The joe-ring baseline for handoff item 4: the bank-collapse
-    // measurement runs THIS ring and reads THIS number. Naive v1
-    // codegen paces well over the hand-written 60 cy/pass; a guard at
-    // 130 catches regressions without blessing the current cost.
+    // Handoff item 4, the pre-registered claim, answered: naive v1
+    // codegen paid 110 cy/pass; the prediction said the collapsed-
+    // register convention would hold it under 70; the burst-liveness
+    // codegen measures 55 — under the hand-written ring's 60. The
+    // convention beat the heroics. The guard holds the prediction, not
+    // the achievement, so honest codegen changes have room to breathe.
     const cy_per_pass = o.cycles / 800;
-    try testing.expect(cy_per_pass < 130);
+    try testing.expect(cy_per_pass < 70);
+}
+
+test "item 4: the joe corpus is scorch-invariant — nothing trusts the banked file" {
+    // The bank-collapse verifier: registers (A, X, Y, SP, P) are
+    // poisoned at every real park. If any compiled program ran on the
+    // banked register file's memory, states, vars, console output or
+    // even the cycle count would diverge. They must not: a context is
+    // near page + run-queue entry + control block, nothing else.
+    const joe_run = @import("joe_run.zig");
+    const sources = [_][]const u8{
+        @embedFile("programs/pingpong.joe"),
+        @embedFile("programs/ring.joe"),
+        @embedFile("programs/crunch.joe"),
+        @embedFile("programs/supervise.joe"),
+        @embedFile("programs/scatter.joe"),
+        @embedFile("programs/pipeline.joe"),
+        @embedFile("programs/hello.joe"),
+    };
+    for (sources) |src| {
+        var plain = try joe_run.simulate(testing.allocator, src, .{});
+        defer plain.deinit();
+        var burnt = try joe_run.simulate(testing.allocator, src, .{ .scorch = true });
+        defer burnt.deinit();
+        try testing.expectEqual(plain.reason, burnt.reason);
+        try testing.expectEqual(plain.cycles, burnt.cycles);
+        try testing.expectEqual(plain.instances.len, burnt.instances.len);
+        for (plain.instances, burnt.instances) |*p, *b| {
+            try testing.expectEqualStrings(p.name, b.name);
+            try testing.expectEqual(p.state, b.state);
+            try testing.expectEqual(p.fault, b.fault);
+            for (p.vars, b.vars) |pv, bv| {
+                try testing.expectEqualStrings(pv.name, bv.name);
+                try testing.expectEqual(pv.value, bv.value);
+            }
+        }
+        if (plain.console) |pc| try testing.expectEqualStrings(pc, burnt.console.?);
+    }
+}
+
+test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
+    // Under the collapse, SP is as volatile as A. Compiled code uses
+    // static near-page temporaries instead of the stack, so there is
+    // not one push in the whole corpus — init included.
+    const joe = @import("joe.zig");
+    const corpus = [_]struct { src: []const u8, actors: []const []const u8 }{
+        .{ .src = @embedFile("programs/pingpong.joe"), .actors = &.{ "Pinger", "Ponger" } },
+        .{ .src = @embedFile("programs/ring.joe"), .actors = &.{ "Head", "Node" } },
+        .{ .src = @embedFile("programs/crunch.joe"), .actors = &.{ "Cruncher", "Sink" } },
+        .{ .src = @embedFile("programs/supervise.joe"), .actors = &.{ "Boss", "Griefer", "Sleeper" } },
+        .{ .src = @embedFile("programs/forkjoin.joe"), .actors = &.{ "Root", "Lieutenant", "Worker" } },
+        .{ .src = @embedFile("programs/pipeline.joe"), .actors = &.{ "Source", "Stage", "Sink" } },
+        .{ .src = @embedFile("programs/hello.joe"), .actors = &.{"Greeter"} },
+    };
+    for (corpus) |entry| {
+        for (entry.actors) |name| {
+            var r = try joe.compile(testing.allocator, entry.src, name, .{}, null);
+            defer r.deinit();
+            for ([_][]const u8{ "PHA", "PLA", "PHX", "PLX", "PHY", "PLY", "PHP", "PLP", "TXS", "TSX" }) |op| {
+                try testing.expect(std.mem.indexOf(u8, r.asm_text, op) == null);
+            }
+        }
+    }
 }
 
 test "joe: supervision — spawn, respawn, hung, abandoned, all from the system block" {

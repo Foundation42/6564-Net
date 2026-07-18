@@ -642,3 +642,82 @@ vector unit would be front-running silicon.
 101 tests green (8 new: 6 checker rejections/acceptances, `while`'s
 targeted error, crunch end-to-end). Frozen table intact; ring.joe
 still 110 cy/pass, still item 4's starting line.
+
+## Item 4: the bank collapse, measured — the convention beats the heroics (2026-07-18)
+
+The §1 decision — registers become one shared set, volatile across
+parks; a context is near page + run-queue entry + control block — was
+pre-registered with predictions on the record: *ring stays under 70
+cy/pass; the spill tax is smaller than feared.* The experiment ran as
+specified: through joe, no hand-conversion heroics, the compiler's
+park-point liveness as the register allocator.
+
+**ring.joe: 110 → 55.26 cy/pass. The hand-written ring pays 60.**
+
+The compiled ring now beats the hand assembly it was chasing. The whole
+Node serve loop is 13 instructions: a 35-cycle deliver burst and a
+12-cycle ack burst. The prediction said the collapse convention would
+cost little; it turned out to cost *less than nothing*, because the
+convention forced discipline the hand ring never had:
+
+- **The fused deliver test.** word0's low 16 bits are status<<8|tag, so
+  `AND ##$FFFF / CMP #3` accepts exactly a clean delivery in ONE
+  compare — acks, exits, timer ticks and empty pops all fail the same
+  test. The old dispatcher's separate status check, tag check, and
+  empty-pop branch are gone.
+- **Registers are free within a burst.** word0 rides in Y only when an
+  exit or timer path will want it; the message tag is compared in A
+  down a 2-instruction-per-miss ladder; a sole unguarded case skips
+  the tag test entirely (the wire is closed — every sender compiles
+  from the same source, one pattern means every delivery matches).
+- **Sends compose in A.** The near-page `_acc` is touched only between
+  field evaluations of multi-field messages; single-field messages
+  never touch it. Masks dedup: a literal masks at compile time, a
+  bound field was masked by its own load.
+- **Direct operands.** `x += 1` is INC; compares and arithmetic with a
+  literal or scalar-slot right side address it directly; `== 0` costs
+  nothing (every evaluation ends setting Z).
+- **The stack is cold.** Expression temporaries are static near-page
+  slots (depth known at compile time, four deep, refused honestly
+  beyond). There is not one push in the compiled corpus — so even SP
+  owes the parks nothing, exactly as §1 demands.
+
+The corpus, before → after (same seeds, same loss):
+
+| program | naive v1 | item 4 | hand |
+|---|---|---|---|
+| ring (cy/pass) | 110 | **55.26** | 60 |
+| pingpong (cy / instr) | 11,125 / 1,056 | **11,078 / 745** | 11,022 / 688 |
+| crunch (cy) | 75,293 | **41,091** | — |
+| forkjoin, 1,009 actors (cy) | 1,260,000 | **955,190** | — |
+| supervise (cy) | 5,367 | 5,366 | — |
+
+pingpong sits at +0.5% cycles and +8% instructions against the hand
+protocol — the makespan is latency-dominated, and the code-side gap
+closed from +53% instructions to +8%. forkjoin's full-scale makespan
+dropped 24% and still joins to the exact sum at 25% loss.
+
+**The proof is scorched earth, not inspection.** The machine grew
+`scorch_parks`: at every real park (LSTN that parks, YLD) it poisons
+A, X, Y, SP and P with $DEAD6564DEAD6564 and sets every flag — the
+maximally hostile implementation the collapsed convention permits.
+The entire joe corpus runs **cycle-identical** under it (states, vars,
+console bytes, cycle counts — asserted in the suite; also from the
+CLI: `sim6564 joe file.joe seed loss scorch`). Nothing compiled ever
+trusted the banked file.
+
+**Verdict for v2.6 (Christian's call to make, numbers now on the
+table):** the collapse pays. Registers were never where state lived —
+the 6502 knew this; variables live in the near page and registers are
+burst-scratch. What silicon buys back: the per-context register file
+deleted, SPWN's register reset deleted, the zero-cycle switch now
+literally zero mechanism. What it costs: the architected control-block
+stripe (incarnation, exit link, watchdog budgets) with hardware write
+protection against the owning context — the one new mechanism, spec
+work for the v2.6 draft (item 8).
+
+103 tests green (scorch invariance across seven programs, stack-free
+corpus assertion, ring guard moved 130 → 70 = the prediction, not the
+achievement). Frozen asm table untouched — the hand corpus never
+changed, which is the point: the convention was measured, not the
+programmer.

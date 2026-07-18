@@ -154,7 +154,27 @@ pub const Config = struct {
     max_cycles: u64 = 10_000_000,
     /// Print scheduler / RBC / fabric events to stderr as they happen.
     trace: bool = false,
+    /// The bank-collapse verifier (handoff item 1/§1): poison A, X, Y, SP
+    /// and P at every voluntary park (LSTN that actually parks, YLD). This
+    /// is the maximally hostile implementation the collapsed-register
+    /// convention permits — registers are one shared set, volatile across
+    /// parks, and a context is only near page + run-queue entry + control
+    /// block. Code that runs identically with this on has proven it never
+    /// relied on the banked file.
+    scorch_parks: bool = false,
 };
+
+/// The poison stamped into registers at a scorched park — recognizable in
+/// any trace, guaranteed not to look like a valid pointer or count.
+pub const scorch_pattern: u64 = 0xDEAD_6564_DEAD_6564;
+
+fn scorch(ctx: *Context) void {
+    ctx.a = scorch_pattern;
+    ctx.x = scorch_pattern;
+    ctx.y = scorch_pattern;
+    ctx.sp = scorch_pattern;
+    ctx.p = .{ .z = true, .n = true, .c = true, .v = true };
+}
 
 pub const StopReason = enum { all_halted, faulted, deadlock, max_cycles };
 
@@ -1345,6 +1365,7 @@ pub const Machine = struct {
                     self.trace("c{d}x{d} @{d} LSTN parks on slot{d}", .{ core.id, ctx_idx, core.clock, desc_slot });
                     ctx.state = .parked;
                     ctx.park_slot = desc_slot;
+                    if (self.cfg.scorch_parks) scorch(ctx);
                     // Resume after the LSTN once the ring has data.
                     return .switched_out;
                 }
@@ -1355,6 +1376,7 @@ pub const Machine = struct {
             },
             .yld => {
                 try core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = ctx.ip });
+                if (self.cfg.scorch_parks) scorch(ctx);
                 return .switched_out;
             },
             .cqpop => {

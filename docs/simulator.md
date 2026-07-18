@@ -520,6 +520,43 @@ The amendment's verdict — *`while` dies, `for` becomes replicated PAR,
   (handoff item 5) — they are surface syntax for a vector unit the
   machine does not have yet, and joe does not front-run silicon.
 
+## The bank collapse, measured through joe (post-v2.5 handoff item 4, §1)
+
+The §1 decision — every context switch is voluntary or fatal, so the
+banked register file can collapse to one shared set, volatile across
+parks — was measured, not assumed. Implementation notes:
+
+- **The compiler is the register allocator.** joe codegen treats the
+  clobber set (`LSTN`, `YLD`, `RECV`, `SEND`) as a full clobber of A,
+  X, Y, SP and P, and spends registers freely *within* a burst: fused
+  one-compare deliver test (`status<<8|tag` vs `#3`), word0 in Y only
+  where an exit/timer path needs it, message tags compared down a
+  ladder in A (sole unguarded case: no tag test — the wire is closed),
+  sends composed in A, direct-operand arithmetic (`INC` for `+= 1`,
+  `CMP #imm`/`CMP $slot`, `== 0` free off the Z flag).
+- **The stack is not used after init — or before it.** Expression
+  temporaries are static near-page slots (`_tmp0..3`, depth tracked at
+  compile time, refused honestly past four). The compiled corpus
+  contains zero stack operations, so SP requires nothing preserved,
+  exactly as §1's clobber set demands. `machine.scorch_pattern` fills
+  every register at every real park when `Config.scorch_parks` is on —
+  the maximally hostile legal implementation — and the joe corpus runs
+  cycle-identical under it (suite-asserted; CLI: `... scorch`).
+- **Result: ring.joe 110 → 55.26 cy/pass, hand ring 60.** The
+  pre-registered prediction was <70. Full table and the v2.6 verdict
+  in docs/measurements.md.
+- The **sole-case dispatch elision** is a deliberate semantic choice,
+  recorded here: an actor with exactly one unguarded `case` treats
+  every clean delivery as that message. The wire is closed (all
+  senders compile from the same source), so one pattern is a total
+  match; a mis-wired sender would be misparsed rather than dropped.
+  If joe ever gains separately-compiled systems, this elision needs a
+  linker-level revisit.
+- The control-block near-page stripe (privileged, write-protected
+  against the owning context: incarnation, exit link, watchdog base +
+  ceiling) is the one new silicon mechanism the collapse requires — it
+  rides with the v2.6 spec draft, not the simulator measurement.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

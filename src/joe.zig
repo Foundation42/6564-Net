@@ -1110,6 +1110,12 @@ const Gen = struct {
     /// `send self` ships through this slot: a capability to the actor's
     /// own RX ring, loader-staged (Amendment 1's self-send loop).
     off_self: u16 = 0,
+    /// Expression temporaries (item 4): a static near-page stack, depth
+    /// known at compile time. Compiled code never touches SP after init —
+    /// under the collapsed-register convention even the stack pointer is
+    /// volatile across parks, so the stack is simply not used.
+    off_tmp: u16 = 0,
+    tdepth: u8 = 0,
     /// First free near slot after the fixed layout — loop variables and
     /// bindings are handed out from here.
     next_slot: u16 = 0,
@@ -1202,7 +1208,8 @@ const Gen = struct {
         self.off_tarmed = off + 64;
         self.off_elem = off + 72;
         self.off_self = off + 80;
-        self.spawn_base = off + 88;
+        self.off_tmp = off + 88; // 4 slots
+        self.spawn_base = off + 120;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
@@ -1286,6 +1293,49 @@ const Gen = struct {
 
     // ── Expressions: result in A ─────────────────────────────────────────
 
+    /// A value that can be an operand directly — a literal (imm) or a
+    /// scalar near-page slot — so binary ops and compares skip the
+    /// evaluate-spill-reload dance entirely (item 4: registers are free
+    /// within a burst; the near page is for state that crosses parks).
+    const Operand = union(enum) { imm: u64, slot: u16 };
+
+    fn simpleOperand(self: *Gen, e: *const Expr) ?Operand {
+        switch (e.*) {
+            .int => |v| return .{ .imm = v },
+            .ident => |name| {
+                if (self.exit_code_bind != null and std.mem.eql(u8, self.exit_code_bind.?, name))
+                    return .{ .slot = self.off_ecode };
+                if (self.bind != null and std.mem.eql(u8, self.bind.?, name)) return null;
+                if (self.exit_bind != null and std.mem.eql(u8, self.exit_bind.?, name)) return null;
+                if (self.slots.get(name)) |s| return .{ .slot = s };
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Emit `MNEM <operand>` for a simple operand: `#v`, `##$V` or `$slot`.
+    fn opSimple(self: *Gen, comptime mnem: []const u8, opr: Operand) Error!void {
+        switch (opr) {
+            .imm => |v| try self.w("        " ++ mnem ++ " {s}", .{try self.imm(v)}),
+            .slot => |s| try self.w("        " ++ mnem ++ " ${X}", .{s}),
+        }
+    }
+
+    /// A static temp slot for the current expression depth. Depth > 4
+    /// would need a fifth slot; v1 rejects it honestly.
+    fn pushTmp(self: *Gen) Error!u16 {
+        if (self.tdepth >= 4)
+            return self.fail(0, "expression too deep (v1 nests four temporaries)", Error.Unsupported);
+        const s = self.off_tmp + @as(u16, self.tdepth) * 8;
+        self.tdepth += 1;
+        return s;
+    }
+
+    fn popTmp(self: *Gen) void {
+        self.tdepth -= 1;
+    }
+
     fn evalInto(self: *Gen, e: *const Expr) Error!void {
         switch (e.*) {
             .int => |v| {
@@ -1367,25 +1417,47 @@ const Gen = struct {
                         try self.w("        {s} #{d}", .{ mn, b.r.int });
                     },
                     .add, .sub, .band, .bor, .bxor => {
-                        try self.evalInto(b.l);
-                        try self.w("        PHA", .{});
+                        if (self.simpleOperand(b.r)) |opr| {
+                            // A = l, then one direct-operand instruction.
+                            try self.evalInto(b.l);
+                            switch (b.op) {
+                                .add => {
+                                    try self.w("        CLC", .{});
+                                    try self.opSimple("ADC", opr);
+                                },
+                                .sub => {
+                                    try self.w("        SEC", .{});
+                                    try self.opSimple("SBC", opr);
+                                },
+                                .band => try self.opSimple("AND", opr),
+                                .bor => try self.opSimple("ORA", opr),
+                                .bxor => try self.opSimple("EOR", opr),
+                                else => unreachable,
+                            }
+                            return;
+                        }
+                        // Complex right side: r first into a static temp,
+                        // then l in A against it (evaluation is pure, so
+                        // the reorder is free — and the stack stays cold).
+                        const tmp = try self.pushTmp();
                         try self.evalInto(b.r);
-                        try self.w("        STA ${X}", .{self.off_t});
-                        try self.w("        PLA", .{});
+                        try self.w("        STA ${X}", .{tmp});
+                        try self.evalInto(b.l);
                         switch (b.op) {
                             .add => {
                                 try self.w("        CLC", .{});
-                                try self.w("        ADC ${X}", .{self.off_t});
+                                try self.w("        ADC ${X}", .{tmp});
                             },
                             .sub => {
                                 try self.w("        SEC", .{});
-                                try self.w("        SBC ${X}", .{self.off_t});
+                                try self.w("        SBC ${X}", .{tmp});
                             },
-                            .band => try self.w("        AND ${X}", .{self.off_t}),
-                            .bor => try self.w("        ORA ${X}", .{self.off_t}),
-                            .bxor => try self.w("        EOR ${X}", .{self.off_t}),
+                            .band => try self.w("        AND ${X}", .{tmp}),
+                            .bor => try self.w("        ORA ${X}", .{tmp}),
+                            .bxor => try self.w("        EOR ${X}", .{tmp}),
                             else => unreachable,
                         }
+                        self.popTmp();
                     },
                 }
             },
@@ -1408,12 +1480,21 @@ const Gen = struct {
             else => return self.fail(0, "a condition must compare something (v1)", Error.Unsupported),
         }
         // A = left, M = right; CMP sets flags from A − M (unsigned).
-        try self.evalInto(b.l);
-        try self.w("        PHA", .{});
-        try self.evalInto(b.r);
-        try self.w("        STA ${X}", .{self.off_t});
-        try self.w("        PLA", .{});
-        try self.w("        CMP ${X}", .{self.off_t});
+        if (b.r.* == .int and b.r.int == 0 and (b.op == .eq or b.op == .ne)) {
+            // `x == 0` / `x != 0`: every evaluation ends in an instruction
+            // that sets Z from A — the compare is already done.
+            try self.evalInto(b.l);
+        } else if (self.simpleOperand(b.r)) |opr| {
+            try self.evalInto(b.l);
+            try self.opSimple("CMP", opr);
+        } else {
+            const tmp = try self.pushTmp();
+            try self.evalInto(b.r);
+            try self.w("        STA ${X}", .{tmp});
+            try self.evalInto(b.l);
+            try self.w("        CMP ${X}", .{tmp});
+            self.popTmp();
+        }
         switch (b.op) {
             .eq => try self.w("        BNE L{d}", .{target}),
             .ne => try self.w("        BEQ L{d}", .{target}),
@@ -1448,13 +1529,23 @@ const Gen = struct {
                         return self.fail(0, "not an array", Error.Semantics);
                     if (a.op != .set)
                         return self.fail(0, "v1 array assignment is `=` only", Error.Unsupported);
+                    if (self.simpleOperand(a.expr)) |opr| {
+                        try self.evalInto(ix);
+                        try self.w("        ASL #3", .{});
+                        try self.w("        TAY", .{});
+                        try self.opSimple("LDA", opr);
+                        try self.w("        STA (${X}),Y", .{arr.ptr_slot});
+                        return;
+                    }
+                    const tmp = try self.pushTmp();
                     try self.evalInto(a.expr);
-                    try self.w("        PHA", .{});
+                    try self.w("        STA ${X}", .{tmp});
                     try self.evalInto(ix);
                     try self.w("        ASL #3", .{});
                     try self.w("        TAY", .{});
-                    try self.w("        PLA", .{});
+                    try self.w("        LDA ${X}", .{tmp});
                     try self.w("        STA (${X}),Y", .{arr.ptr_slot});
+                    self.popTmp();
                     return;
                 }
                 const slot = self.slots.get(a.name) orelse
@@ -1465,15 +1556,38 @@ const Gen = struct {
                         try self.w("        STA ${X}", .{slot});
                     },
                     .add, .sub => {
-                        try self.evalInto(a.expr);
-                        try self.w("        STA ${X}", .{self.off_t});
-                        try self.w("        LDA ${X}", .{slot});
+                        // `x += 1` is what INC is for.
+                        if (a.expr.* == .int and a.expr.int == 1) {
+                            try self.w("        {s} ${X}", .{
+                                if (a.op == .add) @as([]const u8, "INC") else "DEC", slot,
+                            });
+                            return;
+                        }
+                        if (self.simpleOperand(a.expr)) |opr| {
+                            try self.w("        LDA ${X}", .{slot});
+                            if (a.op == .add) {
+                                try self.w("        CLC", .{});
+                                try self.opSimple("ADC", opr);
+                            } else {
+                                try self.w("        SEC", .{});
+                                try self.opSimple("SBC", opr);
+                            }
+                            try self.w("        STA ${X}", .{slot});
+                            return;
+                        }
                         if (a.op == .add) {
+                            // Commutative: A = e, then add the slot in.
+                            try self.evalInto(a.expr);
                             try self.w("        CLC", .{});
-                            try self.w("        ADC ${X}", .{self.off_t});
+                            try self.w("        ADC ${X}", .{slot});
                         } else {
+                            const tmp = try self.pushTmp();
+                            try self.evalInto(a.expr);
+                            try self.w("        STA ${X}", .{tmp});
+                            try self.w("        LDA ${X}", .{slot});
                             try self.w("        SEC", .{});
-                            try self.w("        SBC ${X}", .{self.off_t});
+                            try self.w("        SBC ${X}", .{tmp});
+                            self.popTmp();
                         }
                         try self.w("        STA ${X}", .{slot});
                     },
@@ -1549,10 +1663,15 @@ const Gen = struct {
                 try self.evalInto(f.from);
                 try self.w("        STA ${X}", .{kslot});
                 try self.w("L{d}:", .{l_top});
-                try self.evalInto(f.to);
-                try self.w("        STA ${X}", .{self.off_t});
-                try self.w("        LDA ${X}", .{kslot});
-                try self.w("        CMP ${X}", .{self.off_t});
+                if (self.simpleOperand(f.to)) |opr| {
+                    try self.w("        LDA ${X}", .{kslot});
+                    try self.opSimple("CMP", opr);
+                } else {
+                    try self.evalInto(f.to);
+                    try self.w("        STA ${X}", .{self.off_t});
+                    try self.w("        LDA ${X}", .{kslot});
+                    try self.w("        CMP ${X}", .{self.off_t});
+                }
                 try self.w("        BCS L{d}", .{l_end});
                 try self.stmts(f.body);
                 try self.w("        INC ${X}", .{kslot});
@@ -1612,6 +1731,47 @@ const Gen = struct {
         }
     }
 
+    /// Evaluate a message-field argument into A, masked to the field's
+    /// width — skipping the mask when the value provably fits: a literal
+    /// masks at compile time, a bound field was masked by its own load.
+    fn evalArg(self: *Gen, arg: *const Expr, f: *const Field) Error!void {
+        const mask: u64 = if (f.ty.size() < 8)
+            (@as(u64, 1) << @intCast(f.ty.size() * 8)) - 1
+        else
+            ~@as(u64, 0);
+        if (arg.* == .int) {
+            const v = arg.int & mask;
+            if (v <= 127) {
+                try self.w("        LDA #{d}", .{v});
+            } else {
+                try self.w("        LDA ##${X}", .{v});
+            }
+            return;
+        }
+        try self.evalInto(arg);
+        if (f.ty.size() < 8 and self.maskedTo(arg) > f.ty.size())
+            try self.w("        AND ##${X}", .{mask});
+    }
+
+    /// The width in bytes an evaluated expression provably fits after
+    /// evalInto (8 = unknown): a case binding's field is masked to its
+    /// declared size by the load itself.
+    fn maskedTo(self: *Gen, e: *const Expr) u16 {
+        switch (e.*) {
+            .field => |fx| {
+                if (self.bind != null and std.mem.eql(u8, self.bind.?, fx.base)) {
+                    if (self.bind_msg) |m| {
+                        for (m.fields) |*fl| {
+                            if (std.mem.eql(u8, fl.name, fx.name)) return fl.ty.size();
+                        }
+                    }
+                }
+                return 8;
+            },
+            else => return 8,
+        }
+    }
+
     /// `send target, Msg{args}` — build the wire image and ship it. ≤ 8
     /// bytes rides TXR through the target's near-page slot; larger stages
     /// at msg_staging and rides SEND 0. Fire and forget either way: the
@@ -1642,53 +1802,48 @@ const Gen = struct {
             return self.fail(sd.line, "unknown send target", Error.Semantics);
 
         if (msg.wire_size <= 8) {
-            // TXR path: compose tag | fields into A.
-            try self.w("        LDA {s}", .{try self.imm(msg.tag)});
-            try self.w("        STA ${X}", .{self.off_acc});
-            for (msg.fields, sd.args) |*f, arg| {
-                try self.evalInto(arg);
-                if (f.ty.size() < 8) {
-                    const mask: u64 = (@as(u64, 1) << @intCast(f.ty.size() * 8)) - 1;
-                    try self.w("        AND ##${X}", .{mask});
-                }
-                if (f.offset != 0) try self.w("        ASL #{d}", .{f.offset * 8});
-                try self.w("        ORA ${X}", .{self.off_acc});
-                try self.w("        STA ${X}", .{self.off_acc});
-            }
-            try self.w("        LDA ${X}", .{self.off_acc});
-            try self.w("        TXR (${X})", .{tslot});
-            return;
-        }
-        // SEND path: stage the image word by word, then one SQE.
-        var word: u16 = 0;
-        while (word * 8 < msg.wire_size) : (word += 1) {
-            var first = true;
-            for (msg.fields, sd.args) |*f, arg| {
-                if (f.offset / 8 != word) continue;
-                try self.evalInto(arg);
-                if (f.ty.size() < 8) {
-                    const mask: u64 = (@as(u64, 1) << @intCast(f.ty.size() * 8)) - 1;
-                    try self.w("        AND ##${X}", .{mask});
-                }
-                const bit = (f.offset % 8) * 8;
-                if (bit != 0) try self.w("        ASL #{d}", .{bit});
-                if (word == 0 or !first) {
-                    if (first) {
-                        // word 0 starts from the tag
+            // TXR path (item 4): the wire word composes in A — the near
+            // page holds a partial only between field evaluations, and a
+            // single-field message never touches it at all.
+            if (msg.fields.len == 0) {
+                try self.w("        LDA {s}", .{try self.imm(msg.tag)});
+            } else {
+                for (msg.fields, sd.args, 0..) |*f, arg, i| {
+                    try self.evalArg(arg, f);
+                    if (f.offset != 0) try self.w("        ASL #{d}", .{f.offset * 8});
+                    if (i == 0) {
                         try self.w("        ORA {s}", .{try self.imm(msg.tag)});
                     } else {
                         try self.w("        ORA ${X}", .{self.off_acc});
                     }
+                    if (i + 1 < msg.fields.len) try self.w("        STA ${X}", .{self.off_acc});
                 }
-                try self.w("        STA ${X}", .{self.off_acc});
-                first = false;
             }
-            if (first) {
+            try self.w("        TXR (${X})", .{tslot});
+            return;
+        }
+        // SEND path: each staged word composes in A the same way and
+        // stores straight to the staging buffer.
+        var word: u16 = 0;
+        while (word * 8 < msg.wire_size) : (word += 1) {
+            var have = false;
+            for (msg.fields, sd.args) |*f, arg| {
+                if (f.offset / 8 != word) continue;
+                if (have) try self.w("        STA ${X}", .{self.off_acc});
+                try self.evalArg(arg, f);
+                const bit = (f.offset % 8) * 8;
+                if (bit != 0) try self.w("        ASL #{d}", .{bit});
+                if (word == 0 and !have) {
+                    try self.w("        ORA {s}", .{try self.imm(msg.tag)});
+                } else if (have) {
+                    try self.w("        ORA ${X}", .{self.off_acc});
+                }
+                have = true;
+            }
+            if (!have) {
                 // no fields in this word: tag alone (word 0) or zero
                 try self.w("        LDA {s}", .{if (word == 0) try self.imm(msg.tag) else "#0"});
-                try self.w("        STA ${X}", .{self.off_acc});
             }
-            try self.w("        LDA ${X}", .{self.off_acc});
             try self.w("        STA !${X}", .{self.layout.staging() + word * 8});
         }
         try self.w("        LDA #1              ; SQE: op = send", .{});
@@ -1816,74 +1971,61 @@ const Gen = struct {
         const serve_cost_start = self.cost;
         self.serve_label = self.label();
         self.quiesce_label = self.label();
-        const l_dispatch = self.label();
         const l_exit = self.label();
-        try self.w("; serve: LSTN, pop, dispatch — acks are consumed, never seen", .{});
+        // The fused deliver test (item 4): word0 low 16 = status<<8 | tag,
+        // so `AND ##$FFFF / CMP #deliver` accepts exactly a clean delivery
+        // in one compare — acks, exits, timers and empty pops all fail it.
+        // word0 rides in Y (registers are free within a burst); the near
+        // page is touched only for what the handlers actually need.
+        const has_other = self.uses_timer or self.spawn_count > 0;
+        const l_other = if (has_other) self.label() else self.serve_label;
+        try self.w("; serve: LSTN, pop, fused deliver test — acks fail one compare", .{});
         try self.w("L{d}:   LSTN 1", .{self.serve_label});
         try self.w("        CQPOP 1", .{});
-        try self.w("        BEQ L{d}", .{self.serve_label});
-        try self.w("        STA ${X}", .{self.off_w0});
-        try self.w("        STX ${X}", .{self.off_ptr});
-        try self.w("        AND #$FF", .{});
+        if (has_other) try self.w("        TAY", .{});
+        try self.w("        AND ##$FFFF", .{});
         try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});
-        try self.w("        BEQ L{d}", .{l_dispatch});
-        if (self.spawn_count > 0) {
-            try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.exit)});
-            try self.w("        BEQ L{d}", .{l_exit});
-        }
-        if (self.uses_timer) {
-            // tag 1 (txr) + cookie $77 = the timer; everything else is ack noise
-            try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.txr)});
-            try self.w("        BNE L{d}", .{self.serve_label});
-            try self.w("        LDA ${X}", .{self.off_ptr});
-            try self.w("        AND ##$FFFFFFFF", .{});
-            try self.w("        CMP #{d}", .{abi.timer_cookie});
-            try self.w("        BNE L{d}", .{self.serve_label});
-            self.in_handler = true;
-            for (self.actor.handlers) |*h| {
-                if (h.* == .after) {
-                    const bm = self.beginBurst();
-                    try self.stmts(h.after.body);
-                    try self.endBurst(bm, h.after.line, false);
-                    break;
-                }
-            }
-            self.in_handler = false;
-            try self.w("        BRA L{d}", .{self.serve_label});
-        } else {
-            try self.w("        BRA L{d}", .{self.serve_label});
-        }
+        try self.w("        BNE L{d}", .{l_other});
+        try self.w("        STX ${X}", .{self.off_ptr});
+        try self.emitCaseLadder(self.actor.handlers, self.serve_label);
 
-        // deliveries: clean status, then first-match tag + guard chain
-        try self.w("L{d}:   LDA ${X}", .{ l_dispatch, self.off_w0 });
-        try self.w("        LSR #8", .{});
-        try self.w("        AND #$FF", .{});
-        try self.w("        BNE L{d}", .{self.serve_label});
-        for (self.actor.handlers) |*h| {
-            if (h.* != .case) continue;
-            const c = h.case;
-            const msg = self.message(c.msg) orelse
-                return self.fail(c.line, "unknown message in case", Error.Semantics);
-            const l_next = self.label();
-            try self.w("; case {s}({s})", .{ c.msg, c.bind orelse "_" });
-            try self.w("        LDA (${X})", .{self.off_ptr});
-            try self.w("        AND ##$FFFF", .{});
-            try self.w("        CMP {s}", .{try self.imm(msg.tag)});
-            try self.w("        BNE L{d}", .{l_next});
-            self.bind = c.bind;
-            self.bind_msg = msg;
-            if (c.where) |g| try self.branchIfFalse(g, l_next);
-            self.in_handler = true;
-            const bm = self.beginBurst();
-            try self.stmts(c.body);
-            try self.endBurst(bm, c.line, false);
-            self.in_handler = false;
-            self.bind = null;
-            self.bind_msg = null;
+        if (has_other) {
+            try self.w("; not a delivery: exit and timer peel off, acks fall through", .{});
+            try self.w("L{d}:", .{l_other});
+            if (self.spawn_count > 0) {
+                const l_not_exit = self.label();
+                try self.w("        TYA", .{});
+                try self.w("        AND #$FF", .{});
+                try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.exit)});
+                try self.w("        BNE L{d}", .{l_not_exit});
+                try self.w("        STY ${X}", .{self.off_w0});
+                try self.w("        STX ${X}", .{self.off_ptr});
+                try self.w("        BRA L{d}", .{l_exit});
+                try self.w("L{d}:", .{l_not_exit});
+            }
+            if (self.uses_timer) {
+                // tag 1 (txr) + cookie $77 in X = the timer tick
+                try self.w("        TYA", .{});
+                try self.w("        AND #$FF", .{});
+                try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.txr)});
+                try self.w("        BNE L{d}", .{self.serve_label});
+                try self.w("        TXA", .{});
+                try self.w("        AND ##$FFFFFFFF", .{});
+                try self.w("        CMP #{d}", .{abi.timer_cookie});
+                try self.w("        BNE L{d}", .{self.serve_label});
+                self.in_handler = true;
+                for (self.actor.handlers) |*h| {
+                    if (h.* == .after) {
+                        const bm = self.beginBurst();
+                        try self.stmts(h.after.body);
+                        try self.endBurst(bm, h.after.line, false);
+                        break;
+                    }
+                }
+                self.in_handler = false;
+            }
             try self.w("        BRA L{d}", .{self.serve_label});
-            try self.w("L{d}:", .{l_next});
         }
-        try self.w("        BRA L{d}", .{self.serve_label});
 
         if (self.spawn_count > 0) try self.emitExitRuntime(l_exit);
         if (self.has_quiesce) try self.emitQuiesce();
@@ -1966,43 +2108,62 @@ const Gen = struct {
         }
     }
 
-    /// The lame-duck loop (sketch §2.3): a restricted case set, no
-    /// timers, everything else consumed in silence. Stragglers converge;
-    /// the machine goes quiet instead of staying awake.
-    fn emitQuiesce(self: *Gen) Error!void {
-        const lq = self.quiesce_label;
-        const l_dispatch = self.label();
-        // Case-body BRAs loop back to the quiesce serve, not the live one.
-        const saved = self.serve_label;
-        self.serve_label = lq;
-        defer self.serve_label = saved;
-        try self.w("; quiesce: the lame-duck serve", .{});
-        try self.w("L{d}:   LSTN 1", .{lq});
-        try self.w("        CQPOP 1", .{});
-        try self.w("        BEQ L{d}", .{lq});
-        try self.w("        STA ${X}", .{self.off_w0});
-        try self.w("        STX ${X}", .{self.off_ptr});
-        try self.w("        AND #$FF", .{});
-        try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});
-        try self.w("        BEQ L{d}", .{l_dispatch});
-        try self.w("        BRA L{d}", .{lq});
-        try self.w("L{d}:   LDA ${X}", .{ l_dispatch, self.off_w0 });
-        try self.w("        LSR #8", .{});
-        try self.w("        AND #$FF", .{});
-        try self.w("        BNE L{d}", .{lq});
-        for (self.actor.quiesce) |*h| {
+    /// The delivery dispatch (item 4): the message tag once in A, then a
+    /// compare ladder — two instructions per non-matching case, guards
+    /// reloading the stashed tag on failure. A sole unguarded case skips
+    /// the test entirely: the wire is closed (every sender compiles from
+    /// this same source), so one pattern means every delivery matches.
+    fn emitCaseLadder(self: *Gen, handlers: []const Handler, loop_label: usize) Error!void {
+        var case_count: usize = 0;
+        var any_guard = false;
+        for (handlers) |*h| {
+            if (h.* != .case) continue;
+            case_count += 1;
+            if (h.case.where != null) any_guard = true;
+        }
+        if (case_count == 0) {
+            try self.w("        BRA L{d}", .{loop_label});
+            return;
+        }
+        if (case_count == 1 and !any_guard) {
+            for (handlers) |*h| {
+                if (h.* != .case) continue;
+                const c = h.case;
+                const msg = self.message(c.msg) orelse
+                    return self.fail(c.line, "unknown message in case", Error.Semantics);
+                try self.w("; case {s}({s}) — sole pattern, closed wire: no tag test", .{ c.msg, c.bind orelse "_" });
+                self.bind = c.bind;
+                self.bind_msg = msg;
+                self.in_handler = true;
+                const bm = self.beginBurst();
+                try self.stmts(c.body);
+                try self.endBurst(bm, c.line, false);
+                self.in_handler = false;
+                self.bind = null;
+                self.bind_msg = null;
+                try self.w("        BRA L{d}", .{loop_label});
+            }
+            return;
+        }
+        try self.w("        LDA (${X})", .{self.off_ptr});
+        try self.w("        AND ##$FFFF", .{});
+        if (any_guard) try self.w("        STA ${X}", .{self.off_t});
+        for (handlers) |*h| {
+            if (h.* != .case) continue;
             const c = h.case;
             const msg = self.message(c.msg) orelse
-                return self.fail(c.line, "unknown message in quiesce case", Error.Semantics);
+                return self.fail(c.line, "unknown message in case", Error.Semantics);
             const l_next = self.label();
-            try self.w("; quiesce case {s}({s})", .{ c.msg, c.bind orelse "_" });
-            try self.w("        LDA (${X})", .{self.off_ptr});
-            try self.w("        AND ##$FFFF", .{});
+            try self.w("; case {s}({s})", .{ c.msg, c.bind orelse "_" });
             try self.w("        CMP {s}", .{try self.imm(msg.tag)});
             try self.w("        BNE L{d}", .{l_next});
             self.bind = c.bind;
             self.bind_msg = msg;
-            if (c.where) |g| try self.branchIfFalse(g, l_next);
+            var l_fail: ?usize = null;
+            if (c.where) |g| {
+                l_fail = self.label();
+                try self.branchIfFalse(g, l_fail.?);
+            }
             self.in_handler = true;
             const bm = self.beginBurst();
             try self.stmts(c.body);
@@ -2010,10 +2171,33 @@ const Gen = struct {
             self.in_handler = false;
             self.bind = null;
             self.bind_msg = null;
-            try self.w("        BRA L{d}", .{lq});
+            try self.w("        BRA L{d}", .{loop_label});
+            if (l_fail) |lf| {
+                // guard failed: restore the tag and try the next case
+                try self.w("L{d}:   LDA ${X}", .{ lf, self.off_t });
+            }
             try self.w("L{d}:", .{l_next});
         }
-        try self.w("        BRA L{d}", .{lq});
+        try self.w("        BRA L{d}", .{loop_label});
+    }
+
+    /// The lame-duck loop (sketch §2.3): a restricted case set, no
+    /// timers, everything else consumed in silence. Stragglers converge;
+    /// the machine goes quiet instead of staying awake.
+    fn emitQuiesce(self: *Gen) Error!void {
+        const lq = self.quiesce_label;
+        // Case-body BRAs loop back to the quiesce serve, not the live one.
+        const saved = self.serve_label;
+        self.serve_label = lq;
+        defer self.serve_label = saved;
+        try self.w("; quiesce: the lame-duck serve — same fused test, timers dead", .{});
+        try self.w("L{d}:   LSTN 1", .{lq});
+        try self.w("        CQPOP 1", .{});
+        try self.w("        AND ##$FFFF", .{});
+        try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});
+        try self.w("        BNE L{d}", .{lq});
+        try self.w("        STX ${X}", .{self.off_ptr});
+        try self.emitCaseLadder(self.actor.quiesce, lq);
     }
 
     /// The supervision runtime (sketch §2.2: "restarts N is policy, not

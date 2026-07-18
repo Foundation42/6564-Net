@@ -89,7 +89,15 @@ PTT capabilities, parameter staging and timers are all loader work:
 any `.joe` file runs without a harness. The capstone is
 `src/programs/forkjoin.joe`: a 1,009-actor fork-join tree, every hop
 acked through the tree because joe cannot see transport verdicts,
-joining to the exact sum at 25% packet loss. Amendment 1
+joining to the exact sum at 25% packet loss. The bank-collapse
+experiment ran through this corpus and closed: registers are one
+shared set, volatile across parks, and the compiler's burst-liveness
+codegen took Armstrong's ring from 110 to **55 cycles a pass — under
+the hand-written 60** — while the whole corpus runs cycle-identical
+with every register *poisoned* at every park (`sim6564 joe
+src/programs/ring.joe 0x6564 1024 scorch`). A context is a near page,
+a run-queue entry and a control block; nothing else survives, and
+nothing compiled ever needed more. Amendment 1
 (`docs/joe-v1-ammendment-1.md`) made the language smaller and the
 promise larger: `while` is gone — unbounded work is a `send self`
 loop, on-chip and lossless, one park per slice (`crunch.joe`) — and
