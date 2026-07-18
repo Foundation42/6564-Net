@@ -90,6 +90,15 @@ pub const Tag = enum(u8) {
 
 /// Ring-descriptor flags (word1 bits 56..64).
 pub const desc_flag_auto_repost: u8 = 0x01;
+/// A REGISTERED REGION (§6.2 widened, handoff item 6): this descriptor
+/// names not a ring but a span of memory — word0 base, word2 length in
+/// bytes, word3 the capability token. Grant-on-submit sets OWNED;
+/// the completion record clears it (the release fence); software
+/// revokes by zeroing the token, and a late DMA re-checks at access
+/// time and reject-completes instead of scribbling.
+pub const desc_flag_region: u8 = 0x02;
+/// Hardware-managed: the region is granted out and hardware-owned.
+pub const desc_flag_owned: u8 = 0x04;
 /// Hardware-managed state for AUTO_REPOST's deferred grant: set once the
 /// first delivery record has been popped; thereafter each pop re-grants the
 /// PREVIOUS pop's buffer. The just-popped payload is thus valid until the

@@ -238,6 +238,10 @@ pub const Stats = struct {
     dev_deliveries: u64 = 0,
     /// Reply datagrams devices fired back through their own PTTs.
     dev_replies: u64 = 0,
+    /// 64-byte chunks the remote matmul polyfill pulled/pushed through
+    /// the network window — the observable (and only) difference from
+    /// the in-proc unit, besides the clock.
+    accel_pulls: u64 = 0,
 };
 
 /// A device attached to the peripheral row: the device itself, the token it
@@ -247,6 +251,39 @@ pub const DevEndpoint = struct {
     dev: dev.Device,
     token: u64 = 0,
     ptt: [dev.ptt_slots]ring.PttEntry = @splat(.{}),
+};
+
+/// An accelerator actor on the peripheral row (handoff item 6): matmul,
+/// in two indistinguishable implementations per §7.5 — an in-proc "TPU"
+/// that DMAs the granted region, and a fabric-remote polyfill that pulls
+/// it through the network window chunk by chunk with the same token.
+/// Both declare `deterministic`: C[i,j] = Σ_k A[i,k]·B[k,j], k ascending,
+/// IEEE RNE — the reduction order is in the contract, so the two
+/// implementations agree to the bit and only the clock can tell them
+/// apart. Queue depth one: a busy accelerator rejects, and saturation is
+/// backpressure, never corruption.
+pub const Accel = struct {
+    kind: enum { inproc, remote },
+    token: u64 = 0,
+    busy: bool = false,
+};
+
+/// One granted matmul in flight: everything re-checked at completion
+/// time against the LIVE descriptor — the deferred-read discipline, so
+/// revocation between grant and completion turns the job into an honest
+/// reject instead of a scribble.
+const AccelJob = struct {
+    coord: u16,
+    core: u16,
+    ctx: u8,
+    slot: u8,
+    token: u64,
+    m: u16,
+    k: u16,
+    n: u16,
+    off_a: u64,
+    off_b: u64,
+    off_c: u64,
 };
 
 const PendingSend = struct {
@@ -263,6 +300,9 @@ pub const Machine = struct {
     seq: u64 = 0,
     pending: std.AutoHashMap(u64, PendingSend),
     devices: std.AutoHashMap(u16, DevEndpoint),
+    accels: std.AutoHashMap(u16, Accel),
+    accel_jobs: std.AutoHashMap(u64, AccelJob),
+    accel_next_id: u64 = 1,
     /// Which die this machine is on the IO plane (§6.5); 0 standalone.
     die_id: u16 = 0,
     /// The die's hook onto the plane; PTT entries with route != 0 need it.
@@ -300,6 +340,8 @@ pub const Machine = struct {
             .prng = std.Random.DefaultPrng.init(cfg.seed),
             .pending = std.AutoHashMap(u64, PendingSend).init(alloc),
             .devices = std.AutoHashMap(u16, DevEndpoint).init(alloc),
+            .accels = std.AutoHashMap(u16, Accel).init(alloc),
+            .accel_jobs = std.AutoHashMap(u64, AccelJob).init(alloc),
         };
     }
 
@@ -310,6 +352,8 @@ pub const Machine = struct {
         var it = self.devices.valueIterator();
         while (it.next()) |ep| ep.dev.deinit();
         self.devices.deinit();
+        self.accels.deinit();
+        self.accel_jobs.deinit();
         for (self.cores) |*core| {
             self.alloc.free(core.ram);
             self.alloc.free(core.contexts);
@@ -391,6 +435,182 @@ pub const Machine = struct {
         self.devices.getPtr(coord).?.ptt[slot] = entry;
     }
 
+    /// Attach a matmul accelerator at a peripheral coordinate (item 6).
+    pub fn attachAccel(self: *Machine, coord: u16, token: u64, kind: @FieldType(Accel, "kind")) !void {
+        std.debug.assert(coord >= dev.first_core and coord <= dev.last_core);
+        try self.accels.put(coord, .{ .kind = kind, .token = token });
+    }
+
+    /// A matmul request arrives (contract, all u64 LE words):
+    ///   w0 region desc slot   w1 token presented
+    ///   w2 dims M | K<<16 | N<<32 (each 1..32)
+    ///   w3 offset of A   w4 offset of B   w5 offset of C  (bytes, in-region)
+    /// Grant-on-submit: acceptance sets the descriptor's OWNED flag; the
+    /// completion (a delivery to the sender's RX ring) is the release
+    /// fence. A busy accelerator rejects — saturation is backpressure.
+    fn deliverToAccel(self: *Machine, due: u64, gram: mesh.Datagram) !void {
+        const ac = self.accels.getPtr(gram.dst_core).?;
+        const reject = struct {
+            fn of(m: *Machine, d: u64, g: mesh.Datagram, s: ring.Status) !void {
+                m.stats.rejects += 1;
+                try m.ackSender(d, g, g.dst_core, s, 0);
+            }
+        }.of;
+        if (ac.token != 0 and ac.token != gram.token)
+            return reject(self, due, gram, .reject_capability);
+        if (ac.busy or gram.payload.len < 48)
+            return reject(self, due, gram, .reject_no_buffer);
+        // the granting context is the sender of this request
+        const pend = self.pending.get(gram.send_id) orelse
+            return reject(self, due, gram, .reject_capability);
+        const rcore = pend.reply.core;
+        const rctx = pend.reply.ctx;
+        const w = struct {
+            fn at(p: []const u8, i: usize) u64 {
+                return std.mem.readInt(u64, p[i * 8 ..][0..8], .little);
+            }
+        }.at;
+        const job = AccelJob{
+            .coord = gram.dst_core,
+            .core = rcore,
+            .ctx = rctx,
+            .slot = @truncate(w(gram.payload, 0)),
+            .token = w(gram.payload, 1),
+            .m = @truncate(w(gram.payload, 2)),
+            .k = @truncate(w(gram.payload, 2) >> 16),
+            .n = @truncate(w(gram.payload, 2) >> 32),
+            .off_a = w(gram.payload, 3),
+            .off_b = w(gram.payload, 4),
+            .off_c = w(gram.payload, 5),
+        };
+        if (job.m == 0 or job.k == 0 or job.n == 0 or job.m > 32 or job.k > 32 or job.n > 32)
+            return reject(self, due, gram, .reject_capability);
+        const desc = self.regionDesc(job) orelse
+            return reject(self, due, gram, .reject_capability);
+        if (desc.token == 0 or desc.token != job.token)
+            return reject(self, due, gram, .reject_capability);
+        const need_a = @as(u64, job.m) * job.k * 8;
+        const need_b = @as(u64, job.k) * job.n * 8;
+        const need_c = @as(u64, job.m) * job.n * 8;
+        if (job.off_a + need_a > desc.len or job.off_b + need_b > desc.len or
+            job.off_c + need_c > desc.len)
+            return reject(self, due, gram, .reject_capability);
+        // grant: the region is hardware-owned until the completion fence
+        self.setRegionOwned(job, true);
+        ac.busy = true;
+        const flops = @as(u64, job.m) * job.k * job.n;
+        const latency: u64 = switch (ac.kind) {
+            // the in-proc unit DMAs; the polyfill pulls and pushes the
+            // region through the window in 64-byte chunks, same token —
+            // same bytes at the end, only the clock can tell
+            .inproc => 100 + flops,
+            .remote => blk: {
+                const chunks = (need_a + need_b + need_c + 63) / 64;
+                self.stats.accel_pulls += chunks;
+                break :blk 400 + chunks * 200 + flops;
+            },
+        };
+        const id = self.accel_next_id;
+        self.accel_next_id += 1;
+        try self.accel_jobs.put(id, job);
+        try self.events.add(.{ .due = due + latency, .seq = self.nextSeq(), .kind = .{ .accel = .{ .id = id } } });
+        self.stats.delivered += 1;
+        self.stats.dev_deliveries += 1;
+        self.trace("accel ${X} @{d} grant slot{d} {d}x{d}x{d}", .{ gram.dst_core, due, job.slot, job.m, job.k, job.n });
+        try self.ackSender(due, gram, gram.dst_core, .ok, @intCast(gram.payload.len));
+    }
+
+    const RegionDesc = struct { base: u64, len: u64, token: u64, flags: u8 };
+
+    /// Read a region descriptor LIVE from the granting context's near
+    /// page — every check is against current words, never a copy.
+    fn regionDesc(self: *Machine, job: AccelJob) ?RegionDesc {
+        if (job.core >= self.cores.len) return null;
+        const core = &self.cores[job.core];
+        if (job.ctx >= core.contexts.len) return null;
+        const ctx = &core.contexts[job.ctx];
+        if (job.slot >= ring.desc_slots) return null;
+        const off = @as(u64, job.slot) * ring.desc_size;
+        const base = read64(core, ctx, off) catch return null;
+        const w1 = read64(core, ctx, off + 8) catch return null;
+        const len = read64(core, ctx, off + 16) catch return null;
+        const token = read64(core, ctx, off + 24) catch return null;
+        const flags: u8 = @truncate(w1 >> 56);
+        if (flags & ring.desc_flag_region == 0) return null;
+        return .{ .base = base, .len = len, .token = token, .flags = flags };
+    }
+
+    fn setRegionOwned(self: *Machine, job: AccelJob, owned: bool) void {
+        const core = &self.cores[job.core];
+        const ctx = &core.contexts[job.ctx];
+        const off = @as(u64, job.slot) * ring.desc_size + 8;
+        const w1 = read64(core, ctx, off) catch return;
+        const flags: u8 = @truncate(w1 >> 56);
+        const nf: u8 = if (owned) flags | ring.desc_flag_owned else flags & ~ring.desc_flag_owned;
+        const nw = (w1 & 0x00FF_FFFF_FFFF_FFFF) | (@as(u64, nf) << 56);
+        write64(core, ctx, off, nw) catch return;
+    }
+
+    /// The accelerator finishes: re-check the LIVE descriptor (the
+    /// deferred-read discipline — revocation between grant and now turns
+    /// the job into a reject, and nothing is scribbled), do the work,
+    /// clear OWNED, and deliver the completion to the sender's RX ring.
+    /// Completion payload: w0 = 0 ok / 1 rejected, w1 = the desc slot.
+    fn accelComplete(self: *Machine, due: u64, id: u64) !void {
+        const kv = self.accel_jobs.fetchRemove(id) orelse return;
+        const job = kv.value;
+        if (self.accels.getPtr(job.coord)) |ac| ac.busy = false;
+        var ok = false;
+        if (self.regionDesc(job)) |desc| {
+            if (desc.token != 0 and desc.token == job.token) {
+                // the DMA: C[i,j] = Σ_k A[i,k]·B[k,j], k ascending — the
+                // declared-deterministic contract, bit for bit
+                const core = &self.cores[job.core];
+                const ctx = &core.contexts[job.ctx];
+                var i: u64 = 0;
+                outer: while (i < job.m) : (i += 1) {
+                    var j: u64 = 0;
+                    while (j < job.n) : (j += 1) {
+                        var acc: f64 = 0;
+                        var kk: u64 = 0;
+                        while (kk < job.k) : (kk += 1) {
+                            const a_at = desc.base + job.off_a + (i * job.k + kk) * 8;
+                            const b_at = desc.base + job.off_b + (kk * job.n + j) * 8;
+                            const av: f64 = @bitCast(read64(core, ctx, a_at) catch break :outer);
+                            const bv: f64 = @bitCast(read64(core, ctx, b_at) catch break :outer);
+                            acc += av * bv;
+                        }
+                        const c_at = desc.base + job.off_c + (i * job.n + j) * 8;
+                        write64(core, ctx, c_at, @bitCast(acc)) catch break :outer;
+                    }
+                }
+                ok = i == job.m;
+            }
+        }
+        self.setRegionOwned(job, false); // the release fence precedes the record
+        self.trace("accel ${X} @{d} {s} slot{d}", .{ job.coord, due, if (ok) @as([]const u8, "complete") else "REVOKED", job.slot });
+        var payload: [16]u8 = undefined;
+        std.mem.writeInt(u64, payload[0..8], if (ok) 0 else 1, .little);
+        std.mem.writeInt(u64, payload[8..16], job.slot, .little);
+        const rx_token = blk: {
+            // silicon presents whatever the target ring demands
+            const core = &self.cores[job.core];
+            const ctx = &core.contexts[job.ctx];
+            break :blk read64(core, ctx, @as(u64, ring.slot_rx) * ring.desc_size + 24) catch 0;
+        };
+        const gram = mesh.Datagram{
+            .send_id = self.nextSeq(),
+            .src_die = self.die_id,
+            .dst_core = job.core,
+            .dst_ctx = job.ctx,
+            .dst_slot = ring.slot_rx,
+            .offset = 0,
+            .token = rx_token,
+            .payload = try self.alloc.dupe(u8, &payload),
+        };
+        try self.events.add(.{ .due = due + 4, .seq = self.nextSeq(), .kind = .{ .deliver = gram } });
+    }
+
     pub fn device(self: *Machine, coord: u16) ?*dev.Device {
         const ep = self.devices.getPtr(coord) orelse return null;
         return &ep.dev;
@@ -411,7 +631,7 @@ pub const Machine = struct {
     /// validated here; an invalid target vanishes and the sender's timeout
     /// speaks (§6.1), exactly as for an unroutable local prefix.
     pub fn injectDeliver(self: *Machine, gram: mesh.Datagram, due: u64) !void {
-        const ok = self.devices.contains(gram.dst_core) or
+        const ok = self.devices.contains(gram.dst_core) or self.accels.contains(gram.dst_core) or
             (gram.dst_core < self.cores.len and
                 gram.dst_ctx < self.cfg.contexts_per_core and
                 gram.dst_slot < ring.desc_slots);
@@ -639,7 +859,7 @@ pub const Machine = struct {
         }
         // The peripheral row (§7): a device coordinate routes like any
         // other — context/slot bits below the row are device-defined.
-        const routable = self.devices.contains(entry.dstCore()) or
+        const routable = self.devices.contains(entry.dstCore()) or self.accels.contains(entry.dstCore()) or
             (entry.dstCore() < self.cores.len and
                 entry.dstContext() < self.cfg.contexts_per_core and
                 entry.dstSlot() < ring.desc_slots);
@@ -699,6 +919,8 @@ pub const Machine = struct {
         });
         if (self.devices.contains(gram.dst_core))
             return self.deliverToDevice(due, gram);
+        if (self.accels.contains(gram.dst_core))
+            return self.deliverToAccel(due, gram);
         const core = &self.cores[gram.dst_core];
         const ctx = &core.contexts[gram.dst_ctx];
         const d = readDesc(ctx, gram.dst_slot);
@@ -1012,6 +1234,7 @@ pub const Machine = struct {
             .deliver => |gram| try self.deliver(ev.due, gram),
             .ack => |a| try self.completeSend(a.send_id, a.status, a.byte_count),
             .timeout => |t| try self.completeSend(t.send_id, .timeout, 0),
+            .accel => |a| try self.accelComplete(ev.due, a.id),
         }
     }
 

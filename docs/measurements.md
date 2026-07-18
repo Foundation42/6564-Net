@@ -982,3 +982,58 @@ and a watchdogged actor's float handlers are charged honestly).
 117 tests. The A1.4 grammar is complete except where the machine
 itself isn't yet (masks, map, gather) — each deferral named, none
 silent.
+
+## Item 6, machine half: registered regions + the matmul accelerator (2026-07-18)
+
+§4's composition claim held to the letter — regions needed almost
+nothing new, because **the descriptor table is the region table**: a
+region is a descriptor with the REGION flag (word0 base, word2 length,
+word3 token), living in the near page like every ring the actor owns.
+Grant-on-submit sets an OWNED flag in that descriptor; the completion
+is the release fence (OWNED clears before the record lands); and
+revocation is the actor zeroing its own token word — no opcode, no
+syscall, one store.
+
+**The matmul accelerator, in two implementations behind one contract**
+(request: region slot, token, M|K|N ≤ 32, three in-region offsets;
+completion: a delivery to the requester's RX ring). The in-proc "TPU"
+DMAs the granted region; the fabric-remote polyfill pulls and pushes
+it through the network window in 64-byte chunks with the same token —
+the future §6.4 reserved the PTT write right for, now real. Both
+declare `deterministic`: C[i,j] = Σ_k A[i,k]·B[k,j], k ascending, IEEE
+RNE — the reduction order is in the contract, so the two silicons
+agree TO THE BIT, and the suite proves it with the same driver program
+for both: the test changes one PTT binding and nothing else. §7.5 in
+one line of wiring. The only observable differences: window-chunk
+traffic (stats.accel_pulls) and the wall clock — which a parked core
+doesn't pay.
+
+**The failure modes, exercised where the deferred-grant lesson said to
+look:**
+
+- *Revocation between grant and completion*: the requester waits for
+  the transport ack (the ack IS the acceptance), then kills the token
+  mid-flight. The late DMA re-reads the LIVE descriptor — the
+  deferred-read discipline — and reject-completes: C untouched, OWNED
+  still fenced clear, the record still arrives. Revoke a wedged
+  accelerator and its late DMA cannot scribble on reclaimed memory.
+- *Saturation*: two asks at a depth-one unit — the second is
+  reject-completed at the sender (backpressure as a transport
+  verdict), the first completes bit-exact. Saturation is backpressure,
+  never corruption, same law as bigbrother's flood.
+
+Two test-shape lessons paid for and recorded: the core clock counts
+executed cycles, so a parked wait is free and "slower silicon" is not
+visible in core.clock; and revoking before the grant arrives tests
+request rejection, not late-DMA fencing — the ack-then-revoke ordering
+is the honest window, and the remote implementation's longer flight is
+what holds it open.
+
+Deferred to item 6b (the joe surface): `region` declarations and
+`grant` with the type-state — a granted region inaccessible by type
+until the completion case rebinds it, §6.2 promoted to compile time —
+plus region-backed bufs for A2-ii's store hardware and rocci-bird's
+display grants.
+
+120 tests. Null-cost: nothing that doesn't speak to $FF05/$FF06 moved
+a cycle; frozen table intact; ring still 55.

@@ -1344,6 +1344,244 @@ test "A1.4: vecmath.joe — SIMD is a data type with operators, bit-exact" {
     try testing.expectEqual(@as(u64, 1), o.varOf("calc", "flag").?);
 }
 
+// ── Item 6: registered regions + the matmul accelerator ─────────────────
+
+// The driver program is IDENTICAL for both implementations: it grants a
+// region and asks PTT slot 3 for a 4×4×4 matmul. The TEST decides which
+// silicon sits behind slot 3 — §7.5 in one binding.
+pub const matmul_asm =
+    \\        .org $1000
+    \\; rings: SQ $2400, CQ $2000, RX $2100 (cap 2, AUTO_REPOST, token $6564)
+    \\        LDA ##$2400
+    \\        STA $0
+    \\        LDA ##$1000000002000
+    \\        STA $8
+    \\        LDA #0
+    \\        STA $10
+    \\        STA $18
+    \\        LDA ##$2000
+    \\        STA $20
+    \\        LDA ##$1000000001004
+    \\        STA $28
+    \\        LDA #0
+    \\        STA $30
+    \\        STA $38
+    \\        LDA ##$2100
+    \\        STA $40
+    \\        LDA ##$101000000002001
+    \\        STA $48
+    \\        LDA #0
+    \\        STA $50
+    \\        LDA ##$6564
+    \\        STA $58
+    \\        LDA ##$2200
+    \\        STA !$2100
+    \\        STA !$2118
+    \\        LDA #64
+    \\        STA !$2108
+    \\        LDA #0
+    \\        STA !$2110
+    \\        LDA ##$2240
+    \\        STA !$2120
+    \\        STA !$2138
+    \\        LDA #64
+    \\        STA !$2128
+    \\        LDA #0
+    \\        STA !$2130
+    \\        RECV 2
+    \\        RECV 2
+    \\; REGION descriptor, slot 8: base $6000, len $1000, token $1234
+    \\        LDA ##$6000
+    \\        STA $100
+    \\        LDA ##$200000000000000
+    \\        STA $108
+    \\        LDA ##$1000
+    \\        STA $110
+    \\        LDA ##$1234
+    \\        STA $118
+    \\; the request: slot 8, token, 4x4x4, A at +0, B at +$80, C at +$100
+    \\        LDA #8
+    \\        STA !$2500
+    \\        LDA ##$1234
+    \\        STA !$2508
+    \\        LDA ##$400040004
+    \\        STA !$2510
+    \\        LDA #0
+    \\        STA !$2518
+    \\        LDA ##$80
+    \\        STA !$2520
+    \\        LDA ##$100
+    \\        STA !$2528
+    \\; grant-on-submit: one SQE to the accelerator behind PTT slot 3
+    \\        LDA #1
+    \\        STA !$2400
+    \\        LDA ##$FF00030000000000
+    \\        STA !$2408
+    \\        LDA ##$2500
+    \\        STA !$2410
+    \\        LDA ##$100000030
+    \\        STA !$2418
+    \\        SEND 0
+    \\wait:   LSTN 1
+    \\        CQPOP 1
+    \\        BEQ wait
+    \\        STA $800
+    \\        STX $808
+    \\        AND #$FF
+    \\        CMP #3
+    \\        BNE wait
+    \\        LDA ($808)
+    \\        STA $810
+    \\        HLT
+;
+
+fn accelMachine(kind: anytype, revoke_line: []const u8) !Machine {
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .link = .{ .loss_ppm4k = 0, .dup_ppm4k = 0 },
+    });
+    errdefer m.deinit();
+    try m.attachAccel(0xFF05, 0xACCE, kind);
+    m.setPtt(0, 3, .{
+        .prefix_hi = 0xfd65_6400_0000_0000,
+        .prefix_lo = ring.PttEntry.loFrom(0xFF05, 0, 0),
+        .rights = .{ .send = true },
+        .token = 0xACCE,
+    });
+    // A[i][k] = i·4+k+1, B[k][j] = (k+1) + (j+1)/2 — real rounding work
+    var blob: [256]u8 = undefined;
+    for (0..4) |i| {
+        for (0..4) |k| {
+            const v: f64 = @floatFromInt(i * 4 + k + 1);
+            std.mem.writeInt(u64, blob[(i * 4 + k) * 8 ..][0..8], @bitCast(v), .little);
+        }
+    }
+    m.load(0, 0x6000, blob[0..128]);
+    for (0..4) |k| {
+        for (0..4) |j| {
+            const v: f64 = @as(f64, @floatFromInt(k + 1)) + @as(f64, @floatFromInt(j + 1)) / 2.0;
+            std.mem.writeInt(u64, blob[(k * 4 + j) * 8 ..][0..8], @bitCast(v), .little);
+        }
+    }
+    m.load(0, 0x6080, blob[0..128]);
+    // splice the (optional) revocation between SEND and the wait loop
+    var src = std.ArrayList(u8).init(testing.allocator);
+    defer src.deinit();
+    const split = std.mem.indexOf(u8, matmul_asm, "wait:").?;
+    try src.appendSlice(matmul_asm[0..split]);
+    try src.appendSlice(revoke_line);
+    try src.appendSlice(matmul_asm[split..]);
+    try assembleInto(&m, 0, src.items);
+    try m.spawn(0, 0, 0x1000, 0x8000, 0);
+    _ = try m.run();
+    return m;
+}
+
+fn matmulMirror() [16]f64 {
+    var a: [4][4]f64 = undefined;
+    var b: [4][4]f64 = undefined;
+    for (0..4) |i| {
+        for (0..4) |k| a[i][k] = @floatFromInt(i * 4 + k + 1);
+    }
+    for (0..4) |k| {
+        for (0..4) |j| b[k][j] = @as(f64, @floatFromInt(k + 1)) + @as(f64, @floatFromInt(j + 1)) / 2.0;
+    }
+    var c: [16]f64 = undefined;
+    for (0..4) |i| {
+        for (0..4) |j| {
+            var acc: f64 = 0;
+            for (0..4) |k| acc += a[i][k] * b[k][j];
+            c[i * 4 + j] = acc;
+        }
+    }
+    return c;
+}
+
+test "item 6: the matmul completes through a granted region — both siliconsindistinguishable" {
+    const mirror = matmulMirror();
+    var pulls: [2]u64 = undefined;
+    inline for (.{ .inproc, .remote }, 0..) |kind, ki| {
+        var m = try accelMachine(kind, "");
+        defer m.deinit();
+        const ctx = &m.cores[0].contexts[0];
+        try testing.expectEqual(machine.CtxState.halted, ctx.state);
+        // completion said ok
+        try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
+        // C matches the declared-deterministic contract, bit for bit
+        for (0..16) |i| {
+            const got = std.mem.readInt(u64, m.cores[0].ram[0x6100 - machine.ram_base + i * 8 ..][0..8], .little);
+            try testing.expectEqual(@as(u64, @bitCast(mirror[i])), got);
+        }
+        // the release fence: OWNED is clear again
+        const w1 = std.mem.readInt(u64, ctx.near[0x108..][0..8], .little);
+        try testing.expectEqual(@as(u64, 0), (w1 >> 56) & ring.desc_flag_owned);
+        pulls[ki] = m.stats.accel_pulls;
+    }
+    // same bytes; only the window traffic (and the wall clock, which a
+    // parked core doesn't pay) can tell the implementations apart
+    try testing.expectEqual(@as(u64, 0), pulls[0]);
+    try testing.expect(pulls[1] > 0);
+}
+
+test "item 6: revocation between grant and completion — reject, never a scribble" {
+    // The transport ack IS the acceptance: wait for it (tag 2), then
+    // kill the token while the remote implementation is still pulling.
+    // Its late DMA re-checks the live descriptor and reject-completes.
+    var m = try accelMachine(.remote,
+        \\wack:   LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wack
+        \\        AND #$FF
+        \\        CMP #2
+        \\        BNE wack
+        \\        LDA #0
+        \\        STA $118
+        \\
+    );
+    defer m.deinit();
+    const ctx = &m.cores[0].contexts[0];
+    try testing.expectEqual(machine.CtxState.halted, ctx.state);
+    // the completion arrived — as a reject
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
+    // and C was never touched
+    for (0..16) |i| {
+        const got = std.mem.readInt(u64, m.cores[0].ram[0x6100 - machine.ram_base + i * 8 ..][0..8], .little);
+        try testing.expectEqual(@as(u64, 0), got);
+    }
+    // the fence still fired: OWNED is clear
+    const w1 = std.mem.readInt(u64, ctx.near[0x108..][0..8], .little);
+    try testing.expectEqual(@as(u64, 0), (w1 >> 56) & ring.desc_flag_owned);
+}
+
+test "item 6: saturation is backpressure — a busy accelerator rejects, corrupts nothing" {
+    // Two asks back-to-back at a depth-one unit (the remote polyfill,
+    // whose long flight guarantees the overlap): the second is
+    // reject-completed at the sender, the first completes exactly.
+    var m = try accelMachine(.remote,
+        \\        LDA #1
+        \\        STA !$2400
+        \\        LDA ##$FF00030000000000
+        \\        STA !$2408
+        \\        LDA ##$2500
+        \\        STA !$2410
+        \\        LDA ##$100000030
+        \\        STA !$2418
+        \\        SEND 0
+        \\
+    );
+    defer m.deinit();
+    const ctx = &m.cores[0].contexts[0];
+    try testing.expectEqual(machine.CtxState.halted, ctx.state);
+    try testing.expect(m.stats.rejects >= 1);
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
+    const mirror = matmulMirror();
+    for (0..16) |i| {
+        const got = std.mem.readInt(u64, m.cores[0].ram[0x6100 - machine.ram_base + i * 8 ..][0..8], .little);
+        try testing.expectEqual(@as(u64, @bitCast(mirror[i])), got);
+    }
+}
+
 test "A2.5: store.joe — the substrate's shape, polyfilled by an ordinary actor" {
     // §7.5's proof obligation, discharged: the Put/Get/Del contract with
     // canonical struple keys, served entirely from joe — byte equality,

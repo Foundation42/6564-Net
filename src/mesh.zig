@@ -107,6 +107,9 @@ pub const Event = struct {
         ack: struct { send_id: u64, status: ring.Status, byte_count: u32 },
         /// Sender-side timeout check for a send that may have died en route.
         timeout: struct { send_id: u64 },
+        /// An accelerator finishes a granted job (machine-side table
+        /// holds the job; the event carries only its id).
+        accel: struct { id: u64 },
     };
 
     pub fn order(_: void, a: Event, b: Event) std.math.Order {
