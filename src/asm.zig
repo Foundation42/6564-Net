@@ -84,6 +84,8 @@ const OperandShape = union(enum) {
     ind: Expr,
     ind_y: Expr,
     caps: struct { slot: Expr, near: Expr },
+    /// `VFADD 0, 1` — two vector registers packed into one desc byte.
+    pair: struct { a: Expr, b: Expr },
 };
 
 const Expr = struct {
@@ -291,13 +293,17 @@ const Assembler = struct {
                 return .{ .caps = .{ .slot = slot, .near = near } };
             }
         }
-        // expr[,X|,Y] — split on the last comma.
+        // expr[,X|,Y] — split on the last comma. Anything else after the
+        // comma is a register pair (VFADD 0, 1).
         if (std.mem.lastIndexOfScalar(u8, text, ',')) |comma| {
             const reg = std.mem.trim(u8, text[comma + 1 ..], " \t");
             const body = std.mem.trim(u8, text[0..comma], " \t");
             if (std.ascii.eqlIgnoreCase(reg, "X")) return .{ .expr_x = try self.parseExpr(line_no, body) };
             if (std.ascii.eqlIgnoreCase(reg, "Y")) return .{ .expr_y = try self.parseExpr(line_no, body) };
-            return self.fail(line_no, "bad index register", Error.BadOperand);
+            return .{ .pair = .{
+                .a = try self.parseExpr(line_no, body),
+                .b = try self.parseExpr(line_no, reg),
+            } };
         }
         const force_abs = text[0] == '!';
         const body = if (force_abs) text[1..] else text;
@@ -403,6 +409,7 @@ const Assembler = struct {
             .expr_y => &.{.near_y},
             .ind => &.{.ind},
             .ind_y => &.{.ind_y},
+            .pair => &.{.desc},
             .caps => &.{.caps},
         };
         for (modes) |mode| {
@@ -449,10 +456,19 @@ const Assembler = struct {
                     return self.fail(line_no, "branch out of range", Error.ValueOutOfRange);
                 writeU16(buf[1..3], @bitCast(@as(i16, @intCast(delta))));
             },
-            .desc => {
-                const v = try self.eval(line_no, shape.expr.expr);
-                if (v >= 64) return self.fail(line_no, "descriptor slot out of range", Error.ValueOutOfRange);
-                buf[1] = @intCast(v);
+            .desc => switch (shape) {
+                .pair => |p| {
+                    const a = try self.eval(line_no, p.a);
+                    const b = try self.eval(line_no, p.b);
+                    if (a > 7 or b > 7)
+                        return self.fail(line_no, "vector register out of range", Error.ValueOutOfRange);
+                    buf[1] = @intCast((a << 3) | b);
+                },
+                else => {
+                    const v = try self.eval(line_no, shape.expr.expr);
+                    if (v >= 64) return self.fail(line_no, "descriptor slot out of range", Error.ValueOutOfRange);
+                    buf[1] = @intCast(v);
+                },
             },
             .caps => {
                 const slot = try self.eval(line_no, shape.caps.slot);

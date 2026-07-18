@@ -147,6 +147,26 @@ pub const Mnemonic = enum {
     itof,
     flds,
     fsts,
+    // Tier 1 vectors (extended page, the $?7 column — the base page spent
+    // its $?7 column on I/O and concurrency; the extended page spends its
+    // on the vector unit). V0–V7 × 512-bit, EIGHT f64/u64 lanes, ONE
+    // shared file per core, volatile across parks — never banked, never
+    // saved, exactly the §1 collapse convention extended to wide state.
+    vld, // VLD n     — V[n] ⟵ 64 bytes at [X]
+    vst, // VST n     — 64 bytes at [X] ⟵ V[n] (local memory only)
+    vbca, // VBCA n   — every lane of V[n] ⟵ A
+    vfadd, // VFADD d, s — lanewise f64, V[d] ⟵ V[d] op V[s]
+    vfsub,
+    vfmul,
+    vfdiv,
+    vadd, // VADD d, s — lanewise u64, wrapping
+    vand,
+    vora,
+    veor,
+    vradd, // VRADD n — A ⟵ pairwise-tree f64 sum: ((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))
+    vrmax, // VRMAX n — A ⟵ lanewise max, lane 0 bias on ties, NaN propagates
+    vrmin,
+    vperm, // VPERM d, s — V[d].lane[i] ⟵ V[s].lane[A.byte[i] & 7]
     // One-byte vectored calls through the per-context MACTAB (near page
     // $F80–$FFF). Semantics are exactly JSR [MACTAB + n*8]; the slot index
     // is the opcode's high nibble. Pre-normative — see the MAC & chains
@@ -158,6 +178,7 @@ pub const Mnemonic = enum {
         return switch (self) {
             .and_ => "AND",
             inline else => |m| comptime blk: {
+                @setEvalBranchQuota(8000);
                 var buf: [@tagName(m).len]u8 = undefined;
                 _ = std.ascii.upperString(&buf, @tagName(m));
                 const frozen = buf;
@@ -361,6 +382,18 @@ pub const xtable = [_]Encoding{
     x(.flds, .ind_y, 0xB1, 6),  x(.fsts, .near, 0x85, 4),
     x(.fsts, .near_x, 0x95, 4), x(.fsts, .abs, 0x8D, 5),
     x(.fsts, .ind, 0x92, 6),    x(.fsts, .ind_y, 0x91, 6),
+    // ── Tier 1 vectors: the extended $?7 column, spent whole ────────────
+    // Lanewise costs mirror the scalar ops (eight lanes are parallel
+    // silicon, not eight passes); loads/stores price the 64-byte move;
+    // reductions price the three tree levels.
+    x(.vld, .desc, 0x07, 8),    x(.vst, .desc, 0x17, 8),
+    x(.vbca, .desc, 0x27, 2),   x(.vfadd, .desc, 0x37, 6),
+    x(.vfsub, .desc, 0x47, 6),  x(.vfmul, .desc, 0x57, 6),
+    x(.vfdiv, .desc, 0x67, 22), x(.vadd, .desc, 0x77, 3),
+    x(.vand, .desc, 0x87, 3),   x(.vora, .desc, 0x97, 3),
+    x(.veor, .desc, 0xA7, 3),   x(.vradd, .desc, 0xB7, 8),
+    x(.vrmax, .desc, 0xC7, 8),  x(.vrmin, .desc, 0xD7, 8),
+    x(.vperm, .desc, 0xE7, 3),
 };
 
 /// Near-page base of the 16-slot macro vector table (MACTAB).

@@ -107,6 +107,12 @@ pub const Core = struct {
     id: u16,
     ram: []u8,
     contexts: []Context,
+    /// Tier 1: V0–V7 × 512-bit, eight u64/f64 lanes each. ONE file per
+    /// core — never banked, never saved by hardware, volatile across
+    /// parks by the §1 convention. Live vector state spills to the near
+    /// page or dies with the burst; a watchdog trip mid-block loses it
+    /// by design (trips are deaths, deaths restart).
+    v: [8][8]u64 = @splat(@splat(0)),
     ptt: [256]ring.PttEntry = @splat(.{}),
     runq: std.fifo.LinearFifo(RunEntry, .Dynamic),
     /// Context currently owning the pipeline, if any.
@@ -187,12 +193,15 @@ fn otherRunnable(core: *Core, self_ctx: u8) bool {
     return false;
 }
 
-fn scorch(ctx: *Context) void {
+fn scorch(core: *Core, ctx: *Context) void {
     ctx.a = scorch_pattern;
     ctx.x = scorch_pattern;
     ctx.y = scorch_pattern;
     ctx.sp = scorch_pattern;
     ctx.p = .{ .z = true, .n = true, .c = true, .v = true };
+    // Tier 1 state is even more volatile than the scalars: one shared
+    // file, poisoned wholesale.
+    for (&core.v) |*vr| vr.* = @splat(scorch_pattern);
 }
 
 pub const StopReason = enum { all_halted, faulted, deadlock, max_cycles };
@@ -1384,7 +1393,7 @@ pub const Machine = struct {
                     self.trace("c{d}x{d} @{d} LSTN parks on slot{d}", .{ core.id, ctx_idx, core.clock, desc_slot });
                     ctx.state = .parked;
                     ctx.park_slot = desc_slot;
-                    if (self.cfg.scorch_parks) scorch(ctx);
+                    if (self.cfg.scorch_parks) scorch(core, ctx);
                     // Resume after the LSTN once the ring has data.
                     return .switched_out;
                 }
@@ -1404,7 +1413,7 @@ pub const Machine = struct {
                 if (self.cfg.contended_lstn and otherRunnable(core, ctx_idx)) {
                     self.trace("c{d}x{d} @{d} LSTN rotates: slot{d} hot but the core is contended", .{ core.id, ctx_idx, core.clock, desc_slot });
                     try core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = ctx.ip });
-                    if (self.cfg.scorch_parks) scorch(ctx);
+                    if (self.cfg.scorch_parks) scorch(core, ctx);
                     return .switched_out;
                 }
             },
@@ -1414,7 +1423,7 @@ pub const Machine = struct {
             },
             .yld => {
                 try core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = ctx.ip });
-                if (self.cfg.scorch_parks) scorch(ctx);
+                if (self.cfg.scorch_parks) scorch(core, ctx);
                 return .switched_out;
             },
             .cqpop => {
@@ -1484,6 +1493,94 @@ pub const Machine = struct {
                 const r = @sqrt(@as(f64, @bitCast(ctx.a)));
                 ctx.a = @bitCast(r);
                 fpFlags(ctx, r);
+            },
+            // ── Tier 1 vectors: the extended $?7 column ─────────────────
+            // desc byte: one V index for unary forms, (d << 3) | s for
+            // two-register forms. Same IEEE discipline as Tier 0 — RNE,
+            // no FTZ, no fusion — eight lanes at a time.
+            .vld => {
+                const n = desc_slot & 7;
+                for (&core.v[n], 0..) |*lane, i|
+                    lane.* = try read64(core, ctx, ctx.x +% i * 8);
+            },
+            .vst => {
+                const n = desc_slot & 7;
+                if (ctx.x >> 56 == 0xFF) return error.BadAddress; // no vector stores through windows
+                for (core.v[n], 0..) |lane, i|
+                    try write64(core, ctx, ctx.x +% i * 8, lane);
+            },
+            .vbca => {
+                core.v[desc_slot & 7] = @splat(ctx.a);
+            },
+            .vfadd, .vfsub, .vfmul, .vfdiv => {
+                const d = (desc_slot >> 3) & 7;
+                const s = desc_slot & 7;
+                const vs = core.v[s];
+                for (&core.v[d], vs) |*lane, ms| {
+                    const a: f64 = @bitCast(lane.*);
+                    const m: f64 = @bitCast(ms);
+                    lane.* = @bitCast(switch (enc.mnemonic) {
+                        .vfadd => a + m,
+                        .vfsub => a - m,
+                        .vfmul => a * m,
+                        .vfdiv => a / m,
+                        else => unreachable,
+                    });
+                }
+            },
+            .vadd, .vand, .vora, .veor => {
+                const d = (desc_slot >> 3) & 7;
+                const s = desc_slot & 7;
+                const vs = core.v[s];
+                for (&core.v[d], vs) |*lane, ms| {
+                    lane.* = switch (enc.mnemonic) {
+                        .vadd => lane.* +% ms,
+                        .vand => lane.* & ms,
+                        .vora => lane.* | ms,
+                        .veor => lane.* ^ ms,
+                        else => unreachable,
+                    };
+                }
+            },
+            .vradd => {
+                // The spec'd tree, exactly: ((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7)).
+                // Reduction order is part of the contract (§5's bar says
+                // "including reduction order"), so it is one shape, always.
+                const l = core.v[desc_slot & 7];
+                const f = struct {
+                    fn of(w: u64) f64 {
+                        return @bitCast(w);
+                    }
+                }.of;
+                const r = ((f(l[0]) + f(l[1])) + (f(l[2]) + f(l[3]))) +
+                    ((f(l[4]) + f(l[5])) + (f(l[6]) + f(l[7])));
+                ctx.a = @bitCast(r);
+                fpFlags(ctx, r);
+            },
+            .vrmax, .vrmin => {
+                // Sequential fold, lane 0 bias on ties; any NaN wins as
+                // the one canonical NaN. Deterministic in every case.
+                const l = core.v[desc_slot & 7];
+                var best: f64 = @bitCast(l[0]);
+                var poison = std.math.isNan(best);
+                for (l[1..]) |w| {
+                    const x: f64 = @bitCast(w);
+                    if (std.math.isNan(x)) poison = true;
+                    if (!poison) {
+                        const take = if (enc.mnemonic == .vrmax) x > best else x < best;
+                        if (take) best = x;
+                    }
+                }
+                const r: f64 = if (poison) @bitCast(@as(u64, 0x7ff8000000000000)) else best;
+                ctx.a = @bitCast(r);
+                fpFlags(ctx, r);
+            },
+            .vperm => {
+                const d = (desc_slot >> 3) & 7;
+                const s = desc_slot & 7;
+                const src = core.v[s]; // copy: d == s must permute cleanly
+                for (&core.v[d], 0..) |*lane, i|
+                    lane.* = src[(ctx.a >> @intCast(i * 8)) & 7];
             },
             .fcmp => {
                 // Z = equal, N = less, C = greater-or-equal (CMP's carry

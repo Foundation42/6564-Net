@@ -1072,6 +1072,254 @@ test "A2.4: keys.joe — dispatch on structured keys is memcmp, scorched too" {
     }
 }
 
+// ── Tier 1 vectors (item 5) ─────────────────────────────────────────────
+
+fn vecMachine(src: []const u8) !Machine {
+    var m = try Machine.init(testing.allocator, .{ .cores = 1, .contexts_per_core = 1 });
+    errdefer m.deinit();
+    try assembleInto(&m, 0, src);
+    try m.spawn(0, 0, 0x1000, 0x8000, 0);
+    _ = try m.run();
+    try testing.expectEqual(machine.CtxState.halted, m.cores[0].contexts[0].state);
+    return m;
+}
+
+test "tier 1: lanewise RNE is bit-exact and the reduction tree is THE tree" {
+    // 0.1 + 0.2 in every lane — the same bits Tier 0 proved, ×8. Then a
+    // reduction whose value DEPENDS on the spec'd shape: with lane 0 =
+    // 1e16 and seven 1.0s, the pairwise tree yields 1e16+6 while a
+    // sequential fold ties-to-even into 1e16 exactly. The machine must
+    // produce the tree's bits — reduction order is part of the contract.
+    const src =
+        \\        .org $1000
+        \\        LDA ##$3FB999999999999A
+        \\        VBCA 0
+        \\        LDA ##$3FC999999999999A
+        \\        VBCA 1
+        \\        VFADD 0, 1
+        \\        LDX ##$4000
+        \\        VST 0
+        \\        LDX ##$5000
+        \\        VLD 2
+        \\        VRADD 2
+        \\        STA !$4040
+        \\        HLT
+    ;
+    var m = try Machine.init(testing.allocator, .{ .cores = 1, .contexts_per_core = 1 });
+    defer m.deinit();
+    // stage the reduction input at $5000: [1e16, 1, 1, 1, 1, 1, 1, 1]
+    const lanes: [8]f64 = .{ 1e16, 1, 1, 1, 1, 1, 1, 1 };
+    var blob: [64]u8 = undefined;
+    for (lanes, 0..) |v, i|
+        std.mem.writeInt(u64, blob[i * 8 ..][0..8], @bitCast(v), .little);
+    m.load(0, 0x5000, &blob);
+    try assembleInto(&m, 0, src);
+    try m.spawn(0, 0, 0x1000, 0x8000, 0);
+    _ = try m.run();
+    const ram = m.cores[0].ram;
+    for (0..8) |i| {
+        const lane = std.mem.readInt(u64, ram[0x4000 - machine.ram_base + i * 8 ..][0..8], .little);
+        try testing.expectEqual(@as(u64, 0x3FD3333333333334), lane);
+    }
+    // host mirrors: the tree, and the fold it must NOT be
+    const tree = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) +
+        ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+    var seq: f64 = 0;
+    for (lanes) |v| seq += v;
+    const got: f64 = @bitCast(std.mem.readInt(u64, ram[0x4040 - machine.ram_base ..][0..8], .little));
+    try testing.expectEqual(@as(u64, @bitCast(tree)), @as(u64, @bitCast(got)));
+    try testing.expect(@as(u64, @bitCast(tree)) != @as(u64, @bitCast(seq)));
+}
+
+test "tier 1: permute, integer lanes, and the reduction extremes" {
+    const src =
+        \\        .org $1000
+        \\        LDX ##$5000
+        \\        VLD 0
+        \\        LDA ##$0001020304050607
+        \\        VPERM 1, 0
+        \\        LDX ##$4000
+        \\        VST 1
+        \\        LDA #3
+        \\        VBCA 2
+        \\        VADD 2, 2
+        \\        LDX ##$4040
+        \\        VST 2
+        \\        VRMAX 0
+        \\        STA !$4080
+        \\        VRMIN 0
+        \\        STA !$4088
+        \\        HLT
+    ;
+    var m = try Machine.init(testing.allocator, .{ .cores = 1, .contexts_per_core = 1 });
+    defer m.deinit();
+    const lanes: [8]f64 = .{ 4, -8, 15, 16, 23, 42, -0.5, 7 };
+    var blob: [64]u8 = undefined;
+    for (lanes, 0..) |v, i|
+        std.mem.writeInt(u64, blob[i * 8 ..][0..8], @bitCast(v), .little);
+    m.load(0, 0x5000, &blob);
+    try assembleInto(&m, 0, src);
+    try m.spawn(0, 0, 0x1000, 0x8000, 0);
+    _ = try m.run();
+    const ram = m.cores[0].ram;
+    // permute: A's byte i names the source lane — 07..00 reverses
+    for (0..8) |i| {
+        const lane: f64 = @bitCast(std.mem.readInt(u64, ram[0x4000 - machine.ram_base + i * 8 ..][0..8], .little));
+        try testing.expectEqual(@as(u64, @bitCast(lanes[7 - i])), @as(u64, @bitCast(lane)));
+    }
+    for (0..8) |i| {
+        try testing.expectEqual(@as(u64, 6), std.mem.readInt(u64, ram[0x4040 - machine.ram_base + i * 8 ..][0..8], .little));
+    }
+    const mx: f64 = @bitCast(std.mem.readInt(u64, ram[0x4080 - machine.ram_base ..][0..8], .little));
+    const mn: f64 = @bitCast(std.mem.readInt(u64, ram[0x4088 - machine.ram_base ..][0..8], .little));
+    try testing.expectEqual(@as(f64, 42), mx);
+    try testing.expectEqual(@as(f64, -8), mn);
+}
+
+test "tier 1: V registers are volatile across parks — scorch says so" {
+    // Fill V0, yield (a park), then store it. Under scorch every lane
+    // comes back as the poison pattern: nothing wide survives a park,
+    // by the same convention that governs A. Without scorch the bits
+    // happen to survive on an idle core — which is exactly why scorch
+    // exists: the convention is the contract, not the luck.
+    const src =
+        \\        .org $1000
+        \\        LDA ##$AAAAAAAAAAAAAAAA
+        \\        VBCA 0
+        \\        YLD
+        \\        LDX ##$4000
+        \\        VST 0
+        \\        HLT
+    ;
+    for ([_]bool{ false, true }) |burnt| {
+        var m = try Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .scorch_parks = burnt,
+        });
+        defer m.deinit();
+        try assembleInto(&m, 0, src);
+        try m.spawn(0, 0, 0x1000, 0x8000, 0);
+        _ = try m.run();
+        const want: u64 = if (burnt) machine.scorch_pattern else 0xAAAAAAAAAAAAAAAA;
+        for (0..8) |i| {
+            const lane = std.mem.readInt(u64, m.cores[0].ram[0x4000 - machine.ram_base + i * 8 ..][0..8], .little);
+            try testing.expectEqual(want, lane);
+        }
+    }
+}
+
+test "tier 1: a 256-element dot product, bit-exact against the host mirror" {
+    const vector_src =
+        \\        .org $1000
+        \\        LDA ##$4000
+        \\        STA $800
+        \\        LDA ##$4800
+        \\        STA $808
+        \\        LDA #32
+        \\        STA $810
+        \\        LDA #0
+        \\        VBCA 2
+        \\loop:   LDX $800
+        \\        VLD 0
+        \\        LDX $808
+        \\        VLD 1
+        \\        VFMUL 0, 1
+        \\        VFADD 2, 0
+        \\        LDA $800
+        \\        CLC
+        \\        ADC #64
+        \\        STA $800
+        \\        LDA $808
+        \\        CLC
+        \\        ADC #64
+        \\        STA $808
+        \\        DEC $810
+        \\        LDA $810
+        \\        BNE loop
+        \\        VRADD 2
+        \\        STA !$5800
+        \\        HLT
+    ;
+    const scalar_src =
+        \\        .org $1000
+        \\        LDA ##$4000
+        \\        STA $800
+        \\        LDA ##$4800
+        \\        STA $808
+        \\        LDA ##256
+        \\        STA $810
+        \\        LDA #0
+        \\        STA $818
+        \\sloop:  LDA ($800)
+        \\        FMUL ($808)
+        \\        FADD $818
+        \\        STA $818
+        \\        LDA $800
+        \\        CLC
+        \\        ADC #8
+        \\        STA $800
+        \\        LDA $808
+        \\        CLC
+        \\        ADC #8
+        \\        STA $808
+        \\        DEC $810
+        \\        LDA $810
+        \\        BNE sloop
+        \\        LDA $818
+        \\        STA !$5800
+        \\        HLT
+    ;
+    // deterministic data with real rounding activity
+    var a: [256]f64 = undefined;
+    var b: [256]f64 = undefined;
+    for (0..256) |i| {
+        a[i] = 0.1 * @as(f64, @floatFromInt(i)) + 1.0;
+        b[i] = 1.0 / (0.3 * @as(f64, @floatFromInt(i)) + 2.0);
+    }
+    var blob_a: [2048]u8 = undefined;
+    var blob_b: [2048]u8 = undefined;
+    for (0..256) |i| {
+        std.mem.writeInt(u64, blob_a[i * 8 ..][0..8], @bitCast(a[i]), .little);
+        std.mem.writeInt(u64, blob_b[i * 8 ..][0..8], @bitCast(b[i]), .little);
+    }
+    var cycles: [2]u64 = undefined;
+    var results: [2]u64 = undefined;
+    for ([_][]const u8{ vector_src, scalar_src }, 0..) |src, k| {
+        var m = try Machine.init(testing.allocator, .{ .cores = 1, .contexts_per_core = 1 });
+        defer m.deinit();
+        m.load(0, 0x4000, &blob_a);
+        m.load(0, 0x4800, &blob_b);
+        try assembleInto(&m, 0, src);
+        try m.spawn(0, 0, 0x1000, 0x8000, 0);
+        _ = try m.run();
+        try testing.expectEqual(machine.CtxState.halted, m.cores[0].contexts[0].state);
+        results[k] = std.mem.readInt(u64, m.cores[0].ram[0x5800 - machine.ram_base ..][0..8], .little);
+        cycles[k] = m.cores[0].clock;
+    }
+    // vector mirror: per-lane sequential accumulation, then the tree
+    var acc: [8]f64 = @splat(0.0);
+    for (0..32) |c| {
+        for (0..8) |j| acc[j] += a[c * 8 + j] * b[c * 8 + j];
+    }
+    const tree = ((acc[0] + acc[1]) + (acc[2] + acc[3])) +
+        ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    try testing.expectEqual(@as(u64, @bitCast(tree)), results[0]);
+    // scalar mirror: plain sequential fold
+    var seq: f64 = 0;
+    for (0..256) |i| seq += a[i] * b[i];
+    try testing.expectEqual(@as(u64, @bitCast(seq)), results[1]);
+    // the two orders honestly differ in bits, and agree in value
+    try testing.expect(results[0] != results[1]);
+    try testing.expect(@abs(tree - seq) < 1e-9);
+    // and the lanes pay: the vector loop beats scalar by a wide margin
+    try testing.expect(cycles[0] * 4 < cycles[1]);
+    std.debug.print("\n[tier1] dot256: vector {d} cy, scalar {d} cy ({d:.1}x)\n", .{
+        cycles[0], cycles[1],
+        @as(f64, @floatFromInt(cycles[1])) / @as(f64, @floatFromInt(cycles[0])),
+    });
+}
+
 test "A2.5: store.joe — the substrate's shape, polyfilled by an ordinary actor" {
     // §7.5's proof obligation, discharged: the Put/Get/Del contract with
     // canonical struple keys, served entirely from joe — byte equality,

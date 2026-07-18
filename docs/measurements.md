@@ -889,3 +889,57 @@ SoA vectors — and its high score lives at `("rocci", "hs")`, which
 this store already serves.
 
 112 tests. joe now: 10 programs, 3 of them shipped today.
+
+## Item 5: Tier 1 vectors — the extended $?7 column, spent whole (2026-07-18)
+
+The order of work said vectors only after the collapse, so the
+volatility convention would exist before vector state did. It paid
+exactly as designed: **V0–V7 × 512-bit is ONE shared file per core** —
+never banked, never saved by hardware, poisoned by scorch at every
+park like everything else. The register story didn't grow a special
+case; the wide registers simply joined the convention.
+
+Fifteen opcodes on the extended page's `$?7` column (the base page
+spent its `$?7` column on I/O and concurrency; the extended page
+spends its on the vector unit): `VLD`/`VST` (64 bytes at the address
+in X — zero new addressing modes), `VBCA` (broadcast A), lanewise
+f64 (`VFADD/VFSUB/VFMUL/VFDIV`, cycle-priced as the scalar ops: eight
+lanes are parallel silicon, not eight passes), lanewise u64
+(`VADD/VAND/VORA/VEOR`), three reductions, and `VPERM` with its lane
+indices riding in A, one byte each. Two-register forms pack
+`(d << 3) | s` into the one desc byte — `VFADD 0, 1` in the source.
+
+**Reduction order is part of the contract**, per the determinism bar's
+"including reduction order": `VRADD` is the pairwise tree
+`((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))`, one shape, always — and the
+suite proves the shape by *distinction*: lanes `[1e16, 1×7]` yield
+1e16+6 through the tree but tie-to-even into exactly 1e16 through a
+sequential fold, and the machine must produce the tree's bits.
+`VRMAX/VRMIN` fold sequentially with lane-0 tie bias; any NaN wins as
+the one canonical NaN.
+
+**The workload: a 256-element f64 dot product.**
+
+| | cycles | result |
+|---|---|---|
+| scalar (Tier 0 loop) | 12,830 | bit-exact vs host sequential fold |
+| vector (VLD/VFMUL/VFADD + VRADD) | **2,017** | bit-exact vs host lane-mirror + tree |
+
+**6.4× — and the two results differ in bits, honestly**, because they
+are different spec'd summation orders; they agree in value to 1e-9.
+The machine never pretends two arithmetics are one.
+
+V volatility is proven the house way: fill V0, YLD, store — under
+scorch every lane comes back as the poison pattern. The convention is
+the contract, not the luck of an idle core.
+
+Open item 8's V-count question, first data: 8×512-bit served the dot
+at 6.4× and maps onto mandel's row tiles and rocci-bird's SoA pipes
+(8 f64 lanes = one pipe attribute across the whole on-screen set).
+f32 16-lane forms are deferred until a workload demands them — size
+to the workloads, not more. The joe A1.4 surface (vector literals,
+element-wise operators, `.reduce(+)`) needs f64 in joe's type grammar
+first — it rides next, with the same lowering discipline.
+
+116 tests. Null-cost holds by construction: nothing that doesn't
+speak `$42 $?7` moved a cycle; frozen table intact; ring still 55.
