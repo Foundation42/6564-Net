@@ -69,6 +69,11 @@ pub const Error = error{ Syntax, Semantics, Unsupported, OutOfMemory };
 pub const Layout = struct {
     origin: u64 = 0x1000,
     data: u64 = 0x2000,
+    /// Item 7's measurement flag: route eligible byte-equality sites
+    /// through a shared MAC-vectored comparator instead of inlining.
+    /// Costs the per-burst SP re-establishment the collapse removed;
+    /// buys code size where an actor compares many bufs to one field.
+    mac: bool = false,
     /// PTT slot of the black hole the `after` timer ticks against.
     /// Fixed at 255 by the v1 ABI: every actor on a core shares the one
     /// black hole, and capability slots grow from 0 without ever
@@ -1516,6 +1521,13 @@ const Gen = struct {
     off_masks: u16 = 0,
     /// Staging slab for vector literals in expression position.
     off_vlit: u16 = 0,
+    /// The MAC comparator's argument/scratch slots (item 7) and state:
+    /// one routine per distinct field offset, up to eight MACTAB slots.
+    off_mc: u16 = 0,
+    mac_candidates: usize = 0,
+    mac_shapes: [8]u16 = @splat(0),
+    mac_nshapes: usize = 0,
+    mc_labels: [8]usize = @splat(0),
     /// First free near slot after the fixed layout — loop variables and
     /// bindings are handed out from here.
     next_slot: u16 = 0,
@@ -1623,7 +1635,8 @@ const Gen = struct {
         self.off_tmp = off + 88; // 4 slots
         self.off_masks = off + 120; // 8 slots (index k*8, k = 1..7)
         self.off_vlit = off + 184; // 64 B
-        self.spawn_base = off + 248;
+        self.off_mc = off + 248; // 3 slots: arg, rem, X stash
+        self.spawn_base = off + 272;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
@@ -1687,6 +1700,10 @@ const Gen = struct {
         self.next_slot = aoff;
         if (abi.array_off + area > abi.block_size - abi.data_off - 0x400)
             return self.fail(0, "arrays overflow the instance block", Error.Semantics);
+        if (self.layout.mac) {
+            self.mac_candidates = self.countBufEq();
+            if (self.mac_candidates >= 2) try self.prescanMacShapes();
+        }
         // which regions ever leave home (the grant prescan)
         {
             var rit = self.regions.iterator();
@@ -1754,6 +1771,126 @@ const Gen = struct {
             }
             rp.locked = !bodyGrants(body, e.key_ptr.*);
         }
+    }
+
+    /// Item 7: collect the comparator shapes — every distinct bytes-field
+    /// offset that a buf compares against, one MACTAB slot each (≤ 8;
+    /// beyond that a site simply inlines). Runs with each case's binding
+    /// in scope so field offsets resolve exactly as codegen will see them.
+    fn prescanMacShapes(self: *Gen) Error!void {
+        for (self.actor.handlers) |h| {
+            if (h != .case) continue;
+            const c = h.case;
+            self.bind = c.bind;
+            self.bind_msg = self.message(c.msg);
+            if (c.where) |g| self.collectShapes(g);
+            self.collectShapesIn(c.body);
+            self.bind = null;
+            self.bind_msg = null;
+        }
+        for (self.actor.quiesce) |h| {
+            const c = h.case;
+            self.bind = c.bind;
+            self.bind_msg = self.message(c.msg);
+            if (c.where) |g| self.collectShapes(g);
+            self.collectShapesIn(c.body);
+            self.bind = null;
+            self.bind_msg = null;
+        }
+        for (0..self.mac_nshapes) |i| self.mc_labels[i] = self.label();
+    }
+
+    fn collectShapesIn(self: *Gen, list: []const Stmt) void {
+        for (list) |st| {
+            switch (st) {
+                .if_ => |i| {
+                    self.collectShapes(i.cond);
+                    self.collectShapesIn(i.then);
+                    self.collectShapesIn(i.els);
+                },
+                .bounded => |b| self.collectShapesIn(b.body),
+                .for_range => |f| self.collectShapesIn(f.body),
+                .for_group => |f| self.collectShapesIn(f.body),
+                else => {},
+            }
+        }
+    }
+
+    fn collectShapes(self: *Gen, e: *const Expr) void {
+        if (e.* != .bin) return;
+        const b = e.bin;
+        if (b.op == .land) {
+            self.collectShapes(b.l);
+            self.collectShapes(b.r);
+            return;
+        }
+        if (b.op != .eq and b.op != .ne) return;
+        const sa = self.byteSubject(b.l) orelse return;
+        const sb = self.byteSubject(b.r) orelse return;
+        const foff: u16 = if (sa == .field and sb == .buf)
+            sa.field
+        else if (sb == .field and sa == .buf)
+            sb.field
+        else
+            return;
+        for (self.mac_shapes[0..self.mac_nshapes]) |f| {
+            if (f == foff) return;
+        }
+        if (self.mac_nshapes < 8) {
+            self.mac_shapes[self.mac_nshapes] = foff;
+            self.mac_nshapes += 1;
+        }
+    }
+
+    /// Item 7's reuse census: how many conditions compare a buf with
+    /// something byte-shaped? Two or more make the shared comparator
+    /// worth a MACTAB slot.
+    fn countBufEq(self: *Gen) usize {
+        var n: usize = 0;
+        n += self.countBufEqIn(self.actor.body);
+        for (self.actor.handlers) |h| {
+            switch (h) {
+                .case => |c| {
+                    if (c.where) |g| n += self.condBufEq(g);
+                    n += self.countBufEqIn(c.body);
+                },
+                .after => |a| n += self.countBufEqIn(a.body),
+                .exit_case => |x| n += self.countBufEqIn(x.body),
+            }
+        }
+        for (self.actor.quiesce) |h| {
+            if (h.case.where) |g| n += self.condBufEq(g);
+            n += self.countBufEqIn(h.case.body);
+        }
+        return n;
+    }
+
+    fn countBufEqIn(self: *Gen, list: []const Stmt) usize {
+        var n: usize = 0;
+        for (list) |st| {
+            switch (st) {
+                .if_ => |i| {
+                    n += self.condBufEq(i.cond);
+                    n += self.countBufEqIn(i.then);
+                    n += self.countBufEqIn(i.els);
+                },
+                .bounded => |b| n += self.countBufEqIn(b.body),
+                .for_range => |f| n += self.countBufEqIn(f.body),
+                .for_group => |f| n += self.countBufEqIn(f.body),
+                else => {},
+            }
+        }
+        return n;
+    }
+
+    fn condBufEq(self: *Gen, e: *const Expr) usize {
+        if (e.* != .bin) return 0;
+        const b = e.bin;
+        if (b.op == .land) return self.condBufEq(b.l) + self.condBufEq(b.r);
+        if (b.op != .eq and b.op != .ne) return 0;
+        const lbuf = b.l.* == .ident and self.bufs.contains(b.l.ident);
+        const rbuf = b.r.* == .ident and self.bufs.contains(b.r.ident);
+        return if (lbuf or rbuf) 1 else 0;
     }
 
     /// A `case done(r)` / `case failed(r)` where r names a region — the
@@ -2357,6 +2494,85 @@ const Gen = struct {
         try self.w("L{d}:", .{l_done});
     }
 
+    /// Item 7: the shared comparators, one per field shape. In: _mc
+    /// holds the buf's len-slot offset (its slab is the adjacent 8).
+    /// Out: A = 0 equal, 1 different — the verdict, with Z telling it.
+    fn emitMacComparator(self: *Gen) Error!void {
+        for (0..self.mac_nshapes) |i| {
+            try self.emitOneComparator(self.mc_labels[i], self.mac_shapes[i]);
+        }
+    }
+
+    fn emitOneComparator(self: *Gen, entry_label: usize, foff: u16) Error!void {
+        const rem = self.off_mc + 8;
+        const txs = self.off_mc + 16;
+        const l_w = self.label();
+        const l_tail = self.label();
+        const l_eq = self.label();
+        const l_diff = self.label();
+        try self.w("; MAC: byte equality, buf(arg) vs the bytes field at +{d}", .{foff});
+        try self.w("L{d}:   LDX ${X}", .{ entry_label, self.off_mc });
+        try self.w("        LDA $0,X", .{});
+        try self.w("        STA ${X}", .{rem});
+        try self.w("        LDA ${X}", .{self.off_ptr});
+        try self.w("        CLC", .{});
+        try self.w("        ADC {s}", .{try self.imm(foff)});
+        try self.w("        STA ${X}", .{self.off_fp});
+        try self.w("        LDA (${X})", .{self.off_fp});
+        try self.w("        AND #$FF", .{});
+        try self.w("        CMP ${X}", .{rem});
+        try self.w("        BNE L{d}", .{l_diff});
+        try self.w("        INC ${X}", .{self.off_fp});
+        try self.w("        LDA ${X}", .{self.off_mc});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #8", .{});
+        try self.w("        TAX", .{});
+        const c_loop = self.cost;
+        try self.w("L{d}:   LDA ${X}", .{ l_w, rem });
+        try self.w("        CMP #8", .{});
+        try self.w("        BCC L{d}", .{l_tail});
+        try self.w("        LDA $0,X", .{});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        LDA (${X})", .{self.off_fp});
+        try self.w("        CMP ${X}", .{self.off_t});
+        try self.w("        BNE L{d}", .{l_diff});
+        try self.w("        TXA", .{});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #8", .{});
+        try self.w("        TAX", .{});
+        try self.w("        LDA ${X}", .{self.off_fp});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #8", .{});
+        try self.w("        STA ${X}", .{self.off_fp});
+        try self.w("        LDA ${X}", .{rem});
+        try self.w("        SEC", .{});
+        try self.w("        SBC #8", .{});
+        try self.w("        STA ${X}", .{rem});
+        try self.w("        BRA L{d}", .{l_w});
+        self.cost +|= (self.cost - c_loop) *| 127;
+        try self.w("L{d}:   LDA ${X}", .{ l_tail, rem });
+        try self.w("        BEQ L{d}", .{l_eq});
+        try self.w("        TXA", .{});
+        try self.w("        STA ${X}", .{txs});
+        try self.w("        LDA ${X}", .{rem});
+        try self.w("        ASL #3", .{});
+        try self.w("        TAX", .{});
+        try self.w("        LDA ${X},X", .{self.off_masks});
+        try self.w("        STA ${X}", .{self.off_acc});
+        try self.w("        LDX ${X}", .{txs});
+        try self.w("        LDA $0,X", .{});
+        try self.w("        AND ${X}", .{self.off_acc});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        LDA (${X})", .{self.off_fp});
+        try self.w("        AND ${X}", .{self.off_acc});
+        try self.w("        CMP ${X}", .{self.off_t});
+        try self.w("        BNE L{d}", .{l_diff});
+        try self.w("L{d}:   LDA #0              ; equal", .{l_eq});
+        try self.w("        RTS", .{});
+        try self.w("L{d}:   LDA #1              ; different", .{l_diff});
+        try self.w("        RTS", .{});
+    }
+
     fn loadSide(self: *Gen, s: ByteSubj, p: ?u16) Error!void {
         switch (s) {
             .buf => |bi| try self.w("        LDA ${X},X", .{bi.data}),
@@ -2383,6 +2599,34 @@ const Gen = struct {
                 if (self.byteSubject(b.r)) |sb| {
                     if (sa == .field and sb == .field)
                         return self.fail(0, "compare two message fields through a buf (v1)", Error.Unsupported);
+                    // Item 7: route buf-vs-field sites with a shared
+                    // shape through the MAC comparator; anything else
+                    // stays inline.
+                    if (self.layout.mac and self.mac_candidates >= 2) {
+                        const shaped: ?struct { buf: BufInfo, foff: u16 } = blk: {
+                            if (sa == .buf and sb == .field) break :blk .{ .buf = sa.buf, .foff = sb.field };
+                            if (sa == .field and sb == .buf) break :blk .{ .buf = sb.buf, .foff = sa.field };
+                            break :blk null;
+                        };
+                        if (shaped) |sh| {
+                            const slot: ?usize = for (self.mac_shapes[0..self.mac_nshapes], 0..) |f, i| {
+                                if (f == sh.foff) break i;
+                            } else null;
+                            if (slot) |i| {
+                                try self.w("        LDA {s}", .{try self.imm(sh.buf.len_slot)});
+                                try self.w("        STA ${X}", .{self.off_mc});
+                                try self.w("        MAC {d}", .{i});
+                                // A1.3: the burst runs the whole routine —
+                                // charge its conservative bound at the site.
+                                self.cost +|= 600;
+                                // the routine RETURNS a verdict: A=0 equal
+                                try self.w("        {s} L{d}", .{
+                                    if (b.op == .eq) @as([]const u8, "BNE") else "BEQ", target,
+                                });
+                                return;
+                            }
+                        }
+                    }
                     if (b.op == .eq) {
                         try self.emitByteCmp(sa, sb, target);
                     } else {
@@ -3563,6 +3807,14 @@ const Gen = struct {
                 try self.w("        STA ${X}", .{self.slots.get(v.name).?});
             }
         }
+        // Item 7: the MAC comparator vectors, staged like any near word.
+        if (self.layout.mac and self.mac_nshapes > 0) {
+            try self.w("; MACTAB: one byte-comparator vector per field shape", .{});
+            for (0..self.mac_nshapes) |i| {
+                try self.w("        LDA ##L{d}", .{self.mc_labels[i]});
+                try self.w("        STA ${X}", .{isa.mactab_base + i * 8});
+            }
+        }
         // Byte-equality tail masks, staged once per life.
         if (self.bufs.count() > 0) {
             try self.w("; tail masks for byte equality", .{});
@@ -3599,6 +3851,7 @@ const Gen = struct {
                 try self.w("        HLT", .{});
             }
             try self.emitStrings();
+            try self.emitMacComparator();
             try self.checkBounds(0);
             return;
         }
@@ -3615,6 +3868,13 @@ const Gen = struct {
         const l_other = if (has_other) self.label() else self.serve_label;
         try self.w("; serve: LSTN, pop, fused deliver test — acks fail one compare", .{});
         try self.w("L{d}:   LSTN 1", .{self.serve_label});
+        if (self.layout.mac and self.mac_nshapes > 0) {
+            // MAC is JSR-shaped and SP is park-volatile: every burst
+            // re-establishes the stack before anything can call. This is
+            // the tax item 4 removed and item 7 pays to measure.
+            try self.w("        LDX ##${X}", .{self.layout.data + (abi.block_size - abi.data_off)});
+            try self.w("        TXS", .{});
+        }
         try self.w("        CQPOP 1", .{});
         if (has_other) try self.w("        TAY", .{});
         try self.w("        AND ##$FFFF", .{});
@@ -3666,6 +3926,7 @@ const Gen = struct {
         if (self.spawn_count > 0) try self.emitExitRuntime(l_exit);
         if (self.has_quiesce) try self.emitQuiesce();
         try self.emitStrings();
+        try self.emitMacComparator();
 
         // A1.3: everything in the serve region that is not a handler body
         // is dispatch overhead — every burst pays it on top of its own.
@@ -4121,6 +4382,10 @@ const Gen = struct {
         defer self.serve_label = saved;
         try self.w("; quiesce: the lame-duck serve — same fused test, timers dead", .{});
         try self.w("L{d}:   LSTN 1", .{lq});
+        if (self.layout.mac and self.mac_nshapes > 0) {
+            try self.w("        LDX ##${X}", .{self.layout.data + (abi.block_size - abi.data_off)});
+            try self.w("        TXS", .{});
+        }
         try self.w("        CQPOP 1", .{});
         try self.w("        AND ##$FFFF", .{});
         try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});

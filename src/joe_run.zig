@@ -68,6 +68,9 @@ pub const Options = struct {
     /// privilege of an idle core. Off reproduces the starvation for the
     /// pricing benchmark.
     contended_lstn: bool = true,
+    /// Item 7's measurement flag: route eligible byte-equality sites
+    /// through the shared MAC comparator.
+    use_mac: bool = false,
 };
 
 pub const VarOut = struct { name: []const u8, value: u64, f64: bool = false };
@@ -272,6 +275,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         var r = joe.compile(alloc, source, pc.actor, .{
             .origin = block,
             .data = block + joe.abi.data_off,
+            .mac = opts.use_mac,
         }, &diag) catch |err| {
             std.debug.print("joe {s}: line {d}: {s}\n", .{ pc.actor, diag.line, diag.message });
             return err;

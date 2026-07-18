@@ -1075,3 +1075,44 @@ saturation, and the language's hands tied exactly where the hardware
 owns the memory. Next: item 7, the MAC re-trial on a compiled corpus
 that finally has real subroutine reuse — then the v2.6 draft, with
 every verdict of this campaign in its basket.
+
+## Item 7: the MAC re-trial — reuse arrived, and MAC was waiting (2026-07-18)
+
+The original trial deferred MAC with data: hand-written code had no
+reuse worth a vector table. The deferral said re-measure when compiled
+code exists — and the compiled corpus now writes the same comparator
+twelve times into one actor. The re-trial, on store.joe under scorch:
+
+| | code | cycles | MAC calls |
+|---|---|---|---|
+| inline (today's default) | 3,429 B | 10,612 | 0 |
+| `use_mac` | **2,353 B (−31.4%)** | 10,935 (+3.0%) | 12 |
+
+The mechanism: byte-equality sites whose shape matches — a buf against
+a bytes field at a known offset — collapse to a four-instruction call
+(stage the buf's slot, `MAC n`, branch on the returned verdict) through
+one comparator routine per distinct field offset, each in its own
+MACTAB slot (store needs two: Put's key rides at +16, Get/Del's at
++8 — the first single-shape attempt caught only a third of the sites,
+and the census said so). Sites that don't fit any shape inline exactly
+as before; programs without reuse pay nothing (null-cost held at flag
+off, to the cycle).
+
+**The collapse's tax, measured**: MAC is JSR-shaped and SP is
+park-volatile, so every burst re-establishes the stack — two
+instructions after each LSTN. That plus the call/return linkage is the
+whole +3.0%. Item 4 removed the stack; item 7 rents it back per burst,
+only where a program opted in, and scorch proves the linkage never
+leans on anything a park destroys.
+
+**Verdict shape (Christian's call, numbers on the table)**: MAC pays
+where reuse lives — comparator-heavy, pattern-heavy actors — at a
+cycle cost that stays invisible in latency-dominated protocols. As a
+per-deployment flag it is honest today; as a default it should wait
+for the store hardware phase, where the byte-walkers multiply. The
+per-context MACTAB means no cross-actor sharing: the bigger prize
+(one comparator for the whole core) is a shared-code-pages question
+for v2.6's table, noted and not smuggled.
+
+123 tests. The §7 order of work is now COMPLETE through item 7;
+item 8 — the v2.6 draft — is all that remains, and its basket is full.

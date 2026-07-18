@@ -1584,6 +1584,44 @@ test "item 6: saturation is backpressure — a busy accelerator rejects, corrupt
     }
 }
 
+test "item 7: the MAC re-trial — the store's twelve comparators, one routine" {
+    // The deferred measurement, re-run on a corpus with real reuse:
+    // store.joe compares four bufs against one key field from twelve
+    // sites. With use_mac the sites collapse to a four-instruction call
+    // through MACTAB slot 0, each burst re-establishes SP (the tax the
+    // collapse removed), and the outcomes must not move a bit — under
+    // scorch, naturally, since MAC linkage is stack state inside a
+    // burst and nothing survives the parks.
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/store.joe");
+    var bytes: [2]usize = undefined;
+    var cycles: [2]u64 = undefined;
+    var calls: [2]u64 = undefined;
+    for ([_]bool{ false, true }, 0..) |mac, k| {
+        var o = try joe_run.simulate(testing.allocator, src, .{
+            .loss_ppm4k = 0,
+            .dup_ppm4k = 0,
+            .use_mac = mac,
+            .scorch = true,
+        });
+        defer o.deinit();
+        try testing.expectEqual(@as(u64, 4343), o.varOf("client", "got_hs").?);
+        try testing.expectEqual(@as(u64, 111), o.varOf("client", "got_p1").?);
+        try testing.expectEqual(@as(u64, 2), o.varOf("client", "misses").?);
+        try testing.expectEqual(@as(u64, 1), o.varOf("store", "used").?);
+        bytes[k] = o.instance("store").?.code_bytes;
+        cycles[k] = o.cycles;
+        calls[k] = o.stats.macro_calls;
+    }
+    try testing.expectEqual(@as(u64, 0), calls[0]);
+    try testing.expect(calls[1] > 0);
+    try testing.expect(bytes[1] < bytes[0]);
+    std.debug.print("\n[item7] store: {d} B / {d} cy inline  →  {d} B / {d} cy MAC ({d} calls, {d:.1}% code)\n", .{
+        bytes[0], cycles[0], bytes[1], cycles[1], calls[1],
+        @as(f64, @floatFromInt(bytes[1])) * 100.0 / @as(f64, @floatFromInt(bytes[0])),
+    });
+}
+
 test "item 6b: matmul.joe — grant, type-state, rebind; both silicons, same bits" {
     const joe_run = @import("joe_run.zig");
     const src = @embedFile("programs/matmul.joe");
