@@ -304,6 +304,10 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             std.debug.print("joe {s}: asm line {d}: {s}\n", .{ pc.actor, adiag.line, adiag.message });
             return err;
         };
+        if (out.code.len > joe.abi.data_off)
+            return fail("{s}: {d} bytes of code overflow the block's {d}-byte code region", .{
+                pc.actor, out.code.len, joe.abi.data_off,
+            });
         try compiled.append(.{ .r = r, .out = out });
     }
 

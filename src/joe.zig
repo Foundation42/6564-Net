@@ -109,11 +109,14 @@ pub const abi = struct {
     pub const token: u64 = 0x6564;
     pub const param_base: u16 = 0x800;
     pub const timer_cookie: u64 = 0x77;
-    /// One instance block: code at +0, data at +$800 (rings, buffers,
-    /// staging, then the array area), stack down from +$2000. The loader
-    /// places context c of a core at ram_base + c * block_size.
-    pub const block_size: u64 = 0x2000;
-    pub const data_off: u64 = 0x800;
+    /// One instance block: code at +0, data at +$2000 (rings, buffers,
+    /// staging, then the array area), stack down from +$4000. The loader
+    /// places context c of a core at ram_base + c * block_size, and
+    /// refuses code that overflows the code region — the A2 store taught
+    /// us what silent overlap looks like (an actor executing its own
+    /// completion queue: bad_macro at a mid-instruction address).
+    pub const block_size: u64 = 0x4000;
+    pub const data_off: u64 = 0x2000;
     /// Arrays (group params and `var x [N]u64`) live in RAM from this
     /// offset within the data region — the near page is too small.
     pub const array_off: u64 = 0x280;
@@ -225,6 +228,9 @@ const Stmt = union(enum) {
     /// `pack key, ("users", id, "profile")` — encode a struple tuple into
     /// a declared buffer (A2.3). Canonical only; capacity checked.
     pack: struct { buf: []const u8, elems: []PackElem, line: usize },
+    /// `copy dst, src` — bytes into a buf from another buf or from the
+    /// bound message's bytes field. The store's Put, among others.
+    copy_: struct { dst: []const u8, src: *Expr, line: usize },
     spawn: struct {
         actor: []const u8,
         args: []u64, // v1: literal args only
@@ -935,6 +941,11 @@ const Parser = struct {
                 return self.fail("an empty tuple packs nothing", Error.Semantics);
             return .{ .pack = .{ .buf = bname.text, .elems = try elems.toOwnedSlice(), .line = line } };
         }
+        if (try self.eatKw("copy")) {
+            const dst = try self.expect(.ident, "a buf name");
+            _ = try self.expect(.comma, ",");
+            return .{ .copy_ = .{ .dst = dst.text, .src = try self.parseExpr(), .line = line } };
+        }
         if (self.isKw("while"))
             return self.fail(
                 "joe has no `while` (Amendment 1): unbounded iteration is a self-send loop, one park per slice",
@@ -1284,6 +1295,10 @@ const Gen = struct {
     /// volatile across parks, so the stack is simply not used.
     off_tmp: u16 = 0,
     tdepth: u8 = 0,
+    /// Tail masks for byte equality (A2): masks[k] = 2^(8k)−1 at
+    /// off_masks + 8k, staged at init when the actor has any bufs — the
+    /// ISA has no variable shifts, so the mask is a table lookup.
+    off_masks: u16 = 0,
     /// First free near slot after the fixed layout — loop variables and
     /// bindings are handed out from here.
     next_slot: u16 = 0,
@@ -1381,7 +1396,8 @@ const Gen = struct {
         self.off_elem = off + 72;
         self.off_self = off + 80;
         self.off_tmp = off + 88; // 4 slots
-        self.spawn_base = off + 120;
+        self.off_masks = off + 120; // 8 slots (index k*8, k = 1..7)
+        self.spawn_base = off + 184;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
@@ -1462,6 +1478,7 @@ const Gen = struct {
         for (list) |s| {
             switch (s) {
                 .pack => |p| if (std.mem.eql(u8, p.buf, name)) return true,
+                .copy_ => |c| if (std.mem.eql(u8, c.dst, name)) return true,
                 .if_ => |i| if (packsInto(i.then, name) or packsInto(i.els, name)) return true,
                 .bounded => |b| if (packsInto(b.body, name)) return true,
                 .for_range => |f| if (packsInto(f.body, name)) return true,
@@ -1682,12 +1699,174 @@ const Gen = struct {
         }
     }
 
+    /// A byte-comparable subject: a local buf, or the bound message's
+    /// bytes field (as its landing-buffer offset).
+    const ByteSubj = union(enum) { buf: BufInfo, field: u16 };
+
+    fn byteSubject(self: *Gen, e: *const Expr) ?ByteSubj {
+        switch (e.*) {
+            .ident => |name| {
+                if (self.bufs.get(name)) |bi| return .{ .buf = bi };
+                return null;
+            },
+            .field => |fx| {
+                if (self.bind == null or !std.mem.eql(u8, self.bind.?, fx.base)) return null;
+                const m = self.bind_msg orelse return null;
+                for (m.fields) |*fl| {
+                    if (std.mem.eql(u8, fl.name, fx.name))
+                        return if (fl.ty == .bytes_) .{ .field = fl.offset } else null;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Byte equality (A2, the store's comparator): lengths first, then
+    /// whole words, then the tail word under a mask-table mask (the ISA
+    /// has no variable shifts, so the mask is a lookup). Branches to
+    /// `l_diff` on any difference; falls through equal.
+    fn emitByteCmp(self: *Gen, a: ByteSubj, b: ByteSubj, l_diff: usize) Error!void {
+        const t_rem = try self.pushTmp();
+        var tmps: u8 = 1;
+        defer while (tmps > 0) : (tmps -= 1) self.popTmp();
+        const pa: ?u16 = if (a == .field) blk: {
+            tmps += 1;
+            break :blk try self.pushTmp();
+        } else null;
+        const pb: ?u16 = if (b == .field) blk: {
+            tmps += 1;
+            break :blk try self.pushTmp();
+        } else null;
+        const any_buf = a == .buf or b == .buf;
+        const t_x: ?u16 = if (any_buf) blk: {
+            tmps += 1;
+            break :blk try self.pushTmp();
+        } else null;
+
+        try self.w("; byte equality: lengths, words, masked tail", .{});
+        // field pointers at the length byte
+        if (pa) |p| {
+            try self.w("        LDA ${X}", .{self.off_ptr});
+            try self.w("        CLC", .{});
+            try self.w("        ADC {s}", .{try self.imm(a.field)});
+            try self.w("        STA ${X}", .{p});
+        }
+        if (pb) |p| {
+            try self.w("        LDA ${X}", .{self.off_ptr});
+            try self.w("        CLC", .{});
+            try self.w("        ADC {s}", .{try self.imm(b.field)});
+            try self.w("        STA ${X}", .{p});
+        }
+        // lengths
+        switch (a) {
+            .buf => |bi| try self.w("        LDA ${X}", .{bi.len_slot}),
+            .field => {
+                try self.w("        LDA (${X})", .{pa.?});
+                try self.w("        AND #$FF", .{});
+            },
+        }
+        try self.w("        STA ${X}", .{t_rem});
+        switch (b) {
+            .buf => |bi| try self.w("        LDA ${X}", .{bi.len_slot}),
+            .field => {
+                try self.w("        LDA (${X})", .{pb.?});
+                try self.w("        AND #$FF", .{});
+            },
+        }
+        try self.w("        CMP ${X}", .{t_rem});
+        try self.w("        BNE L{d}", .{l_diff});
+        // advance field pointers past the length byte
+        if (pa) |p| try self.w("        INC ${X}", .{p});
+        if (pb) |p| try self.w("        INC ${X}", .{p});
+        if (any_buf) try self.w("        LDX #0", .{});
+        const l_w = self.label();
+        const l_tail = self.label();
+        const l_done = self.label();
+        const c_loop = self.cost;
+        try self.w("L{d}:   LDA ${X}", .{ l_w, t_rem });
+        try self.w("        CMP #8", .{});
+        try self.w("        BCC L{d}", .{l_tail});
+        try self.loadSide(a, pa);
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.loadSide(b, pb);
+        try self.w("        CMP ${X}", .{self.off_t});
+        try self.w("        BNE L{d}", .{l_diff});
+        if (any_buf) {
+            try self.w("        TXA", .{});
+            try self.w("        CLC", .{});
+            try self.w("        ADC #8", .{});
+            try self.w("        TAX", .{});
+        }
+        if (pa) |p| try self.bumpPtr(p);
+        if (pb) |p| try self.bumpPtr(p);
+        try self.w("        LDA ${X}", .{t_rem});
+        try self.w("        SEC", .{});
+        try self.w("        SBC #8", .{});
+        try self.w("        STA ${X}", .{t_rem});
+        try self.w("        BRA L{d}", .{l_w});
+        // A1.3: bufs cap at 1024 → at most 128 word laps.
+        self.cost +|= (self.cost - c_loop) *| 127;
+        try self.w("L{d}:   LDA ${X}", .{ l_tail, t_rem });
+        try self.w("        BEQ L{d}", .{l_done});
+        if (t_x) |tx| {
+            try self.w("        TXA", .{});
+            try self.w("        STA ${X}", .{tx});
+        }
+        try self.w("        LDA ${X}", .{t_rem});
+        try self.w("        ASL #3", .{});
+        try self.w("        TAX", .{});
+        try self.w("        LDA ${X},X", .{self.off_masks});
+        try self.w("        STA ${X}", .{self.off_acc});
+        if (t_x) |tx| try self.w("        LDX ${X}", .{tx});
+        try self.loadSide(a, pa);
+        try self.w("        AND ${X}", .{self.off_acc});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.loadSide(b, pb);
+        try self.w("        AND ${X}", .{self.off_acc});
+        try self.w("        CMP ${X}", .{self.off_t});
+        try self.w("        BNE L{d}", .{l_diff});
+        try self.w("L{d}:", .{l_done});
+    }
+
+    fn loadSide(self: *Gen, s: ByteSubj, p: ?u16) Error!void {
+        switch (s) {
+            .buf => |bi| try self.w("        LDA ${X},X", .{bi.data}),
+            .field => try self.w("        LDA (${X})", .{p.?}),
+        }
+    }
+
+    fn bumpPtr(self: *Gen, p: u16) Error!void {
+        try self.w("        LDA ${X}", .{p});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #8", .{});
+        try self.w("        STA ${X}", .{p});
+    }
+
     /// Emit a branch to `target` when `cond` is FALSE. Conditions are
     /// comparisons or && chains of them (v1).
     fn branchIfFalse(self: *Gen, cond: *const Expr, target: usize) Error!void {
         if (cond.* != .bin)
             return self.fail(0, "a condition must compare something (v1)", Error.Unsupported);
         const b = cond.bin;
+        // Byte subjects compare as bytes (A2): `key == g.key` and friends.
+        if (b.op == .eq or b.op == .ne) {
+            if (self.byteSubject(b.l)) |sa| {
+                if (self.byteSubject(b.r)) |sb| {
+                    if (sa == .field and sb == .field)
+                        return self.fail(0, "compare two message fields through a buf (v1)", Error.Unsupported);
+                    if (b.op == .eq) {
+                        try self.emitByteCmp(sa, sb, target);
+                    } else {
+                        const l_diff = self.label();
+                        try self.emitByteCmp(sa, sb, l_diff);
+                        try self.w("        BRA L{d}", .{target});
+                        try self.w("L{d}:", .{l_diff});
+                    }
+                    return;
+                }
+            }
+        }
         switch (b.op) {
             .land => {
                 try self.branchIfFalse(b.l, target);
@@ -1928,6 +2107,7 @@ const Gen = struct {
                 self.cost_dyn = true;
             },
             .pack => |pk| try self.stmtPack(pk),
+            .copy_ => |cp| try self.stmtCopy(cp),
             .quiesce => {
                 // Termination is a phase: kill the clock, cross into the
                 // lame-duck case set, never come back.
@@ -2310,6 +2490,66 @@ const Gen = struct {
         }
     }
 
+    /// `copy dst, src` (A2): whole-word copies — buf to buf straight
+    /// through the near page, bytes field to buf through the landing
+    /// pointer. Length checked against the destination's capacity (BRK
+    /// on overflow, the pack_overflow law).
+    fn stmtCopy(self: *Gen, cp: anytype) Error!void {
+        const di = self.bufs.get(cp.dst) orelse
+            return self.fail(cp.line, "copy wants a `buf` destination", Error.Semantics);
+        const src = self.byteSubject(cp.src) orelse
+            return self.fail(cp.line, "copy's source is a buf or the bound bytes field", Error.Semantics);
+        switch (src) {
+            .buf => |si| {
+                try self.w("; copy {s} <- buf", .{cp.dst});
+                if (si.cap > di.cap) {
+                    const l_ok = self.label();
+                    try self.w("        LDA ${X}", .{si.len_slot});
+                    try self.w("        CMP {s}", .{try self.imm(di.cap + 1)});
+                    try self.w("        BCC L{d}", .{l_ok});
+                    try self.w("        BRK                 ; copy overflow", .{});
+                    try self.w("L{d}:", .{l_ok});
+                }
+                try self.w("        LDA ${X}", .{si.len_slot});
+                try self.w("        STA ${X}", .{di.len_slot});
+                const words = (@min(si.cap, di.cap) + 7) / 8;
+                var wo: u16 = 0;
+                while (wo < words) : (wo += 1) {
+                    try self.w("        LDA ${X}", .{si.data + wo * 8});
+                    try self.w("        STA ${X}", .{di.data + wo * 8});
+                }
+            },
+            .field => |foff| {
+                const cap_msg: u16 = @intCast(abi.land_cap - foff - 1);
+                const tp = try self.pushTmp();
+                defer self.popTmp();
+                try self.w("; copy {s} <- bytes field", .{cp.dst});
+                try self.w("        LDA ${X}", .{self.off_ptr});
+                try self.w("        CLC", .{});
+                try self.w("        ADC {s}", .{try self.imm(foff)});
+                try self.w("        STA ${X}", .{tp});
+                try self.w("        LDA (${X})", .{tp});
+                try self.w("        AND #$FF", .{});
+                if (cap_msg > di.cap) {
+                    const l_ok = self.label();
+                    try self.w("        CMP {s}", .{try self.imm(di.cap + 1)});
+                    try self.w("        BCC L{d}", .{l_ok});
+                    try self.w("        BRK                 ; copy overflow", .{});
+                    try self.w("L{d}:", .{l_ok});
+                }
+                try self.w("        STA ${X}", .{di.len_slot});
+                try self.w("        INC ${X}", .{tp});
+                const words = (@min(cap_msg, di.cap) + 7) / 8;
+                var wo: u16 = 0;
+                while (wo < words) : (wo += 1) {
+                    if (wo != 0) try self.bumpPtr(tp);
+                    try self.w("        LDA (${X})", .{tp});
+                    try self.w("        STA ${X}", .{di.data + wo * 8});
+                }
+            },
+        }
+    }
+
     /// Append one u64 as a canonical struple int at the buffer's current
     /// length: zero is the bare $20; else type code $20+n then the n
     /// magnitude bytes, emitted MSB-first by a skip-counted peel of the
@@ -2671,6 +2911,16 @@ const Gen = struct {
             if (v.init) |e| {
                 try self.evalInto(e);
                 try self.w("        STA ${X}", .{self.slots.get(v.name).?});
+            }
+        }
+        // Byte-equality tail masks, staged once per life.
+        if (self.bufs.count() > 0) {
+            try self.w("; tail masks for byte equality", .{});
+            var k: u16 = 1;
+            while (k < 8) : (k += 1) {
+                const mask = (@as(u64, 1) << @intCast(k * 8)) - 1;
+                try self.w("        LDA ##${X}", .{mask});
+                try self.w("        STA ${X}", .{self.off_masks + k * 8});
             }
         }
         // Pack targets reset their length every life (the near page

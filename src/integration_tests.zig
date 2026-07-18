@@ -1072,6 +1072,30 @@ test "A2.4: keys.joe — dispatch on structured keys is memcmp, scorched too" {
     }
 }
 
+test "A2.5: store.joe — the substrate's shape, polyfilled by an ordinary actor" {
+    // §7.5's proof obligation, discharged: the Put/Get/Del contract with
+    // canonical struple keys, served entirely from joe — byte equality,
+    // copy, overwrite, delete, honest misses. Scorched and not.
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/store.joe");
+    for ([_]bool{ false, true }) |burnt| {
+        var o = try joe_run.simulate(testing.allocator, src, .{
+            .loss_ppm4k = 0,
+            .dup_ppm4k = 0,
+            .scorch = burnt,
+        });
+        defer o.deinit();
+        // overwrite honored, both keys retrieved, ghost + deleted both miss
+        try testing.expectEqual(@as(u64, 4343), o.varOf("client", "got_hs").?);
+        try testing.expectEqual(@as(u64, 111), o.varOf("client", "got_p1").?);
+        try testing.expectEqual(@as(u64, 2), o.varOf("client", "misses").?);
+        try testing.expectEqual(@as(u64, 8), o.varOf("client", "step").?);
+        // after the Del, only ("rocci","hs") remains
+        try testing.expectEqual(@as(u64, 1), o.varOf("store", "used").?);
+        try testing.expectEqual(machine.CtxState.parked, o.instance("store").?.state);
+    }
+}
+
 test "contended LSTN: hot delivery is a privilege of an idle core" {
     // The pricing benchmark for the v2.6 candidate. The machine-gun
     // shape that exposed the hole: a self-send looper co-resident with
@@ -1203,6 +1227,7 @@ test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
         .{ .src = @embedFile("programs/pipeline.joe"), .actors = &.{ "Source", "Stage", "Sink" } },
         .{ .src = @embedFile("programs/hello.joe"), .actors = &.{"Greeter"} },
         .{ .src = @embedFile("programs/keys.joe"), .actors = &.{ "Asker", "Router" } },
+        .{ .src = @embedFile("programs/store.joe"), .actors = &.{ "Store", "Client" } },
     };
     for (corpus) |entry| {
         for (entry.actors) |name| {

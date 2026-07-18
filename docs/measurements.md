@@ -839,3 +839,53 @@ an idle core, where nobody is harmed by it.
 Suite: 111 tests (the starvation is now a regression test in both
 directions). Default: on. v2.6 records "contended LSTN parks" with
 this table as its pricing.
+
+## store.joe: the substrate's shape, polyfilled in joe itself (2026-07-18)
+
+Christian's call: at this stage the store polyfill should be JOE, not
+the host engine behind a device coordinate — §7.5 discharged in the
+strongest available way. "Any device contract must be implementable by
+an ordinary actor" is not an argument anymore; it is a program:
+`store.joe` serves Put/Get/Del with canonical struple keys from four
+buf slots and a bitmask, and the radix engine, a dedicated node, or
+real silicon can stand behind the same messages later with no client
+the wiser.
+
+Two small byte capabilities made it writable, both A2-shaped:
+
+- **`copy dst, src`** — bytes into a buf from another buf or the bound
+  message's bytes field. Whole-word copies; capacity checked (BRK on
+  overflow, the pack_overflow law).
+- **Byte equality** — `k0 == p.key` in any condition. Lengths first,
+  then whole words, then the tail word under a mask from a near-page
+  table (the ISA has no variable shifts, so `2^(8k)−1` is a lookup,
+  staged once per life). Compare joins `where`/`if` through the same
+  branch machinery as everything else.
+
+The client walks a nine-step script, one request in flight (the reply
+is the ack), sequenced through an A1.1 self-send: Put ("rocci","hs")
+4242, Put ("users",1,"name") 111, overwrite to 4343, Get → **4343**,
+Get → **111**, Get ("ghost",9) → Miss, Del, Get-the-deleted → Miss.
+misses=2, used=1, quiescent, 24/24 delivered — scorched and not.
+
+**A bug worth its whole ledger line: the store was the first actor to
+outgrow the block.** 2,216 bytes of client against a 2KB code region
+(`data_off $800`) meant the CQ ring silently overwrote the code tail,
+and the machine faulted `bad_macro` executing its own completion queue
+at a mid-instruction address. The failure was honest (a fault, not
+corruption-and-continue) but the overlap was silent at load time — the
+recurring RAM-layout hazard, fourth incident. The block is now 16KB
+(8KB code + 8KB data), and the loader REFUSES oversized code instead
+of overlapping it. Cost of the growth: zero cycles everywhere (ring
+still 44,208 to the cycle).
+
+Deferred, still honest: byte values (sized bytes[N] fields), Scan and
+ordered iteration (memcmp ORDER, not just equality — wants the range
+machinery), multi-client reply routing (the `.from` question), store
+capacity beyond four (buf arrays or regions — A2-ii). Christian's
+rocci-bird sketch (docs/rocci-bird-joe.md) now sits in the docs as the
+north star for items 5/6: display/pad/APU devices, granted regions,
+SoA vectors — and its high score lives at `("rocci", "hs")`, which
+this store already serves.
+
+112 tests. joe now: 10 programs, 3 of them shipped today.

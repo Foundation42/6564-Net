@@ -1,0 +1,119 @@
+// store.joe — the substrate's shape (A2.5), polyfilled in joe itself.
+//
+// §7.5's rule is that silicon is an optimization, never an interface:
+// any device contract must be implementable by an ordinary actor. Here
+// is the proof for the store — the Put/Get/Del contract, keys as
+// canonical struple bytes, served by a joe actor with four slots and a
+// bitmask. The battle-tested radix engine, a dedicated node, or real
+// silicon can stand behind the same messages later; no client will be
+// able to tell, and that is the point.
+//
+// v1 honesty: values are u64 words (byte values want sized bytes[N]
+// fields — A2-ii); capacity is four keys, and a full store says so;
+// one client, because reply routing is a capability and `.from` is
+// still the kernel's question. Scan waits for ordered iteration.
+
+message Put  { val u64, key bytes }
+message Get  { key bytes }
+message Del  { key bytes }
+message Ok   { }
+message Got  { val u64 }
+message Miss { }
+message Full { }
+message Next { }
+
+actor Store(reply addr) {
+    var k0 buf [56]u8
+    var k1 buf [56]u8
+    var k2 buf [56]u8
+    var k3 buf [56]u8
+    var v [4]u64
+    var used u64 = 0
+    var hit u64 = 0
+
+    serve {
+        case Put(p):
+            hit = 0
+            if used & 1 == 1 && k0 == p.key { v[0] = p.val  hit = 1 }
+            if used & 2 == 2 && k1 == p.key { v[1] = p.val  hit = 1 }
+            if used & 4 == 4 && k2 == p.key { v[2] = p.val  hit = 1 }
+            if used & 8 == 8 && k3 == p.key { v[3] = p.val  hit = 1 }
+            if hit == 0 && used & 1 == 0 { copy k0, p.key  v[0] = p.val  used = used | 1  hit = 1 }
+            if hit == 0 && used & 2 == 0 { copy k1, p.key  v[1] = p.val  used = used | 2  hit = 1 }
+            if hit == 0 && used & 4 == 0 { copy k2, p.key  v[2] = p.val  used = used | 4  hit = 1 }
+            if hit == 0 && used & 8 == 0 { copy k3, p.key  v[3] = p.val  used = used | 8  hit = 1 }
+            if hit == 1 { send reply, Ok{} }
+            if hit == 0 { send reply, Full{} }
+
+        case Get(g):
+            hit = 0
+            if used & 1 == 1 && k0 == g.key { send reply, Got{v[0]}  hit = 1 }
+            if used & 2 == 2 && k1 == g.key { send reply, Got{v[1]}  hit = 1 }
+            if used & 4 == 4 && k2 == g.key { send reply, Got{v[2]}  hit = 1 }
+            if used & 8 == 8 && k3 == g.key { send reply, Got{v[3]}  hit = 1 }
+            if hit == 0 { send reply, Miss{} }
+
+        case Del(d):
+            hit = 0
+            if used & 1 == 1 && k0 == d.key { used = used & 14  hit = 1 }
+            if hit == 0 && used & 2 == 2 && k1 == d.key { used = used & 13  hit = 1 }
+            if hit == 0 && used & 4 == 4 && k2 == d.key { used = used & 11  hit = 1 }
+            if hit == 0 && used & 8 == 8 && k3 == d.key { used = used & 7   hit = 1 }
+            if hit == 1 { send reply, Ok{} }
+            if hit == 0 { send reply, Miss{} }
+    }
+}
+
+// The client walks a script, one request in flight (the reply is the
+// ack), sequencing through an A1.1 self-send so each case stays small.
+actor Client(store addr) {
+    var key buf [56]u8
+    var step u64 = 0
+    var last u64 = 0
+    var got_hs u64 = 0
+    var got_p1 u64 = 0
+    var misses u64 = 0
+
+    pack key, ("rocci", "hs")
+    send store, Put{4242, key}
+
+    serve {
+        case Ok(_):
+            step += 1
+            send self, Next{}
+        case Got(r):
+            step += 1
+            last = r.val
+            send self, Next{}
+        case Miss(_):
+            step += 1
+            misses += 1
+            send self, Next{}
+        case Full(_):
+            halt err
+
+        case Next(_):
+            if step == 1 { pack key, ("users", 1, "name")  send store, Put{111, key} }
+            if step == 2 { pack key, ("rocci", "hs")  send store, Put{4343, key} }
+            if step == 3 { pack key, ("rocci", "hs")  send store, Get{key} }
+            if step == 4 {
+                got_hs = last
+                pack key, ("users", 1, "name")
+                send store, Get{key}
+            }
+            if step == 5 {
+                got_p1 = last
+                pack key, ("ghost", 9)
+                send store, Get{key}
+            }
+            if step == 6 { pack key, ("users", 1, "name")  send store, Del{key} }
+            if step == 7 { pack key, ("users", 1, "name")  send store, Get{key} }
+            if step == 8 { quiesce }
+    }
+}
+
+// The store, declared last, is parked and listening first.
+system {
+    client = Client(store)
+    store = Store(client)
+}
