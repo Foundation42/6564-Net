@@ -42,6 +42,11 @@ const joe = @import("joe.zig");
 /// no context.
 const device_table = [_]struct { name: []const u8, coord: u16 }{
     .{ .name = "Console", .coord = 0xFF00 },
+    // The matmul accelerators (item 6): same contract, different
+    // silicon — the polyfill pulls the region through the network
+    // window; no client can tell, and that is the point.
+    .{ .name = "Matmul", .coord = 0xFF05 },
+    .{ .name = "MatmulRemote", .coord = 0xFF06 },
 };
 
 /// Replica-packing limits per core.
@@ -338,8 +343,12 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     defer m.deinit();
 
     for (devices.items) |*d| {
-        std.debug.assert(d.coord == 0xFF00); // Console is v1's only device
-        try m.attachDevice(d.coord, joe.abi.token, .{ .console = dev.Console.init(alloc) });
+        switch (d.coord) {
+            0xFF00 => try m.attachDevice(d.coord, joe.abi.token, .{ .console = dev.Console.init(alloc) }),
+            0xFF05 => try m.attachAccel(d.coord, joe.abi.token, .inproc),
+            0xFF06 => try m.attachAccel(d.coord, joe.abi.token, .remote),
+            else => unreachable,
+        }
     }
 
     // ── Wire, load and stage, instance by instance. Capability slots

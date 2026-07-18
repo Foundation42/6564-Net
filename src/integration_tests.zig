@@ -1399,19 +1399,21 @@ pub const matmul_asm =
     \\        STA $110
     \\        LDA ##$1234
     \\        STA $118
-    \\; the request: slot 8, token, 4x4x4, A at +0, B at +$80, C at +$100
-    \\        LDA #8
-    \\        STA !$2500
-    \\        LDA ##$1234
-    \\        STA !$2508
-    \\        LDA ##$400040004
-    \\        STA !$2510
+    \\; the request (w0 reserved): slot 8, token, 4x4x4, A +0, B +$80, C +$100
     \\        LDA #0
+    \\        STA !$2500
+    \\        LDA #8
+    \\        STA !$2508
+    \\        LDA ##$1234
+    \\        STA !$2510
+    \\        LDA ##$400040004
     \\        STA !$2518
-    \\        LDA ##$80
+    \\        LDA #0
     \\        STA !$2520
-    \\        LDA ##$100
+    \\        LDA ##$80
     \\        STA !$2528
+    \\        LDA ##$100
+    \\        STA !$2530
     \\; grant-on-submit: one SQE to the accelerator behind PTT slot 3
     \\        LDA #1
     \\        STA !$2400
@@ -1419,7 +1421,7 @@ pub const matmul_asm =
     \\        STA !$2408
     \\        LDA ##$2500
     \\        STA !$2410
-    \\        LDA ##$100000030
+    \\        LDA ##$100000038
     \\        STA !$2418
     \\        SEND 0
     \\wait:   LSTN 1
@@ -1506,8 +1508,8 @@ test "item 6: the matmul completes through a granted region — both siliconsind
         defer m.deinit();
         const ctx = &m.cores[0].contexts[0];
         try testing.expectEqual(machine.CtxState.halted, ctx.state);
-        // completion said ok
-        try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
+        // completion said ok: the architected tag, status clear above it
+        try testing.expectEqual(@as(u64, 0x6772), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
         // C matches the declared-deterministic contract, bit for bit
         for (0..16) |i| {
             const got = std.mem.readInt(u64, m.cores[0].ram[0x6100 - machine.ram_base + i * 8 ..][0..8], .little);
@@ -1542,8 +1544,8 @@ test "item 6: revocation between grant and completion — reject, never a scribb
     defer m.deinit();
     const ctx = &m.cores[0].contexts[0];
     try testing.expectEqual(machine.CtxState.halted, ctx.state);
-    // the completion arrived — as a reject
-    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
+    // the completion arrived — as a reject (status above the tag)
+    try testing.expectEqual(@as(u64, 0x16772), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
     // and C was never touched
     for (0..16) |i| {
         const got = std.mem.readInt(u64, m.cores[0].ram[0x6100 - machine.ram_base + i * 8 ..][0..8], .little);
@@ -1574,11 +1576,75 @@ test "item 6: saturation is backpressure — a busy accelerator rejects, corrupt
     const ctx = &m.cores[0].contexts[0];
     try testing.expectEqual(machine.CtxState.halted, ctx.state);
     try testing.expect(m.stats.rejects >= 1);
-    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
+    try testing.expectEqual(@as(u64, 0x6772), std.mem.readInt(u64, ctx.near[0x810..][0..8], .little));
     const mirror = matmulMirror();
     for (0..16) |i| {
         const got = std.mem.readInt(u64, m.cores[0].ram[0x6100 - machine.ram_base + i * 8 ..][0..8], .little);
         try testing.expectEqual(@as(u64, @bitCast(mirror[i])), got);
+    }
+}
+
+test "item 6b: matmul.joe — grant, type-state, rebind; both silicons, same bits" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/matmul.joe");
+    // the same program against the remote polyfill: one name changes
+    var remote_src_buf: [8192]u8 = undefined;
+    const remote_src = blk: {
+        const idx = std.mem.indexOf(u8, src, "Matmul()").?;
+        const n = (try std.fmt.bufPrint(&remote_src_buf, "{s}MatmulRemote(){s}", .{
+            src[0..idx], src[idx + 8 ..],
+        })).len;
+        break :blk remote_src_buf[0..n];
+    };
+    var sums: [2]u64 = undefined;
+    for ([_][]const u8{ src, remote_src }, 0..) |source, k| {
+        var o = try joe_run.simulate(testing.allocator, source, .{
+            .loss_ppm4k = 0,
+            .dup_ppm4k = 0,
+            .scorch = true,
+        });
+        defer o.deinit();
+        try testing.expectEqual(@as(u64, 1), o.varOf("s", "status").?);
+        sums[k] = o.varOf("s", "checksum").?;
+        // C[0,0] = 50, C[3,3] = 329 — the declared-deterministic mirror
+        try testing.expectEqual(@as(u64, @bitCast(@as(f64, 379.0))), sums[k]);
+    }
+    try testing.expectEqual(sums[0], sums[1]);
+}
+
+test "item 6b: a granted region is unreachable by type — §6.2 at compile time" {
+    // touching the region after the grant, in the same handler: refused
+    const bad1 =
+        \\message Mul { r grant, dims u64, offa u64, offb u64, offc u64 }
+        \\actor A(tpu addr) {
+        \\    var frame region [96]f64
+        \\    send tpu, Mul{grant frame, 1, 0, 8, 16}
+        \\    frame[0] = 1.0
+        \\    serve { case done(frame): quiesce }
+        \\}
+    ;
+    // touching it from a handler that neither grants nor rebinds: refused
+    const bad2 =
+        \\message Mul { r grant, dims u64, offa u64, offb u64, offc u64 }
+        \\message Poke { }
+        \\actor A(tpu addr) {
+        \\    var frame region [96]f64
+        \\    var x f64 = 0.0
+        \\    send tpu, Mul{grant frame, 1, 0, 8, 16}
+        \\    serve {
+        \\        case Poke(_):
+        \\            x = frame[0]
+        \\        case done(frame): quiesce
+        \\    }
+        \\}
+    ;
+    for ([_][]const u8{ bad1, bad2 }) |src| {
+        var diag = joe.Diagnostic{};
+        try testing.expectError(
+            joe.Error.Semantics,
+            joe.compile(testing.allocator, src, "A", .{}, &diag),
+        );
+        try testing.expect(std.mem.indexOf(u8, diag.message, "granted region") != null);
     }
 }
 
@@ -1739,6 +1805,7 @@ test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
         .{ .src = @embedFile("programs/keys.joe"), .actors = &.{ "Asker", "Router" } },
         .{ .src = @embedFile("programs/store.joe"), .actors = &.{ "Store", "Client" } },
         .{ .src = @embedFile("programs/vecmath.joe"), .actors = &.{"Calc"} },
+        .{ .src = @embedFile("programs/matmul.joe"), .actors = &.{"Splat"} },
     };
     for (corpus) |entry| {
         for (entry.actors) |name| {

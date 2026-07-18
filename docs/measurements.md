@@ -1037,3 +1037,41 @@ display grants.
 
 120 tests. Null-cost: nothing that doesn't speak to $FF05/$FF06 moved
 a cycle; frozen table intact; ring still 55.
+
+## Item 6b: joe grants — §6.2 promoted to compile time (2026-07-18)
+
+The sketch's §2.5 example now compiles and runs. `var frame region
+[96]f64` is a RAM array wearing a descriptor (slot 8 up, staged at
+init beside the rings, token = the ABI token); `send tpu, Mul{grant
+frame, …}` stages the descriptor slot and the LIVE token as two wire
+words and flips the compile-time type-state; the accel's completion —
+the architected $6772 tag, far above any program's tag space, status
+riding above it, slot in word1 — routes to `case done(frame)` /
+`case failed(frame)`, which rebind. The contract gained one reserved
+leading word so silicon and joe agree on framing without the device
+ever knowing a program's message table.
+
+**The type-state is v1-conservative and honest**: a granted-anywhere
+region is accessible in a handler only BEFORE that handler's own
+grant, and inside its done/failed cases; every other handler must
+keep its hands off, because it may run while the region is
+hardware-owned. Both violations are compile errors with §6.2 in the
+message, and both are in the suite as negative tests.
+
+`matmul.joe`: fills A and B in-region, grants, parks; done rebinds
+and reads C's corners — checksum 379.0 (C[0,0]=50 + C[3,3]=329,
+hand-checked), **bit-identical against both silicons under scorch**,
+where the remote run differs only in window traffic. The test swaps
+`Matmul()` for `MatmulRemote()` — one name in the system block — and
+nothing else. The loader knows both as device-table citizens.
+
+Also fixed en route: wire fields wider than 8 bytes align to 8, not
+to their own size (the grant field had drifted one word off the
+silicon contract), and the machine rejects a grant of an
+already-owned region (backpressure, same as busy).
+
+122 tests. Item 6 closes whole: regions, two accelerators, revocation,
+saturation, and the language's hands tied exactly where the hardware
+owns the memory. Next: item 7, the MAC re-trial on a compiled corpus
+that finally has real subroutine reuse — then the v2.6 draft, with
+every verdict of this campaign in its basket.

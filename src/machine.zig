@@ -442,12 +442,15 @@ pub const Machine = struct {
     }
 
     /// A matmul request arrives (contract, all u64 LE words):
-    ///   w0 region desc slot   w1 token presented
-    ///   w2 dims M | K<<16 | N<<32 (each 1..32)
-    ///   w3 offset of A   w4 offset of B   w5 offset of C  (bytes, in-region)
+    ///   w0 reserved (joe's tag word — silicon ignores it)
+    ///   w1 region desc slot   w2 token presented
+    ///   w3 dims M | K<<16 | N<<32 (each 1..32)
+    ///   w4 offset of A   w5 offset of B   w6 offset of C  (bytes, in-region)
     /// Grant-on-submit: acceptance sets the descriptor's OWNED flag; the
-    /// completion (a delivery to the sender's RX ring) is the release
-    /// fence. A busy accelerator rejects — saturation is backpressure.
+    /// completion (a delivery to the sender's RX ring, word0 low16 =
+    /// $6772 with the status above it, word1 = the slot) is the release
+    /// fence. A busy accelerator — or an already-granted region — rejects:
+    /// saturation is backpressure.
     fn deliverToAccel(self: *Machine, due: u64, gram: mesh.Datagram) !void {
         const ac = self.accels.getPtr(gram.dst_core).?;
         const reject = struct {
@@ -458,7 +461,7 @@ pub const Machine = struct {
         }.of;
         if (ac.token != 0 and ac.token != gram.token)
             return reject(self, due, gram, .reject_capability);
-        if (ac.busy or gram.payload.len < 48)
+        if (ac.busy or gram.payload.len < 56)
             return reject(self, due, gram, .reject_no_buffer);
         // the granting context is the sender of this request
         const pend = self.pending.get(gram.send_id) orelse
@@ -474,14 +477,14 @@ pub const Machine = struct {
             .coord = gram.dst_core,
             .core = rcore,
             .ctx = rctx,
-            .slot = @truncate(w(gram.payload, 0)),
-            .token = w(gram.payload, 1),
-            .m = @truncate(w(gram.payload, 2)),
-            .k = @truncate(w(gram.payload, 2) >> 16),
-            .n = @truncate(w(gram.payload, 2) >> 32),
-            .off_a = w(gram.payload, 3),
-            .off_b = w(gram.payload, 4),
-            .off_c = w(gram.payload, 5),
+            .slot = @truncate(w(gram.payload, 1)),
+            .token = w(gram.payload, 2),
+            .m = @truncate(w(gram.payload, 3)),
+            .k = @truncate(w(gram.payload, 3) >> 16),
+            .n = @truncate(w(gram.payload, 3) >> 32),
+            .off_a = w(gram.payload, 4),
+            .off_b = w(gram.payload, 5),
+            .off_c = w(gram.payload, 6),
         };
         if (job.m == 0 or job.k == 0 or job.n == 0 or job.m > 32 or job.k > 32 or job.n > 32)
             return reject(self, due, gram, .reject_capability);
@@ -489,6 +492,8 @@ pub const Machine = struct {
             return reject(self, due, gram, .reject_capability);
         if (desc.token == 0 or desc.token != job.token)
             return reject(self, due, gram, .reject_capability);
+        if (desc.flags & ring.desc_flag_owned != 0)
+            return reject(self, due, gram, .reject_no_buffer); // already granted out
         const need_a = @as(u64, job.m) * job.k * 8;
         const need_b = @as(u64, job.k) * job.n * 8;
         const need_c = @as(u64, job.m) * job.n * 8;
@@ -590,7 +595,12 @@ pub const Machine = struct {
         self.setRegionOwned(job, false); // the release fence precedes the record
         self.trace("accel ${X} @{d} {s} slot{d}", .{ job.coord, due, if (ok) @as([]const u8, "complete") else "REVOKED", job.slot });
         var payload: [16]u8 = undefined;
-        std.mem.writeInt(u64, payload[0..8], if (ok) 0 else 1, .little);
+        // word0: the architected grant-completion tag $6772 with the
+        // status above it — far outside any program's message tag space,
+        // so a joe dispatcher routes it without the silicon ever knowing
+        // the program's message table.
+        const status: u64 = if (ok) 0 else 1;
+        std.mem.writeInt(u64, payload[0..8], 0x6772 | (status << 16), .little);
         std.mem.writeInt(u64, payload[8..16], job.slot, .little);
         const rx_token = blk: {
             // silicon presents whatever the target ring demands

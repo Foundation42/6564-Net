@@ -1,0 +1,39 @@
+// matmul.joe — the sketch's §2.5, in the flesh: Tier 2 as a granted
+// region and a fabric request. The actor fills A and B inside its own
+// region, grants it to the accelerator on the send, and CANNOT TOUCH
+// IT — not by convention, by type: any access between the grant and
+// the completion case is a compile error, §6.2 promoted to compile
+// time. The completion is the release fence; `case done(frame)`
+// rebinds; `case failed(frame)` hears a revoked or rejected grant.
+//
+// Swap `Matmul` for `MatmulRemote` in the system block and the same
+// program runs against the fabric-remote polyfill — same bits, §7.5.
+
+message Mul { r grant, dims u64, offa u64, offb u64, offc u64 }
+
+actor Splat(tpu addr) {
+    var frame region [96]f64
+    var checksum f64 = 0.0
+    var status u64 = 0
+
+    for i in 0..16 { frame[i] = f64(i + 1) }
+    for i in 0..16 { frame[32 + i] = f64(i) * 0.5 + 1.0 }
+
+    send tpu, Mul{grant frame, $400040004, 0, 256, 512}
+
+    serve {
+        case done(frame):
+            status = 1
+            checksum = frame[64] + frame[79]
+            quiesce
+
+        case failed(frame):
+            status = 2
+            quiesce
+    }
+}
+
+system {
+    s = Splat(tpu)
+    tpu = Matmul()
+}

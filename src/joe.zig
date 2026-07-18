@@ -141,6 +141,9 @@ const Type = enum {
     bytes_,
     /// `f64` — Tier 0 scalar float; bits in a u64 slot (A1.4).
     f64_,
+    /// `grant` — a region grant riding a message (item 6): two wire
+    /// words, the descriptor slot and the token. Message fields only.
+    grant_,
     /// `vec` — eight f64 lanes in a 64-byte near-page slab; expressions
     /// evaluate through the Tier 1 V file, which never survives a park,
     /// so `var` stays the only thing that does (A1.4).
@@ -153,6 +156,7 @@ const Type = enum {
             .u32_ => 4,
             .u64_, .addr, .addr_slice, .f64_ => 8,
             .bytes_ => 0, // laid out specially; never masked or packed
+            .grant_ => 16,
             .vec_ => 64,
         };
     }
@@ -163,6 +167,7 @@ const Type = enum {
             .{ "u32", Type.u32_ }, .{ "u64", Type.u64_ },
             .{ "addr", Type.addr }, .{ "bytes", Type.bytes_ },
             .{ "f64", Type.f64_ },  .{ "vec", Type.vec_ },
+            .{ "grant", Type.grant_ },
         };
         inline for (pairs) |p| {
             if (std.mem.eql(u8, name, p[0])) return p[1];
@@ -206,6 +211,9 @@ const Expr = union(enum) {
     permute: struct { base: *Expr, mask: u64 },
     /// `f64(e)` / `int(e)` — the explicit conversions (ITOF / FTOI).
     cast: struct { to_f64: bool, e: *Expr },
+    /// `grant frame` as a send argument (item 6): stages the region's
+    /// descriptor slot and token, and flips the compile-time type-state.
+    grantref: []const u8,
 };
 
 /// One element of an `is` tuple pattern (A2.4): constants fuse into a
@@ -288,7 +296,18 @@ const Param = struct { name: []const u8, ty: Type };
 /// the instance block's RAM (the near page is too small for them).
 /// `buf_cap` > 0 makes this a `buf [N]u8` (Amendment 2): a near-page byte
 /// slab with a length slot — small, hot, survives parks.
-const VarDecl = struct { name: []const u8, ty: Type, init: ?*Expr, array: u16 = 0, buf_cap: u16 = 0 };
+/// `region_len` > 0 makes this a REGISTERED REGION (item 6): a RAM array
+/// with a descriptor — grantable, token-guarded, type-state-locked while
+/// granted. `region_f64` picks the element type.
+const VarDecl = struct {
+    name: []const u8,
+    ty: Type,
+    init: ?*Expr,
+    array: u16 = 0,
+    buf_cap: u16 = 0,
+    region_len: u16 = 0,
+    region_f64: bool = false,
+};
 
 /// One element of a `pack` tuple literal: constants pre-pack at compile
 /// time; an identifier is a u64 scalar encoded at runtime.
@@ -684,6 +703,8 @@ const Parser = struct {
                 return self.fail("bytes live in messages and bufs, not params (v1)", Error.Semantics);
             if (ty == .vec_)
                 return self.fail("a vec is actor-local (v1) — params carry scalars", Error.Semantics);
+            if (ty == .grant_)
+                return self.fail("a grant rides a message, not a param", Error.Semantics);
             try params.append(.{ .name = pname.text, .ty = ty });
             if (self.tok.kind == .comma) try self.advance();
         }
@@ -694,6 +715,28 @@ const Parser = struct {
         while (self.isKw("var")) {
             try self.advance();
             const vname = try self.expect(.ident, "var name");
+            if (self.isKw("region")) {
+                // `var frame region [96]f64` — a registered region (item
+                // 6): RAM elements plus a descriptor the actor can grant.
+                try self.advance();
+                _ = try self.expect(.lbracket, "[");
+                const n = try self.expect(.int, "region length");
+                _ = try self.expect(.rbracket, "]");
+                const t = try self.expect(.ident, "u64 or f64");
+                const is_f = std.mem.eql(u8, t.text, "f64");
+                if (!is_f and !std.mem.eql(u8, t.text, "u64"))
+                    return self.fail("v1 regions hold u64 or f64", Error.Unsupported);
+                if (n.value == 0 or n.value > 512)
+                    return self.fail("region length is 1..512 elements in v1", Error.Semantics);
+                try vlist.append(.{
+                    .name = vname.text,
+                    .ty = if (is_f) .f64_ else .u64_,
+                    .init = null,
+                    .region_len = @intCast(n.value),
+                    .region_f64 = is_f,
+                });
+                continue;
+            }
             if (self.isKw("buf")) {
                 // `var key buf [64]u8` — a near-page byte buffer (A2.1).
                 try self.advance();
@@ -727,6 +770,8 @@ const Parser = struct {
                 return self.fail("[]addr is a parameter type", Error.Semantics);
             if (ty == .bytes_)
                 return self.fail("a byte variable is a `buf [N]u8`", Error.Semantics);
+            if (ty == .grant_)
+                return self.fail("a grant rides a message; a grantable thing is a `region`", Error.Semantics);
             var init_expr: ?*Expr = null;
             if (self.tok.kind == .assign) {
                 try self.advance();
@@ -896,7 +941,12 @@ const Parser = struct {
             _ = try self.expect(.lbrace, "{");
             var args = std.ArrayList(*Expr).init(self.arena);
             while (self.tok.kind != .rbrace) {
-                try args.append(try self.parseExpr());
+                if (try self.eatKw("grant")) {
+                    const rname = try self.expect(.ident, "a region name");
+                    try args.append(try self.mkExpr(.{ .grantref = rname.text }));
+                } else {
+                    try args.append(try self.parseExpr());
+                }
                 if (self.tok.kind == .comma) try self.advance();
             }
             try self.advance(); // }
@@ -1380,6 +1430,17 @@ const BoundedRec = struct { line: usize, n: u64, body_cost: u64, body_dyn: bool 
 /// slot and the data slab.
 const BufInfo = struct { len_slot: u16, data: u16, cap: u16 };
 
+/// A registered region inside the generator: its descriptor slot, RAM
+/// area, and the compile-time grant state.
+const RegionInfo = struct {
+    slot: u8,
+    f64: bool,
+    len: u16,
+    area: u64,
+    granted_anywhere: bool = false,
+    locked: bool = false,
+};
+
 /// A ≤ 8-byte chunk of pre-packed struple bytes as the little-endian word
 /// an immediate store lays down (byte 0 lands at the lowest address).
 fn chunkWord(b: []const u8) u64 {
@@ -1459,8 +1520,12 @@ const Gen = struct {
     /// bindings are handed out from here.
     next_slot: u16 = 0,
     /// RAM arrays: name → near slot holding the base pointer. Group
-    /// params and array vars both land here.
-    arrays: std.StringHashMap(struct { ptr_slot: u16, area: u64, len: u16 }),
+    /// params, array vars and regions all land here.
+    arrays: std.StringHashMap(struct { ptr_slot: u16, area: u64, len: u16, f64: bool = false }),
+    /// Registered regions (item 6): grantable RAM arrays with a
+    /// descriptor. `locked` is the compile-time type-state — granted
+    /// means inaccessible until the done/failed case rebinds.
+    regions: std.StringHashMap(RegionInfo),
     /// Byte buffers (A2.1): near-page slab + length slot. The slab keeps
     /// 8 bytes of slack past capacity so unaligned word stores of partial
     /// appends land in owned ground.
@@ -1540,7 +1605,7 @@ const Gen = struct {
             off += 8;
         }
         for (self.actor.vars) |v| {
-            if (v.array > 0 or v.buf_cap > 0 or v.ty == .vec_) continue; // wide things get their own homes
+            if (v.array > 0 or v.buf_cap > 0 or v.region_len > 0 or v.ty == .vec_) continue; // wide things get their own homes
             try self.slots.put(v.name, off);
             off += 8;
         }
@@ -1596,6 +1661,15 @@ const Gen = struct {
             aoff += 8;
             area += @as(u64, v.array) * 8;
         }
+        var next_region_slot: u8 = 8; // rings own 0..5; regions from 8
+        for (self.actor.vars) |v| {
+            if (v.region_len == 0) continue;
+            try self.arrays.put(v.name, .{ .ptr_slot = aoff, .area = area, .len = v.region_len, .f64 = v.region_f64 });
+            try self.regions.put(v.name, .{ .slot = next_region_slot, .f64 = v.region_f64, .len = v.region_len, .area = area });
+            next_region_slot += 1;
+            aoff += 8;
+            area += @as(u64, v.region_len) * 8;
+        }
         for (self.actor.vars) |v| {
             if (v.buf_cap == 0) continue;
             try self.bufs.put(v.name, .{ .len_slot = aoff, .data = aoff + 8, .cap = v.buf_cap });
@@ -1613,6 +1687,22 @@ const Gen = struct {
         self.next_slot = aoff;
         if (abi.array_off + area > abi.block_size - abi.data_off - 0x400)
             return self.fail(0, "arrays overflow the instance block", Error.Semantics);
+        // which regions ever leave home (the grant prescan)
+        {
+            var rit = self.regions.iterator();
+            while (rit.next()) |e| {
+                var granted = bodyGrants(self.actor.body, e.key_ptr.*);
+                for (self.actor.handlers) |h| {
+                    const body = switch (h) {
+                        .case => |c| c.body,
+                        .after => |a| a.body,
+                        .exit_case => |x| x.body,
+                    };
+                    if (bodyGrants(body, e.key_ptr.*)) granted = true;
+                }
+                e.value_ptr.granted_anywhere = granted;
+            }
+        }
         self.has_quiesce = self.actor.quiesce.len > 0 or anyQuiesce(self.actor.body) or blk: {
             for (self.actor.handlers) |h| {
                 const body = switch (h) {
@@ -1624,6 +1714,54 @@ const Gen = struct {
             }
             break :blk false;
         };
+    }
+
+    /// Does this statement list grant the named region anywhere?
+    fn bodyGrants(list: []const Stmt, name: []const u8) bool {
+        for (list) |s| {
+            switch (s) {
+                .send => |sd| for (sd.args) |a| {
+                    if (a.* == .grantref and std.mem.eql(u8, a.grantref, name)) return true;
+                },
+                .if_ => |i| if (bodyGrants(i.then, name) or bodyGrants(i.els, name)) return true,
+                .bounded => |b| if (bodyGrants(b.body, name)) return true,
+                .for_range => |f| if (bodyGrants(f.body, name)) return true,
+                .for_group => |f| if (bodyGrants(f.body, name)) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// The §6.2 type-state, per burst (v1's conservative shape): a
+    /// granted-anywhere region is reachable in a handler only BEFORE
+    /// that handler's own grant of it, and inside its done/failed case
+    /// (the rebind). Every other handler must keep its hands off — it
+    /// may run while the region is hardware-owned.
+    fn setRegionLocks(self: *Gen, body: []const Stmt, rebind: ?[]const u8) void {
+        var it = self.regions.iterator();
+        while (it.next()) |e| {
+            const rp = e.value_ptr;
+            if (!rp.granted_anywhere) {
+                rp.locked = false;
+                continue;
+            }
+            if (rebind) |rb| {
+                if (std.mem.eql(u8, rb, e.key_ptr.*)) {
+                    rp.locked = false;
+                    continue;
+                }
+            }
+            rp.locked = !bodyGrants(body, e.key_ptr.*);
+        }
+    }
+
+    /// A `case done(r)` / `case failed(r)` where r names a region — the
+    /// grant-completion cases, routed by the architected $6772 tag.
+    fn isRegionCase(self: *Gen, c: anytype) bool {
+        if (c.bind == null) return false;
+        if (!std.mem.eql(u8, c.msg, "done") and !std.mem.eql(u8, c.msg, "failed")) return false;
+        return self.regions.contains(c.bind.?);
     }
 
     fn actorPacksInto(self: *const Gen, name: []const u8) bool {
@@ -1704,7 +1842,13 @@ const Gen = struct {
             .vlit, .permute => return .vec_,
             .reduce => return .f64_,
             .cast => |c| return if (c.to_f64) .f64_ else .u64_,
-            .count, .index => return .u64_,
+            .count, .grantref => return .u64_,
+            .index => |ix| {
+                if (self.arrays.get(ix.base)) |arr| {
+                    if (arr.f64) return .f64_;
+                }
+                return .u64_;
+            },
             .ident => |name| {
                 if (self.vecs.contains(name)) return .vec_;
                 for (self.actor.params) |p| {
@@ -1928,6 +2072,10 @@ const Gen = struct {
             .index => |ix| {
                 const arr = self.arrays.get(ix.base) orelse
                     return self.fail(0, "not an array or group", Error.Semantics);
+                if (self.regions.get(ix.base)) |r| {
+                    if (r.locked)
+                        return self.fail(0, "a granted region is inaccessible until done/failed rebinds it (§6.2)", Error.Semantics);
+                }
                 try self.evalInto(ix.idx);
                 try self.w("        ASL #3", .{});
                 try self.w("        TAY", .{});
@@ -1961,6 +2109,7 @@ const Gen = struct {
                 }});
             },
             .vlit, .permute => return self.fail(0, "a vector value needs a vec home", Error.Semantics),
+            .grantref => return self.fail(0, "`grant` rides inside a send's braces", Error.Semantics),
             .field => |f| {
                 if (self.exit_bind != null and std.mem.eql(u8, self.exit_bind.?, f.base)) {
                     // w.id = the dead worker's context id; w.life = the
@@ -2342,6 +2491,10 @@ const Gen = struct {
                     // arr[e] = v — evaluate v first (it may clobber Y).
                     const arr = self.arrays.get(a.name) orelse
                         return self.fail(0, "not an array", Error.Semantics);
+                    if (self.regions.get(a.name)) |r| {
+                        if (r.locked)
+                            return self.fail(0, "a granted region is inaccessible until done/failed rebinds it (§6.2)", Error.Semantics);
+                    }
                     if (a.op != .set)
                         return self.fail(0, "v1 array assignment is `=` only", Error.Unsupported);
                     if (self.simpleOperand(a.expr)) |opr| {
@@ -3185,6 +3338,29 @@ const Gen = struct {
         while (word * 8 < fixed_end) : (word += 1) {
             var have = false;
             for (msg.fields, sd.args) |*f, arg| {
+                if (f.ty == .grant_) {
+                    // grant-on-send (item 6): two words — the region's
+                    // descriptor slot, then its live token — and the
+                    // compile-time type-state flips: from here to the
+                    // done/failed case, the region is unreachable.
+                    const fw = f.offset / 8;
+                    if (word != fw and word != fw + 1) continue;
+                    if (arg.* != .grantref)
+                        return self.fail(sd.line, "a grant field wants `grant <region>`", Error.Semantics);
+                    const rp = self.regions.getPtr(arg.grantref) orelse
+                        return self.fail(sd.line, "grant wants a `region` variable", Error.Semantics);
+                    if (rp.locked)
+                        return self.fail(sd.line, "this region is already granted out here (§6.2)", Error.Semantics);
+                    if (have) try self.w("        STA ${X}", .{self.off_acc});
+                    if (word == fw) {
+                        try self.w("        LDA {s}", .{try self.imm(rp.slot)});
+                    } else {
+                        try self.w("        LDA ${X}", .{@as(u64, rp.slot) * ring.desc_size + 24});
+                        rp.locked = true; // granted: inaccessible by type
+                    }
+                    have = true;
+                    continue;
+                }
                 if (f.offset / 8 != word) continue;
                 if (have) try self.w("        STA ${X}", .{self.off_acc});
                 try self.evalArg(arg, f);
@@ -3318,6 +3494,21 @@ const Gen = struct {
                 );
             }
         }
+        if (self.regions.count() > 0) {
+            // The descriptor table IS the region table: base, REGION
+            // flag, length in bytes, token. Re-staged every life —
+            // idempotent respawn, same as the rings.
+            try self.w("; region descriptors (grantable; the token is the leash)", .{});
+            var rit = self.regions.iterator();
+            while (rit.next()) |e| {
+                const r = e.value_ptr.*;
+                const off = @as(u64, r.slot) * ring.desc_size;
+                try self.store(self.layout.data + abi.array_off + r.area, off);
+                try self.store(@as(u64, ring.desc_flag_region) << 56, off + 8);
+                try self.store(@as(u64, r.len) * 8, off + 16);
+                try self.store(abi.token, off + 24);
+            }
+        }
 
         // RX ring: two landing buffers, cookie = buffer address.
         try self.w("; landing buffers (cap-2 AUTO_REPOST ring)", .{});
@@ -3397,6 +3588,7 @@ const Gen = struct {
         }
 
         // opening statements
+        self.setRegionLocks(self.actor.body, null);
         try self.stmts(self.actor.body);
         try self.endBurst(m_init, 0, true);
 
@@ -3429,6 +3621,7 @@ const Gen = struct {
         try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});
         try self.w("        BNE L{d}", .{l_other});
         try self.w("        STX ${X}", .{self.off_ptr});
+        try self.emitRegionDispatcher();
         try self.emitCaseLadder(self.actor.handlers, self.serve_label);
 
         if (has_other) {
@@ -3458,6 +3651,7 @@ const Gen = struct {
                 self.in_handler = true;
                 for (self.actor.handlers) |*h| {
                     if (h.* == .after) {
+                        self.setRegionLocks(h.after.body, null);
                         const bm = self.beginBurst();
                         try self.stmts(h.after.body);
                         try self.endBurst(bm, h.after.line, false);
@@ -3758,6 +3952,87 @@ const Gen = struct {
         }
     }
 
+    /// Grant completions (item 6): deliveries whose word0 low16 is the
+    /// architected $6772 — far outside any program's tag space — with
+    /// the status above it and the region's descriptor slot in word1.
+    /// Routed to `case done(r)` / `case failed(r)`; unmatched ones are
+    /// consumed, so the case ladder never sees a completion, and the
+    /// sole-case elision stays sound.
+    fn emitRegionDispatcher(self: *Gen) Error!void {
+        var any = false;
+        var rit = self.regions.iterator();
+        while (rit.next()) |e| {
+            if (e.value_ptr.granted_anywhere) any = true;
+        }
+        if (!any) return;
+        const l_not = self.label();
+        try self.w("; grant completions: the $6772 tag routes by region slot", .{});
+        try self.w("        LDA (${X})", .{self.off_ptr});
+        try self.w("        AND ##$FFFF", .{});
+        try self.w("        CMP ##$6772", .{});
+        try self.w("        BNE L{d}", .{l_not});
+        try self.w("        LDA ${X}", .{self.off_ptr});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #8", .{});
+        try self.w("        STA ${X}", .{self.off_fp});
+        try self.w("        LDA (${X})", .{self.off_fp});
+        try self.w("        AND #$FF", .{});
+        rit = self.regions.iterator();
+        while (rit.next()) |e| {
+            const rname = e.key_ptr.*;
+            const r = e.value_ptr.*;
+            if (!r.granted_anywhere) continue;
+            var done_body: ?[]const Stmt = null;
+            var done_line: usize = 0;
+            var fail_body: ?[]const Stmt = null;
+            var fail_line: usize = 0;
+            for (self.actor.handlers) |*h| {
+                if (h.* != .case) continue;
+                const c = h.case;
+                if (c.bind == null or !std.mem.eql(u8, c.bind.?, rname)) continue;
+                if (std.mem.eql(u8, c.msg, "done")) {
+                    done_body = c.body;
+                    done_line = c.line;
+                } else if (std.mem.eql(u8, c.msg, "failed")) {
+                    fail_body = c.body;
+                    fail_line = c.line;
+                }
+            }
+            if (done_body == null and fail_body == null) continue;
+            const l_next = self.label();
+            const l_fail = self.label();
+            try self.w("; region {s}: rebind on completion", .{rname});
+            try self.w("        CMP {s}", .{try self.imm(r.slot)});
+            try self.w("        BNE L{d}", .{l_next});
+            try self.w("        LDA (${X})", .{self.off_ptr});
+            try self.w("        LSR #16", .{});
+            try self.w("        AND #$FF", .{});
+            try self.w("        BNE L{d}", .{l_fail});
+            if (done_body) |body| {
+                self.setRegionLocks(body, rname);
+                self.in_handler = true;
+                const bm = self.beginBurst();
+                try self.stmts(body);
+                try self.endBurst(bm, done_line, false);
+                self.in_handler = false;
+            }
+            try self.w("        BRA L{d}", .{self.serve_label});
+            try self.w("L{d}:", .{l_fail});
+            if (fail_body) |body| {
+                self.setRegionLocks(body, rname);
+                self.in_handler = true;
+                const bm = self.beginBurst();
+                try self.stmts(body);
+                try self.endBurst(bm, fail_line, false);
+                self.in_handler = false;
+            }
+            try self.w("        BRA L{d}", .{self.serve_label});
+            try self.w("L{d}:", .{l_next});
+        }
+        try self.w("        BRA L{d}", .{self.serve_label});
+        try self.w("L{d}:", .{l_not});
+    }
+
     /// The delivery dispatch (item 4): the message tag once in A, then a
     /// compare ladder — two instructions per non-matching case, guards
     /// reloading the stashed tag on failure. A sole unguarded case skips
@@ -3768,6 +4043,7 @@ const Gen = struct {
         var any_guard = false;
         for (handlers) |*h| {
             if (h.* != .case) continue;
+            if (self.isRegionCase(h.case)) continue; // routed by $6772, not by tag
             case_count += 1;
             if (h.case.where != null or h.case.pat != null) any_guard = true;
         }
@@ -3778,12 +4054,14 @@ const Gen = struct {
         if (case_count == 1 and !any_guard) {
             for (handlers) |*h| {
                 if (h.* != .case) continue;
+                if (self.isRegionCase(h.case)) continue;
                 const c = h.case;
                 const msg = self.message(c.msg) orelse
                     return self.fail(c.line, "unknown message in case", Error.Semantics);
                 try self.w("; case {s}({s}) — sole pattern, closed wire: no tag test", .{ c.msg, c.bind orelse "_" });
                 self.bind = c.bind;
                 self.bind_msg = msg;
+                self.setRegionLocks(c.body, null);
                 self.in_handler = true;
                 const bm = self.beginBurst();
                 try self.stmts(c.body);
@@ -3800,6 +4078,7 @@ const Gen = struct {
         if (any_guard) try self.w("        STA ${X}", .{self.off_t});
         for (handlers) |*h| {
             if (h.* != .case) continue;
+            if (self.isRegionCase(h.case)) continue;
             const c = h.case;
             const msg = self.message(c.msg) orelse
                 return self.fail(c.line, "unknown message in case", Error.Semantics);
@@ -3813,6 +4092,7 @@ const Gen = struct {
             if (c.where != null or c.pat != null) l_fail = self.label();
             if (c.where) |g| try self.branchIfFalse(g, l_fail.?);
             if (c.pat) |*p| try self.emitPattern(p, l_fail.?);
+            self.setRegionLocks(c.body, null);
             self.in_handler = true;
             const bm = self.beginBurst();
             try self.stmts(c.body);
@@ -3912,6 +4192,7 @@ const Gen = struct {
                 if (h.* != .exit_case or h.exit_case.cause != cz.cause) continue;
                 self.exit_bind = h.exit_case.bind;
                 self.exit_code_bind = h.exit_case.code_bind;
+                self.setRegionLocks(h.exit_case.body, null);
                 self.in_handler = true;
                 const bm = self.beginBurst();
                 try self.stmts(h.exit_case.body);
@@ -4097,7 +4378,7 @@ pub fn compile(
                 continue;
             }
             const a = f.ty.size();
-            off = std.mem.alignForward(u16, off, a);
+            off = std.mem.alignForward(u16, off, @min(a, 8));
             f.offset = off;
             off += a;
         }
@@ -4127,6 +4408,7 @@ pub fn compile(
         .arrays = .init(arena),
         .bufs = .init(arena),
         .vecs = .init(arena),
+        .regions = .init(arena),
         .bursts = .init(arena),
         .brecs = .init(arena),
     };
@@ -4150,7 +4432,7 @@ pub fn compile(
         });
     }
     for (actor.vars) |v| {
-        if (v.array > 0 or v.buf_cap > 0 or v.ty == .vec_) continue; // wide things aren't scalar readbacks
+        if (v.array > 0 or v.buf_cap > 0 or v.region_len > 0 or v.ty == .vec_) continue; // wide things aren't scalar readbacks
         try vars.append(.{
             .name = try alloc.dupe(u8, v.name),
             .off = gen.slots.get(v.name).?,
