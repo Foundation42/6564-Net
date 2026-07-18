@@ -51,6 +51,7 @@ const std = @import("std");
 const isa = @import("isa.zig");
 const ring = @import("ring.zig");
 const machine = @import("machine.zig");
+const struple = @import("struple.zig");
 
 pub const Diagnostic = struct {
     line: usize = 0,
@@ -193,6 +194,9 @@ const Stmt = union(enum) {
     /// Enter the lame-duck phase: timers die, the quiesce case set takes
     /// over. Termination is a phase, not an instruction.
     quiesce,
+    /// `pack key, ("users", id, "profile")` — encode a struple tuple into
+    /// a declared buffer (A2.3). Canonical only; capacity checked.
+    pack: struct { buf: []const u8, elems: []PackElem, line: usize },
     spawn: struct {
         actor: []const u8,
         args: []u64, // v1: literal args only
@@ -226,7 +230,17 @@ const Param = struct { name: []const u8, ty: Type };
 
 /// `array` > 0 makes this a u64 array of that many elements, living in
 /// the instance block's RAM (the near page is too small for them).
-const VarDecl = struct { name: []const u8, ty: Type, init: ?*Expr, array: u16 = 0 };
+/// `buf_cap` > 0 makes this a `buf [N]u8` (Amendment 2): a near-page byte
+/// slab with a length slot — small, hot, survives parks.
+const VarDecl = struct { name: []const u8, ty: Type, init: ?*Expr, array: u16 = 0, buf_cap: u16 = 0 };
+
+/// One element of a `pack` tuple literal: constants pre-pack at compile
+/// time; an identifier is a u64 scalar encoded at runtime.
+const PackElem = union(enum) {
+    str: []const u8,
+    int: u64,
+    ident: []const u8,
+};
 
 const Actor = struct {
     name: []const u8,
@@ -584,6 +598,20 @@ const Parser = struct {
         while (self.isKw("var")) {
             try self.advance();
             const vname = try self.expect(.ident, "var name");
+            if (self.isKw("buf")) {
+                // `var key buf [64]u8` — a near-page byte buffer (A2.1).
+                try self.advance();
+                _ = try self.expect(.lbracket, "[");
+                const n = try self.expect(.int, "buffer capacity");
+                _ = try self.expect(.rbracket, "]");
+                const t = try self.expect(.ident, "u8");
+                if (!std.mem.eql(u8, t.text, "u8"))
+                    return self.fail("a buf is bytes: `buf [N]u8`", Error.Syntax);
+                if (n.value < 16 or n.value > 1024)
+                    return self.fail("buf capacity is 16..1024 in v1", Error.Semantics);
+                try vlist.append(.{ .name = vname.text, .ty = .u64_, .init = null, .buf_cap = @intCast(n.value) });
+                continue;
+            }
             if (self.tok.kind == .lbracket) {
                 // `var got [128]u64` — a RAM array; zeroed at load, not
                 // at respawn (it lives outside the near page).
@@ -842,6 +870,26 @@ const Parser = struct {
             } };
         }
         if (try self.eatKw("quiesce")) return .quiesce;
+        if (try self.eatKw("pack")) {
+            const bname = try self.expect(.ident, "a buf name");
+            _ = try self.expect(.comma, ",");
+            _ = try self.expect(.lparen, "(");
+            var elems = std.ArrayList(PackElem).init(self.arena);
+            while (self.tok.kind != .rparen) {
+                switch (self.tok.kind) {
+                    .string => try elems.append(.{ .str = try self.decodeStr(self.tok.text) }),
+                    .int => try elems.append(.{ .int = self.tok.value }),
+                    .ident => try elems.append(.{ .ident = self.tok.text }),
+                    else => return self.fail("a tuple element is a literal or a name (v1)", Error.Syntax),
+                }
+                try self.advance();
+                if (self.tok.kind == .comma) try self.advance();
+            }
+            try self.advance(); // )
+            if (elems.items.len == 0)
+                return self.fail("an empty tuple packs nothing", Error.Semantics);
+            return .{ .pack = .{ .buf = bname.text, .elems = try elems.toOwnedSlice(), .line = line } };
+        }
         if (self.isKw("while"))
             return self.fail(
                 "joe has no `while` (Amendment 1): unbounded iteration is a self-send loop, one park per slice",
@@ -867,6 +915,23 @@ const Parser = struct {
         };
         try self.advance();
         return .{ .assign = .{ .name = name.text, .idx = idx, .op = op, .expr = try self.parseExpr() } };
+    }
+
+    /// Decode a string token's escapes (`\n`, `\t`, `\x`) into the arena.
+    fn decodeStr(self: *Parser, raw: []const u8) Error![]const u8 {
+        var text = std.ArrayList(u8).init(self.arena);
+        var j: usize = 0;
+        while (j < raw.len) : (j += 1) {
+            if (raw[j] == '\\' and j + 1 < raw.len) {
+                j += 1;
+                try text.append(switch (raw[j]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    else => raw[j],
+                });
+            } else try text.append(raw[j]);
+        }
+        return text.toOwnedSlice();
     }
 
     fn mkExpr(self: *Parser, e: Expr) Error!*Expr {
@@ -1057,6 +1122,20 @@ const Burst = struct { line: usize, cost: u64, dyn: bool, is_init: bool, nbounde
 /// computed (or uncomputable) body cost.
 const BoundedRec = struct { line: usize, n: u64, body_cost: u64, body_dyn: bool };
 
+/// A `buf [N]u8` inside the generator: near-page offsets of the length
+/// slot and the data slab.
+const BufInfo = struct { len_slot: u16, data: u16, cap: u16 };
+
+/// A ≤ 8-byte chunk of pre-packed struple bytes as the little-endian word
+/// an immediate store lays down (byte 0 lands at the lowest address).
+fn chunkWord(b: []const u8) u64 {
+    var w: u64 = 0;
+    const n = @min(b.len, 8);
+    var i: usize = 0;
+    while (i < n) : (i += 1) w |= @as(u64, b[i]) << @intCast(i * 8);
+    return w;
+}
+
 const Gen = struct {
     arena: std.mem.Allocator,
     out: std.ArrayList(u8),
@@ -1122,6 +1201,10 @@ const Gen = struct {
     /// RAM arrays: name → near slot holding the base pointer. Group
     /// params and array vars both land here.
     arrays: std.StringHashMap(struct { ptr_slot: u16, area: u64, len: u16 }),
+    /// Byte buffers (A2.1): near-page slab + length slot. The slab keeps
+    /// 8 bytes of slack past capacity so unaligned word stores of partial
+    /// appends land in owned ground.
+    bufs: std.StringHashMap(BufInfo),
     /// Spawn records live after the internals: 48 bytes each —
     /// {ctx, entry, sp, arg} (the SPWN block, loader-staged), +32 the
     /// child's timer-SQE address (for disarm-on-death), +40 the restart
@@ -1246,6 +1329,13 @@ const Gen = struct {
             try self.arrays.put(v.name, .{ .ptr_slot = aoff, .area = area, .len = v.array });
             aoff += 8;
             area += @as(u64, v.array) * 8;
+        }
+        for (self.actor.vars) |v| {
+            if (v.buf_cap == 0) continue;
+            try self.bufs.put(v.name, .{ .len_slot = aoff, .data = aoff + 8, .cap = v.buf_cap });
+            aoff += 8 + std.mem.alignForward(u16, v.buf_cap + 8, 8);
+            if (@as(u32, aoff) + 8 > isa.mactab_base)
+                return self.fail(0, "near page exhausted (buffers)", Error.Semantics);
         }
         self.next_slot = aoff;
         if (abi.array_off + area > abi.block_size - abi.data_off - 0x400)
@@ -1709,6 +1799,7 @@ const Gen = struct {
                 // analysis cannot see this extent.
                 self.cost_dyn = true;
             },
+            .pack => |pk| try self.stmtPack(pk),
             .quiesce => {
                 // Termination is a phase: kill the clock, cross into the
                 // lame-duck case set, never come back.
@@ -1729,6 +1820,162 @@ const Gen = struct {
                 try self.w("        SPWN ${X}", .{rec});
             },
         }
+    }
+
+    /// `pack buf, (…)` (A2.3): constant segments pre-pack at compile time
+    /// through the host half of struple #13 and land as immediate word
+    /// stores; a variable element is a u64 encoded at runtime — type code
+    /// $20+n, big-endian magnitude — through unaligned near_x appends
+    /// (the slab's 8-byte slack makes every word store legal). Capacity
+    /// is checked at compile time where lengths are static, at runtime
+    /// (BRK — pack_overflow arrives as a crash in v1) where they are not.
+    fn stmtPack(self: *Gen, pk: anytype) Error!void {
+        const bi = self.bufs.get(pk.buf) orelse
+            return self.fail(pk.line, "pack wants a `buf` variable", Error.Semantics);
+        var i: usize = 0;
+        // The leading constant run: static bytes at static offset zero.
+        var pre = struple.Packer.init(self.arena);
+        while (i < pk.elems.len) : (i += 1) {
+            switch (pk.elems[i]) {
+                .str => |s| pre.appendString(s) catch return Error.OutOfMemory,
+                .int => |v| pre.appendUint(v) catch return Error.OutOfMemory,
+                .ident => break,
+            }
+        }
+        const prefix = pre.bytes();
+        if (prefix.len > bi.cap)
+            return self.fail(pk.line, "the tuple's constants alone overflow the buffer", Error.Semantics);
+        try self.w("; pack {s}: {d}-byte constant prefix, {d} runtime element(s)", .{
+            pk.buf, prefix.len, pk.elems.len - i,
+        });
+        var off: u16 = 0;
+        while (off < prefix.len) : (off += 8) {
+            try self.w("        LDA ##${X}", .{chunkWord(prefix[off..])});
+            try self.w("        STA ${X}", .{bi.data + off});
+        }
+        try self.w("        LDA {s}", .{try self.imm(prefix.len)});
+        try self.w("        STA ${X}", .{bi.len_slot});
+
+        while (i < pk.elems.len) : (i += 1) {
+            switch (pk.elems[i]) {
+                .ident => |name| {
+                    const slot = self.slots.get(name) orelse
+                        return self.fail(pk.line, "a tuple element names a scalar (v1)", Error.Semantics);
+                    try self.emitIntAppend(bi, slot);
+                },
+                else => {
+                    // A constant run after a variable element: static
+                    // bytes at a runtime offset.
+                    var run = struple.Packer.init(self.arena);
+                    while (i < pk.elems.len) : (i += 1) {
+                        switch (pk.elems[i]) {
+                            .str => |s| run.appendString(s) catch return Error.OutOfMemory,
+                            .int => |v| run.appendUint(v) catch return Error.OutOfMemory,
+                            .ident => break,
+                        }
+                    }
+                    i -= 1; // outer loop re-advances
+                    const blob = run.bytes();
+                    // guard: len + blob must fit
+                    const l_ok = self.label();
+                    try self.w("        LDA ${X}", .{bi.len_slot});
+                    try self.w("        CMP {s}", .{try self.imm(bi.cap - blob.len + 1)});
+                    try self.w("        BCC L{d}", .{l_ok});
+                    try self.w("        BRK                 ; pack_overflow", .{});
+                    try self.w("L{d}:   TAX", .{l_ok});
+                    var boff: u16 = 0;
+                    while (boff < blob.len) : (boff += 8) {
+                        if (boff != 0) {
+                            try self.w("        TXA", .{});
+                            try self.w("        CLC", .{});
+                            try self.w("        ADC #8", .{});
+                            try self.w("        TAX", .{});
+                        }
+                        try self.w("        LDA ##${X}", .{chunkWord(blob[boff..])});
+                        try self.w("        STA ${X},X", .{bi.data});
+                    }
+                    try self.w("        LDA ${X}", .{bi.len_slot});
+                    try self.w("        CLC", .{});
+                    try self.w("        ADC {s}", .{try self.imm(blob.len)});
+                    try self.w("        STA ${X}", .{bi.len_slot});
+                },
+            }
+        }
+    }
+
+    /// Append one u64 as a canonical struple int at the buffer's current
+    /// length: zero is the bare $20; else type code $20+n then the n
+    /// magnitude bytes, emitted MSB-first by a skip-counted peel of the
+    /// top byte (no variable shift counts exist on this machine).
+    fn emitIntAppend(self: *Gen, bi: BufInfo, vslot: u16) Error!void {
+        const t_cnt = try self.pushTmp();
+        const t_skip = try self.pushTmp();
+        const l_nz = self.label();
+        const l_count = self.label();
+        const l_emit = self.label();
+        const l_next = self.label();
+        const l_loop = self.label();
+        const l_done = self.label();
+        const l_fit = self.label();
+        // worst-case append is 9 bytes; the guard is the pack_overflow law
+        try self.w("        LDA ${X}", .{bi.len_slot});
+        try self.w("        CMP {s}", .{try self.imm(bi.cap - 8)});
+        try self.w("        BCC L{d}", .{l_fit});
+        try self.w("        BRK                 ; pack_overflow", .{});
+        try self.w("L{d}:   LDA ${X}", .{ l_fit, vslot });
+        try self.w("        BNE L{d}", .{l_nz});
+        try self.w("        LDX ${X}", .{bi.len_slot});
+        try self.w("        LDA #$20            ; canonical zero", .{});
+        try self.w("        STA ${X},X", .{bi.data});
+        try self.w("        INC ${X}", .{bi.len_slot});
+        try self.w("        BRA L{d}", .{l_done});
+        // count the magnitude bytes: n = 1..8
+        try self.w("L{d}:   STA ${X}", .{ l_nz, self.off_t });
+        try self.w("        LDA #0", .{});
+        try self.w("        STA ${X}", .{t_cnt});
+        const c_count = self.cost;
+        try self.w("L{d}:   INC ${X}", .{ l_count, t_cnt });
+        try self.w("        LDA ${X}", .{self.off_t});
+        try self.w("        LSR #8", .{});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        BNE L{d}", .{l_count});
+        self.cost +|= (self.cost - c_count) *| 7; // ≤ 8 laps, one emitted
+        // type code $20 + n
+        try self.w("        LDA ${X}", .{t_cnt});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #$20", .{});
+        try self.w("        LDX ${X}", .{bi.len_slot});
+        try self.w("        STA ${X},X", .{bi.data});
+        try self.w("        INC ${X}", .{bi.len_slot});
+        // peel 8 top bytes, skipping the 8-n leading zeros
+        try self.w("        LDA #8", .{});
+        try self.w("        SEC", .{});
+        try self.w("        SBC ${X}", .{t_cnt});
+        try self.w("        STA ${X}", .{t_skip});
+        try self.w("        LDA ${X}", .{vslot});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        LDA #8", .{});
+        try self.w("        STA ${X}", .{t_cnt});
+        const c_emit = self.cost;
+        try self.w("L{d}:   LDA ${X}", .{ l_loop, t_skip });
+        try self.w("        BEQ L{d}", .{l_emit});
+        try self.w("        DEC ${X}", .{t_skip});
+        try self.w("        BRA L{d}", .{l_next});
+        try self.w("L{d}:   LDA ${X}", .{ l_emit, self.off_t });
+        try self.w("        LSR #56             ; the top byte", .{});
+        try self.w("        LDX ${X}", .{bi.len_slot});
+        try self.w("        STA ${X},X", .{bi.data});
+        try self.w("        INC ${X}", .{bi.len_slot});
+        try self.w("L{d}:   LDA ${X}", .{ l_next, self.off_t });
+        try self.w("        ASL #8", .{});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        DEC ${X}", .{t_cnt});
+        try self.w("        LDA ${X}", .{t_cnt});
+        try self.w("        BNE L{d}", .{l_loop});
+        self.cost +|= (self.cost - c_emit) *| 7; // 8 laps, one emitted
+        try self.w("L{d}:", .{l_done});
+        self.popTmp();
+        self.popTmp();
     }
 
     /// Evaluate a message-field argument into A, masked to the field's
@@ -1953,6 +2200,16 @@ const Gen = struct {
             if (v.init) |e| {
                 try self.evalInto(e);
                 try self.w("        STA ${X}", .{self.slots.get(v.name).?});
+            }
+        }
+        // buffer lengths reset every life (near page survives SPWN)
+        {
+            var bit = self.bufs.iterator();
+            var first = true;
+            while (bit.next()) |e| {
+                if (first) try self.w("        LDA #0", .{});
+                first = false;
+                try self.w("        STA ${X}", .{e.value_ptr.len_slot});
             }
         }
 
@@ -2279,6 +2536,10 @@ const Gen = struct {
 
 // ── Public interface ─────────────────────────────────────────────────────
 
+/// A `buf [N]u8` as the harness sees it: length slot and data slab are
+/// near-page offsets.
+pub const BufOut = struct { name: []const u8, len_slot: u16, data: u16, cap: u16 };
+
 pub const Slot = struct {
     name: []const u8,
     off: u16,
@@ -2317,10 +2578,15 @@ pub const Result = struct {
     /// Set when the actor says `send self` (Amendment 1): the near slot
     /// where the loader stages a capability to the actor's own RX ring.
     self_slot: ?u16,
+    /// The actor's byte buffers (A2.1) — harnesses stage into and read
+    /// out of the near page through these.
+    bufs: []BufOut,
 
     pub fn deinit(self: *Result) void {
         for (self.params) |p| self.alloc.free(p.name);
         for (self.vars) |v| self.alloc.free(v.name);
+        for (self.bufs) |b| self.alloc.free(b.name);
+        self.alloc.free(self.bufs);
         for (self.spawns) |s| {
             self.alloc.free(s.actor);
             self.alloc.free(s.args);
@@ -2449,6 +2715,7 @@ pub fn compile(
         .slots = std.StringHashMap(u16).init(arena),
         .strings = .init(arena),
         .arrays = .init(arena),
+        .bufs = .init(arena),
         .bursts = .init(arena),
         .brecs = .init(arena),
     };
@@ -2475,6 +2742,19 @@ pub fn compile(
         if (v.array > 0) continue; // RAM arrays aren't read back by name
         try vars.append(.{ .name = try alloc.dupe(u8, v.name), .off = gen.slots.get(v.name).? });
     }
+    var bufs_out = std.ArrayList(BufOut).init(alloc);
+    errdefer bufs_out.deinit();
+    {
+        var bit = gen.bufs.iterator();
+        while (bit.next()) |e| {
+            try bufs_out.append(.{
+                .name = try alloc.dupe(u8, e.key_ptr.*),
+                .len_slot = e.value_ptr.len_slot,
+                .data = e.value_ptr.data,
+                .cap = e.value_ptr.cap,
+            });
+        }
+    }
     var spawns = std.ArrayList(SpawnOut).init(alloc);
     errdefer spawns.deinit();
     var k: u16 = 0;
@@ -2498,6 +2778,7 @@ pub fn compile(
         .uses_timer = gen.uses_timer,
         .timer_period = gen.timer_period,
         .self_slot = if (gen.uses_self) gen.off_self else null,
+        .bufs = try bufs_out.toOwnedSlice(),
     };
 }
 

@@ -15,6 +15,7 @@ const ring = @import("ring.zig");
 const mesh = @import("mesh.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
+const joe = @import("joe.zig");
 
 const Machine = machine.Machine;
 
@@ -860,6 +861,81 @@ test "joe: the ring turns — 8 instances from one system block, token comes hom
     try testing.expect(cy_per_pass < 70);
 }
 
+// A2 harness: compile one actor, run it to completion on a bare machine,
+// hand back the machine for near-page inspection. The caller deinits both.
+fn runBareActor(src: []const u8, actor: []const u8, r: *joe.Result) !machine.Machine {
+    var diag = joe.Diagnostic{};
+    r.* = joe.compile(testing.allocator, src, actor, .{}, &diag) catch |err| {
+        std.debug.print("joe {s}: line {d}: {s}\n", .{ actor, diag.line, diag.message });
+        return err;
+    };
+    errdefer r.deinit();
+    var adiag = asm6564.Diagnostic{};
+    var out = try asm6564.assemble(testing.allocator, r.asm_text, &adiag);
+    defer out.deinit();
+    var m = try machine.Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .scorch_parks = true, // A2.7: everything runs under scorch
+    });
+    errdefer m.deinit();
+    m.load(0, out.origin, out.code);
+    try m.spawn(0, 0, out.origin, 0x8000, 0);
+    _ = try m.run();
+    return m;
+}
+
+fn bufOf(r: *const joe.Result, name: []const u8) *const joe.BufOut {
+    for (r.bufs) |*b| {
+        if (std.mem.eql(u8, b.name, name)) return b;
+    }
+    unreachable;
+}
+
+test "A2: pack — the machine and the host half agree on every byte" {
+    const struple = @import("struple.zig");
+    const src =
+        \\actor P() {
+        \\    var key buf [64]u8
+        \\    var k2 buf [64]u8
+        \\    var id u64 = 12345
+        \\    var zero u64 = 0
+        \\    var big u64 = 18446744073709551615
+        \\    pack key, ("users", id, "profile")
+        \\    pack key, ("users", id, "profile")
+        \\    pack k2, (7, zero, big, "x")
+        \\}
+    ;
+    var r: joe.Result = undefined;
+    var m = try runBareActor(src, "P", &r);
+    defer m.deinit();
+    defer r.deinit();
+
+    // the oracle: the host half of implementation #13
+    var p = struple.Packer.init(testing.allocator);
+    defer p.deinit();
+    try p.appendString("users");
+    try p.appendUint(12345);
+    try p.appendString("profile");
+
+    const near = &m.cores[0].contexts[0].near;
+    const key = bufOf(&r, "key");
+    const got_len = std.mem.readInt(u64, near[key.len_slot..][0..8], .little);
+    try testing.expectEqual(p.bytes().len, got_len);
+    try testing.expectEqualSlices(u8, p.bytes(), near[key.data..][0..p.bytes().len]);
+
+    var p2 = struple.Packer.init(testing.allocator);
+    defer p2.deinit();
+    try p2.appendUint(7);
+    try p2.appendUint(0);
+    try p2.appendUint(18446744073709551615);
+    try p2.appendString("x");
+    const k2 = bufOf(&r, "k2");
+    const got2 = std.mem.readInt(u64, near[k2.len_slot..][0..8], .little);
+    try testing.expectEqual(p2.bytes().len, got2);
+    try testing.expectEqualSlices(u8, p2.bytes(), near[k2.data..][0..p2.bytes().len]);
+}
+
 test "item 4: the joe corpus is scorch-invariant — nothing trusts the banked file" {
     // The bank-collapse verifier: registers (A, X, Y, SP, P) are
     // poisoned at every real park. If any compiled program ran on the
@@ -901,7 +977,6 @@ test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
     // Under the collapse, SP is as volatile as A. Compiled code uses
     // static near-page temporaries instead of the stack, so there is
     // not one push in the whole corpus — init included.
-    const joe = @import("joe.zig");
     const corpus = [_]struct { src: []const u8, actors: []const []const u8 }{
         .{ .src = @embedFile("programs/pingpong.joe"), .actors = &.{ "Pinger", "Ponger" } },
         .{ .src = @embedFile("programs/ring.joe"), .actors = &.{ "Head", "Node" } },
