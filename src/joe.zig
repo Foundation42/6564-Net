@@ -132,6 +132,10 @@ const Type = enum {
     /// `[]addr` — a group parameter: the count lives in the near-page
     /// slot, the windows in a RAM array the loader stages.
     addr_slice,
+    /// `bytes` — a variable-length struple payload in a message (A2.5):
+    /// one length byte then the bytes, filling the envelope's remainder.
+    /// v1: at most one per message, in last position.
+    bytes_,
 
     fn size(self: Type) u16 {
         return switch (self) {
@@ -139,6 +143,7 @@ const Type = enum {
             .u16_ => 2,
             .u32_ => 4,
             .u64_, .addr, .addr_slice => 8,
+            .bytes_ => 0, // laid out specially; never masked or packed
         };
     }
 
@@ -146,7 +151,7 @@ const Type = enum {
         const pairs = .{
             .{ "u8", Type.u8_ },   .{ "u16", Type.u16_ },
             .{ "u32", Type.u32_ }, .{ "u64", Type.u64_ },
-            .{ "addr", Type.addr },
+            .{ "addr", Type.addr }, .{ "bytes", Type.bytes_ },
         };
         inline for (pairs) |p| {
             if (std.mem.eql(u8, name, p[0])) return p[1];
@@ -176,6 +181,29 @@ const Expr = union(enum) {
     field: struct { base: []const u8, name: []const u8 },
     index: struct { base: []const u8, idx: *Expr },
     bin: struct { op: BinOp, l: *Expr, r: *Expr },
+    /// `key.count()` — walk a buf's elements with the total skip (A2.2);
+    /// data-dependent by nature, so A1.3's rules apply in full.
+    count: []const u8,
+};
+
+/// One element of an `is` tuple pattern (A2.4): constants fuse into a
+/// pre-packed memcmp; `?x` decodes and binds one integer element; a
+/// non-subset element fails the match, it does not fault.
+const Tpat = union(enum) {
+    lit_str: []const u8,
+    lit_int: u64,
+    bind: []const u8,
+};
+
+/// `subject is ("users", ?id, ..rest)` — subject is a bound message's
+/// bytes field or a local buf. `rest` binds the remaining bytes as a
+/// view value (offset<<32 | length, subject-relative); without it the
+/// pattern requires end of stream.
+const Pattern = struct {
+    subject: *Expr,
+    elems: []Tpat,
+    rest: ?[]const u8,
+    line: usize,
 };
 
 const AssignOp = enum { set, add, sub };
@@ -213,6 +241,9 @@ const Handler = union(enum) {
         msg: []const u8,
         bind: ?[]const u8, // null = wildcard `_`
         where: ?*Expr,
+        /// `where subject is (…)` — the A2.4 tuple pattern; a case has
+        /// a comparison guard or a pattern, not both.
+        pat: ?Pattern = null,
         body: []Stmt,
         line: usize,
     },
@@ -297,6 +328,7 @@ const TokKind = enum {
     dot,
     dotdot,
     underscore,
+    question,
     assign, // =
     plus_eq,
     minus_eq,
@@ -376,7 +408,7 @@ const Lexer = struct {
             .{ '<', TokKind.lt },     .{ '>', TokKind.gt },
             .{ '+', TokKind.plus },   .{ '-', TokKind.minus },
             .{ '&', TokKind.amp },    .{ '|', TokKind.pipe },
-            .{ '^', TokKind.caret },
+            .{ '^', TokKind.caret },  .{ '?', TokKind.question },
         };
         inline for (ones) |o| {
             if (c == o[0]) {
@@ -588,6 +620,8 @@ const Parser = struct {
         while (self.tok.kind != .rparen) {
             const pname = try self.expect(.ident, "parameter name");
             const ty = try self.parseType();
+            if (ty == .bytes_)
+                return self.fail("bytes live in messages and bufs, not params (v1)", Error.Semantics);
             try params.append(.{ .name = pname.text, .ty = ty });
             if (self.tok.kind == .comma) try self.advance();
         }
@@ -629,6 +663,8 @@ const Parser = struct {
             const ty = try self.parseType();
             if (ty == .addr_slice)
                 return self.fail("[]addr is a parameter type", Error.Semantics);
+            if (ty == .bytes_)
+                return self.fail("a byte variable is a `buf [N]u8`", Error.Semantics);
             var init_expr: ?*Expr = null;
             if (self.tok.kind == .assign) {
                 try self.advance();
@@ -713,12 +749,21 @@ const Parser = struct {
             }
             _ = try self.expect(.rparen, ")");
             var where: ?*Expr = null;
-            if (try self.eatKw("where")) where = try self.parseExpr();
+            var pat: ?Pattern = null;
+            if (try self.eatKw("where")) {
+                const subj = try self.parseExpr();
+                if (try self.eatKw("is")) {
+                    if (subj.* != .field and subj.* != .ident)
+                        return self.fail("a match subject is a bytes field or a buf", Error.Semantics);
+                    pat = try self.parseTpat(subj);
+                } else where = subj;
+            }
             _ = try self.expect(.colon, ":");
             return .{ .case = .{
                 .msg = msg.text,
                 .bind = bind,
                 .where = where,
+                .pat = pat,
                 .body = try self.parseHandlerBody(),
                 .line = line,
             } };
@@ -917,6 +962,41 @@ const Parser = struct {
         return .{ .assign = .{ .name = name.text, .idx = idx, .op = op, .expr = try self.parseExpr() } };
     }
 
+    /// `("users", ?id, ..rest)` — the A2.4 tuple pattern.
+    fn parseTpat(self: *Parser, subj: *Expr) Error!Pattern {
+        const line = self.tok.line;
+        _ = try self.expect(.lparen, "(");
+        var elems = std.ArrayList(Tpat).init(self.arena);
+        var rest: ?[]const u8 = null;
+        while (self.tok.kind != .rparen) {
+            if (self.tok.kind == .dotdot) {
+                try self.advance();
+                rest = (try self.expect(.ident, "rest binding")).text;
+                break; // ..rest is always last
+            }
+            switch (self.tok.kind) {
+                .string => {
+                    try elems.append(.{ .lit_str = try self.decodeStr(self.tok.text) });
+                    try self.advance();
+                },
+                .int => {
+                    try elems.append(.{ .lit_int = self.tok.value });
+                    try self.advance();
+                },
+                .question => {
+                    try self.advance();
+                    try elems.append(.{ .bind = (try self.expect(.ident, "bind name")).text });
+                },
+                else => return self.fail("a pattern element is a literal, `?name` or `..rest`", Error.Syntax),
+            }
+            if (self.tok.kind == .comma) try self.advance();
+        }
+        _ = try self.expect(.rparen, ")");
+        if (elems.items.len == 0 and rest == null)
+            return self.fail("an empty pattern matches nothing", Error.Semantics);
+        return .{ .subject = subj, .elems = try elems.toOwnedSlice(), .rest = rest, .line = line };
+    }
+
     /// Decode a string token's escapes (`\n`, `\t`, `\x`) into the arena.
     fn decodeStr(self: *Parser, raw: []const u8) Error![]const u8 {
         var text = std.ArrayList(u8).init(self.arena);
@@ -1025,6 +1105,15 @@ const Parser = struct {
                 if (self.tok.kind == .dot) {
                     try self.advance();
                     const f = try self.expect(.ident, "field name");
+                    if (self.tok.kind == .lparen) {
+                        // method call — v1 speaks `.count()` only; the
+                        // rest of view navigation rides with the store.
+                        try self.advance();
+                        _ = try self.expect(.rparen, ")");
+                        if (!std.mem.eql(u8, f.text, "count"))
+                            return self.fail("view navigation beyond `.count()` rides with the store phase", Error.Unsupported);
+                        return self.mkExpr(.{ .count = name });
+                    }
                     return self.mkExpr(.{ .field = .{ .base = name, .name = f.text } });
                 }
                 if (self.tok.kind == .lbracket) {
@@ -1276,7 +1365,7 @@ const Gen = struct {
             off += 8;
         }
         for (self.actor.vars) |v| {
-            if (v.array > 0) continue; // RAM arrays get pointers, not slots
+            if (v.array > 0 or v.buf_cap > 0) continue; // arrays and bufs get their own homes
             try self.slots.put(v.name, off);
             off += 8;
         }
@@ -1351,6 +1440,36 @@ const Gen = struct {
             }
             break :blk false;
         };
+    }
+
+    fn actorPacksInto(self: *const Gen, name: []const u8) bool {
+        if (packsInto(self.actor.body, name)) return true;
+        for (self.actor.handlers) |h| {
+            const body = switch (h) {
+                .case => |c| c.body,
+                .after => |a| a.body,
+                .exit_case => |e| e.body,
+            };
+            if (packsInto(body, name)) return true;
+        }
+        for (self.actor.quiesce) |h| {
+            if (packsInto(h.case.body, name)) return true;
+        }
+        return false;
+    }
+
+    fn packsInto(list: []const Stmt, name: []const u8) bool {
+        for (list) |s| {
+            switch (s) {
+                .pack => |p| if (std.mem.eql(u8, p.buf, name)) return true,
+                .if_ => |i| if (packsInto(i.then, name) or packsInto(i.els, name)) return true,
+                .bounded => |b| if (packsInto(b.body, name)) return true,
+                .for_range => |f| if (packsInto(f.body, name)) return true,
+                .for_group => |f| if (packsInto(f.body, name)) return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn anyQuiesce(list: []const Stmt) bool {
@@ -1455,6 +1574,13 @@ const Gen = struct {
                 try self.w("        TAY", .{});
                 try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
             },
+            .count => |bname| {
+                const bi = self.bufs.get(bname) orelse
+                    return self.fail(0, "`.count()` walks a buf", Error.Semantics);
+                try self.emitCount(bi);
+                // element counts are data — A1.3's rules apply in full
+                self.cost_dyn = true;
+            },
             .field => |f| {
                 if (self.exit_bind != null and std.mem.eql(u8, self.exit_bind.?, f.base)) {
                     // w.id = the dead worker's context id; w.life = the
@@ -1474,6 +1600,8 @@ const Gen = struct {
                 const fld = for (msg.fields) |*fl| {
                     if (std.mem.eql(u8, fl.name, f.name)) break fl;
                 } else return self.fail(0, "no such field in the message", Error.Semantics);
+                if (fld.ty == .bytes_)
+                    return self.fail(0, "a bytes field is matched with `is` or forwarded whole (v1)", Error.Semantics);
                 const word: u16 = fld.offset / 8;
                 const bit: u16 = (fld.offset % 8) * 8;
                 if (word == 0) {
@@ -1822,6 +1950,285 @@ const Gen = struct {
         }
     }
 
+    /// `key.count()` — A2.2's element walk, which is also A2.7's machine
+    /// half of "skip is total": every valid element of the FULL tower —
+    /// including big ints, decimal, map and set, which joe cannot decode —
+    /// is stepped over structurally. A malformed or truncated stream is
+    /// BRK: the actor crashes honestly and the supervisor hears about it.
+    /// Result: the element count, in A.
+    fn emitCount(self: *Gen, bi: BufInfo) Error!void {
+        const t_n = try self.pushTmp();
+        const t_aux = try self.pushTmp();
+        defer {
+            self.popTmp();
+            self.popTmp();
+        }
+        const L = struct {
+            top: usize,
+            next: usize,
+            done: usize,
+            brk: usize,
+            one: usize,
+            neg: usize,
+            pos: usize,
+            adv1w: usize,
+            f4: usize,
+            f8: usize,
+            u16_: usize,
+            framed: usize,
+            fs: usize,
+            fs_inc: usize,
+            bign: usize,
+            bigp: usize,
+            big: usize,
+            bm: usize,
+            bl: usize,
+            bb: usize,
+            bb2: usize,
+            bdone: usize,
+            dec: usize,
+            dec_nz: usize,
+            dec_n: usize,
+            dec_e: usize,
+            nc: usize,
+            pos_e: usize,
+            w_e: usize,
+            dsc: usize,
+            dfound: usize,
+            exact: usize,
+        };
+        var l: L = undefined;
+        inline for (@typeInfo(L).@"struct".fields) |f| @field(l, f.name) = self.label();
+
+        try self.w("; count(): the total skip — all 18 type codes, in silicon", .{});
+        try self.w("        LDX #0", .{});
+        try self.w("        LDA #0", .{});
+        try self.w("        STA ${X}", .{t_n});
+        try self.w("L{d}:   TXA", .{l.top});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.done});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        AND #$FF", .{});
+        // the dispatch ladder: exact codes first, then the ranges
+        try self.w("        CMP #$01", .{});
+        try self.w("        BEQ L{d}", .{l.one});
+        try self.w("        CMP #$02", .{});
+        try self.w("        BEQ L{d}", .{l.one});
+        try self.w("        CMP #$05", .{});
+        try self.w("        BEQ L{d}", .{l.one});
+        try self.w("        CMP #$06", .{});
+        try self.w("        BEQ L{d}", .{l.one});
+        try self.w("        CMP #$0F", .{});
+        try self.w("        BEQ L{d}", .{l.bign});
+        try self.w("        CMP #$20", .{});
+        try self.w("        BEQ L{d}", .{l.one});
+        try self.w("        CMP #$31", .{});
+        try self.w("        BEQ L{d}", .{l.bigp});
+        try self.w("        CMP #$38", .{});
+        try self.w("        BEQ L{d}", .{l.dec});
+        try self.w("        CMP #$10", .{});
+        try self.w("        BCC L{d}", .{l.brk});
+        try self.w("        CMP #$20", .{});
+        try self.w("        BCC L{d}", .{l.neg});
+        try self.w("        CMP #$31", .{});
+        try self.w("        BCC L{d}", .{l.pos});
+        try self.w("        CMP #$34", .{});
+        try self.w("        BEQ L{d}", .{l.f4});
+        try self.w("        CMP #$35", .{});
+        try self.w("        BEQ L{d}", .{l.f8});
+        try self.w("        CMP #$40", .{});
+        try self.w("        BEQ L{d}", .{l.f8});
+        try self.w("        CMP #$44", .{});
+        try self.w("        BEQ L{d}", .{l.u16_});
+        try self.w("        CMP #$48", .{});
+        try self.w("        BEQ L{d}", .{l.framed});
+        try self.w("        CMP #$49", .{});
+        try self.w("        BEQ L{d}", .{l.framed});
+        try self.w("        CMP #$50", .{});
+        try self.w("        BEQ L{d}", .{l.framed});
+        try self.w("        CMP #$52", .{});
+        try self.w("        BEQ L{d}", .{l.framed});
+        try self.w("        CMP #$54", .{});
+        try self.w("        BEQ L{d}", .{l.framed});
+        try self.w("L{d}:   BRK                 ; malformed or truncated", .{l.brk});
+        // one-byte elements
+        try self.w("L{d}:   INX", .{l.one});
+        try self.w("        BRA L{d}", .{l.next});
+        // fixed ints: width from the code, both sides of zero
+        try self.w("L{d}:   STA ${X}", .{ l.neg, self.off_t });
+        try self.w("        LDA #$20", .{});
+        try self.w("        SEC", .{});
+        try self.w("        SBC ${X}", .{self.off_t});
+        try self.w("        BRA L{d}", .{l.adv1w});
+        try self.w("L{d}:   SEC", .{l.pos});
+        try self.w("        SBC #$20", .{});
+        try self.w("L{d}:   STA ${X}", .{ l.adv1w, self.off_t });
+        try self.w("        TXA", .{});
+        try self.w("        CLC", .{});
+        try self.w("        ADC ${X}", .{self.off_t});
+        try self.w("        TAX", .{});
+        try self.w("        INX", .{});
+        try self.w("        BRA L{d}", .{l.next});
+        // fixed-width payloads
+        try self.w("L{d}:   TXA", .{l.f4});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #5", .{});
+        try self.w("        TAX", .{});
+        try self.w("        BRA L{d}", .{l.next});
+        try self.w("L{d}:   TXA", .{l.f8});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #9", .{});
+        try self.w("        TAX", .{});
+        try self.w("        BRA L{d}", .{l.next});
+        try self.w("L{d}:   TXA", .{l.u16_});
+        try self.w("        CLC", .{});
+        try self.w("        ADC #17", .{});
+        try self.w("        TAX", .{});
+        try self.w("        BRA L{d}", .{l.next});
+        // framed: scan for an unescaped terminator
+        try self.w("L{d}:   INX", .{l.framed});
+        try self.w("L{d}:   TXA", .{l.fs});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        AND #$FF", .{});
+        try self.w("        BNE L{d}", .{l.fs_inc});
+        try self.w("        INX                 ; past the 0x00", .{});
+        try self.w("        TXA", .{});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.next});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        AND #$FF", .{});
+        try self.w("        CMP #$FF", .{});
+        try self.w("        BNE L{d}", .{l.next});
+        try self.w("        INX                 ; escaped literal 0x00", .{});
+        try self.w("        BRA L{d}", .{l.fs});
+        try self.w("L{d}:   INX", .{l.fs_inc});
+        try self.w("        BRA L{d}", .{l.fs});
+        // big ints: [m][n][magnitude], complemented when negative
+        try self.w("L{d}:   LDA ##$FF", .{l.bign});
+        try self.w("        STA ${X}", .{t_aux});
+        try self.w("        BRA L{d}", .{l.big});
+        try self.w("L{d}:   LDA #0", .{l.bigp});
+        try self.w("        STA ${X}", .{t_aux});
+        try self.w("L{d}:   INX", .{l.big});
+        try self.w("        TXA", .{});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        AND #$FF", .{});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        LDA ${X}", .{t_aux});
+        try self.w("        BEQ L{d}", .{l.bm});
+        try self.w("        LDA ${X}", .{self.off_t});
+        try self.w("        EOR ##$FF", .{});
+        try self.w("        AND #$FF", .{});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("L{d}:   LDA ${X}", .{ l.bm, self.off_t });
+        try self.w("        CMP #9", .{});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        INX", .{});
+        try self.w("        LDA #0", .{});
+        try self.w("        STA ${X}", .{self.off_acc});
+        try self.w("L{d}:   LDA ${X}", .{ l.bl, self.off_t });
+        try self.w("        BEQ L{d}", .{l.bdone});
+        try self.w("        TXA", .{});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        LDA ${X}", .{self.off_acc});
+        try self.w("        ASL #8", .{});
+        try self.w("        STA ${X}", .{self.off_acc});
+        try self.w("        LDA ${X}", .{t_aux});
+        try self.w("        BEQ L{d}", .{l.bb});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        EOR ##$FF", .{});
+        try self.w("        AND #$FF", .{});
+        try self.w("        BRA L{d}", .{l.bb2});
+        try self.w("L{d}:   LDA ${X},X", .{ l.bb, bi.data });
+        try self.w("        AND #$FF", .{});
+        try self.w("L{d}:   ORA ${X}", .{ l.bb2, self.off_acc });
+        try self.w("        STA ${X}", .{self.off_acc});
+        try self.w("        INX", .{});
+        try self.w("        DEC ${X}", .{self.off_t});
+        try self.w("        BRA L{d}", .{l.bl});
+        try self.w("L{d}:   TXA", .{l.bdone});
+        try self.w("        CLC", .{});
+        try self.w("        ADC ${X}", .{self.off_acc});
+        try self.w("        TAX", .{});
+        try self.w("        BRA L{d}", .{l.next});
+        // decimal: sign, embedded exponent int, digits to the terminator
+        try self.w("L{d}:   INX", .{l.dec});
+        try self.w("        TXA", .{});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        AND #$FF", .{});
+        try self.w("        CMP #2", .{});
+        try self.w("        BNE L{d}", .{l.dec_nz});
+        try self.w("        INX                 ; canonical zero", .{});
+        try self.w("        BRA L{d}", .{l.next});
+        try self.w("L{d}:   CMP #1", .{l.dec_nz});
+        try self.w("        BEQ L{d}", .{l.dec_n});
+        try self.w("        CMP #3", .{});
+        try self.w("        BNE L{d}", .{l.brk});
+        try self.w("        LDA #0", .{});
+        try self.w("        STA ${X}", .{t_aux});
+        try self.w("        BRA L{d}", .{l.dec_e});
+        try self.w("L{d}:   LDA ##$FF", .{l.dec_n});
+        try self.w("        STA ${X}", .{t_aux});
+        try self.w("L{d}:   INX                 ; past the sign", .{l.dec_e});
+        try self.w("        TXA", .{});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        AND #$FF", .{});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        LDA ${X}", .{t_aux});
+        try self.w("        BEQ L{d}", .{l.nc});
+        try self.w("        LDA ${X}", .{self.off_t});
+        try self.w("        EOR ##$FF", .{});
+        try self.w("        AND #$FF", .{});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("L{d}:   LDA ${X}", .{ l.nc, self.off_t });
+        try self.w("        CMP #$20", .{});
+        try self.w("        BCS L{d}", .{l.pos_e});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        LDA #$20", .{});
+        try self.w("        SEC", .{});
+        try self.w("        SBC ${X}", .{self.off_t});
+        try self.w("        BRA L{d}", .{l.w_e});
+        try self.w("L{d}:   SEC", .{l.pos_e});
+        try self.w("        SBC #$20", .{});
+        try self.w("L{d}:   CMP #17", .{l.w_e});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        STA ${X}", .{self.off_t});
+        try self.w("        TXA", .{});
+        try self.w("        CLC", .{});
+        try self.w("        ADC ${X}", .{self.off_t});
+        try self.w("        TAX", .{});
+        try self.w("        INX", .{});
+        try self.w("L{d}:   TXA", .{l.dsc});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BCS L{d}", .{l.brk});
+        try self.w("        LDA ${X},X", .{bi.data});
+        try self.w("        AND #$FF", .{});
+        try self.w("        CMP ${X}", .{t_aux});
+        try self.w("        BEQ L{d}", .{l.dfound});
+        try self.w("        INX", .{});
+        try self.w("        BRA L{d}", .{l.dsc});
+        try self.w("L{d}:   INX", .{l.dfound});
+        try self.w("        BRA L{d}", .{l.next});
+        // one more element walked
+        try self.w("L{d}:   INC ${X}", .{ l.next, t_n });
+        try self.w("        BRA L{d}", .{l.top});
+        // the stream must end exactly at the length — else it was truncated
+        try self.w("L{d}:   TXA", .{l.done});
+        try self.w("        CMP ${X}", .{bi.len_slot});
+        try self.w("        BEQ L{d}", .{l.exact});
+        try self.w("        BRK                 ; overshoot: truncated element", .{});
+        try self.w("L{d}:   LDA ${X}", .{ l.exact, t_n });
+    }
+
     /// `pack buf, (…)` (A2.3): constant segments pre-pack at compile time
     /// through the host half of struple #13 and land as immediate word
     /// stores; a variable element is a u64 encoded at runtime — type code
@@ -2070,9 +2477,17 @@ const Gen = struct {
             return;
         }
         // SEND path: each staged word composes in A the same way and
-        // stores straight to the staging buffer.
+        // stores straight to the staging buffer. A bytes field (always
+        // last, 8-aligned) is staged after the fixed words: its length
+        // byte, then the payload words.
+        const bytes_arg: ?*Expr = blk: {
+            if (msg.fields.len > 0 and msg.fields[msg.fields.len - 1].ty == .bytes_)
+                break :blk sd.args[msg.fields.len - 1];
+            break :blk null;
+        };
+        const fixed_end: u16 = if (bytes_arg != null) msg.fields[msg.fields.len - 1].offset else msg.wire_size;
         var word: u16 = 0;
-        while (word * 8 < msg.wire_size) : (word += 1) {
+        while (word * 8 < fixed_end) : (word += 1) {
             var have = false;
             for (msg.fields, sd.args) |*f, arg| {
                 if (f.offset / 8 != word) continue;
@@ -2092,6 +2507,58 @@ const Gen = struct {
                 try self.w("        LDA {s}", .{if (word == 0) try self.imm(msg.tag) else "#0"});
             }
             try self.w("        STA !${X}", .{self.layout.staging() + word * 8});
+        }
+        if (bytes_arg) |arg| {
+            const foff = msg.fields[msg.fields.len - 1].offset;
+            const cap_msg: u16 = @intCast(abi.land_cap - foff - 1);
+            switch (arg.*) {
+                .ident => |bname| {
+                    const bi = self.bufs.get(bname) orelse
+                        return self.fail(sd.line, "a bytes argument is a buf or a bound bytes field (v1)", Error.Semantics);
+                    // guard, then length word, then payload words
+                    const l_ok = self.label();
+                    try self.w("; bytes field: {s}'s length byte + payload", .{bname});
+                    try self.w("        LDA ${X}", .{bi.len_slot});
+                    try self.w("        CMP {s}", .{try self.imm(cap_msg + 1)});
+                    try self.w("        BCC L{d}", .{l_ok});
+                    try self.w("        BRK                 ; bytes overflow the envelope", .{});
+                    try self.w("L{d}:   STA !${X}", .{ l_ok, self.layout.staging() + foff });
+                    var wo: u16 = 0;
+                    while (wo < cap_msg) : (wo += 8) {
+                        if (wo >= bi.cap) break; // buf shorter than the envelope
+                        try self.w("        LDA ${X}", .{bi.data + wo});
+                        try self.w("        STA !${X}", .{self.layout.staging() + foff + 1 + wo});
+                    }
+                },
+                .field => |fx| {
+                    // forward a bound bytes field whole: word-for-word
+                    // copy from the landing buffer (both sides 8-aligned,
+                    // the length byte rides the first word).
+                    const bind = self.bind orelse
+                        return self.fail(sd.line, "a forwarded bytes field needs a case binding", Error.Semantics);
+                    if (!std.mem.eql(u8, bind, fx.base))
+                        return self.fail(sd.line, "field base is not the case binding", Error.Semantics);
+                    const smsg = self.bind_msg.?;
+                    const sfld = for (smsg.fields) |*fl| {
+                        if (std.mem.eql(u8, fl.name, fx.name)) break fl;
+                    } else return self.fail(sd.line, "no such field in the message", Error.Semantics);
+                    if (sfld.ty != .bytes_)
+                        return self.fail(sd.line, "only a bytes field forwards into a bytes field", Error.Semantics);
+                    if (abi.land_cap - sfld.offset < abi.land_cap - foff)
+                        return self.fail(sd.line, "the destination bytes field is narrower than the source", Error.Semantics);
+                    try self.w("; bytes field: forward {s}.{s} whole", .{ fx.base, fx.name });
+                    var wo: u16 = 0;
+                    while (sfld.offset + wo < abi.land_cap) : (wo += 8) {
+                        try self.w("        LDA ${X}", .{self.off_ptr});
+                        try self.w("        CLC", .{});
+                        try self.w("        ADC {s}", .{try self.imm(sfld.offset + wo)});
+                        try self.w("        STA ${X}", .{self.off_fp});
+                        try self.w("        LDA (${X})", .{self.off_fp});
+                        try self.w("        STA !${X}", .{self.layout.staging() + foff + wo});
+                    }
+                },
+                else => return self.fail(sd.line, "a bytes argument is a buf or a bound bytes field (v1)", Error.Semantics),
+            }
         }
         try self.w("        LDA #1              ; SQE: op = send", .{});
         try self.w("        STA !${X}", .{self.layout.sqBase()});
@@ -2114,6 +2581,10 @@ const Gen = struct {
 
     fn emit(self: *Gen) Error!void {
         try self.layoutSlots();
+        // Label the two loops up front: a body `quiesce` needs the
+        // lame-duck label even in a serve-less actor.
+        self.serve_label = self.label();
+        self.quiesce_label = self.label();
         const m_init = self.beginBurst();
         try self.w("; joe v1 — actor {s} (compiled; do not edit)", .{self.actor.name});
         try self.w("        .org ${X}", .{self.layout.origin});
@@ -2202,11 +2673,14 @@ const Gen = struct {
                 try self.w("        STA ${X}", .{self.slots.get(v.name).?});
             }
         }
-        // buffer lengths reset every life (near page survives SPWN)
+        // Pack targets reset their length every life (the near page
+        // survives SPWN). A buf never packed keeps its bytes — that is
+        // the harness staging contract, and respawn honesty for the rest.
         {
             var bit = self.bufs.iterator();
             var first = true;
             while (bit.next()) |e| {
+                if (!self.actorPacksInto(e.key_ptr.*)) continue;
                 if (first) try self.w("        LDA #0", .{});
                 first = false;
                 try self.w("        STA ${X}", .{e.value_ptr.len_slot});
@@ -2218,7 +2692,11 @@ const Gen = struct {
         try self.endBurst(m_init, 0, true);
 
         if (self.actor.handlers.len == 0) {
-            try self.w("        HLT", .{});
+            if (self.has_quiesce) {
+                try self.emitQuiesce();
+            } else {
+                try self.w("        HLT", .{});
+            }
             try self.emitStrings();
             try self.checkBounds(0);
             return;
@@ -2226,8 +2704,6 @@ const Gen = struct {
 
         // ── serve ──
         const serve_cost_start = self.cost;
-        self.serve_label = self.label();
-        self.quiesce_label = self.label();
         const l_exit = self.label();
         // The fused deliver test (item 4): word0 low 16 = status<<8 | tag,
         // so `AND ##$FFFF / CMP #deliver` accepts exactly a clean delivery
@@ -2365,6 +2841,214 @@ const Gen = struct {
         }
     }
 
+    /// Walker addressing for patterns and `.count()`: a buf walks with X
+    /// against its near-page slab; a message bytes field walks with Y
+    /// through a pointer at the landing buffer. The limit slot holds the
+    /// subject length in cursor coordinates.
+    const PatCtx = struct {
+        is_buf: bool,
+        data: u16 = 0,
+        ptr_tmp: u16 = 0,
+        lim_slot: u16,
+    };
+
+    fn patLoad(self: *Gen, ctx: PatCtx) Error!void {
+        if (ctx.is_buf) {
+            try self.w("        LDA ${X},X", .{ctx.data});
+        } else {
+            try self.w("        LDA (${X}),Y", .{ctx.ptr_tmp});
+        }
+    }
+
+    fn patCursorToA(self: *Gen, ctx: PatCtx) Error!void {
+        try self.w("        {s}", .{if (ctx.is_buf) @as([]const u8, "TXA") else "TYA"});
+    }
+
+    fn patAdvance(self: *Gen, ctx: PatCtx, k: u16) Error!void {
+        if (k == 1) {
+            try self.w("        {s}", .{if (ctx.is_buf) @as([]const u8, "INX") else "INY"});
+            return;
+        }
+        try self.patCursorToA(ctx);
+        try self.w("        CLC", .{});
+        try self.w("        ADC {s}", .{try self.imm(k)});
+        try self.w("        {s}", .{if (ctx.is_buf) @as([]const u8, "TAX") else "TAY"});
+    }
+
+    /// `cursor + k must not pass the limit` — branch to fail if it would.
+    fn patBound(self: *Gen, ctx: PatCtx, k: u16, l_fail: usize) Error!void {
+        const l_ok = self.label();
+        try self.patCursorToA(ctx);
+        if (k > 0) {
+            try self.w("        CLC", .{});
+            try self.w("        ADC {s}", .{try self.imm(k)});
+        }
+        try self.w("        CMP ${X}", .{ctx.lim_slot});
+        try self.w("        BEQ L{d}", .{l_ok});
+        try self.w("        BCS L{d}", .{l_fail});
+        try self.w("L{d}:", .{l_ok});
+    }
+
+    /// A2.4: `subject is ("users", ?id, ..rest)`. Constant segments fuse
+    /// into word compares against pre-packed bytes; `?x` decodes and
+    /// binds one integer element (a non-subset element fails the match,
+    /// it does not fault); `..rest` binds the remaining bytes as a view
+    /// value (cursor<<32 | remaining); no rest means end-of-stream.
+    fn emitPattern(self: *Gen, pat: *const Pattern, l_fail: usize) Error!void {
+        var ctx: PatCtx = undefined;
+        var tmps: u8 = 0;
+        switch (pat.subject.*) {
+            .ident => |bname| {
+                const bi = self.bufs.get(bname) orelse
+                    return self.fail(pat.line, "the match subject is not a buf", Error.Semantics);
+                ctx = .{ .is_buf = true, .data = bi.data, .lim_slot = bi.len_slot };
+                try self.w("; pattern over buf {s}", .{bname});
+                try self.w("        LDX #0", .{});
+            },
+            .field => |fx| {
+                const bind = self.bind orelse
+                    return self.fail(pat.line, "field access outside a case", Error.Semantics);
+                if (!std.mem.eql(u8, bind, fx.base))
+                    return self.fail(pat.line, "field base is not the case binding", Error.Semantics);
+                const msg = self.bind_msg.?;
+                const fld = for (msg.fields) |*fl| {
+                    if (std.mem.eql(u8, fl.name, fx.name)) break fl;
+                } else return self.fail(pat.line, "no such field in the message", Error.Semantics);
+                if (fld.ty != .bytes_)
+                    return self.fail(pat.line, "the match subject is not a bytes field", Error.Semantics);
+                const ptr_tmp = try self.pushTmp();
+                const lim_tmp = try self.pushTmp();
+                tmps = 2;
+                try self.w("; pattern over {s}.{s}", .{ fx.base, fx.name });
+                try self.w("        LDA ${X}", .{self.off_ptr});
+                try self.w("        CLC", .{});
+                try self.w("        ADC {s}", .{try self.imm(fld.offset)});
+                try self.w("        STA ${X}", .{ptr_tmp});
+                // limit = length byte + 1: cursor space starts past it
+                try self.w("        LDA (${X})", .{ptr_tmp});
+                try self.w("        AND #$FF", .{});
+                try self.w("        CLC", .{});
+                try self.w("        ADC #1", .{});
+                try self.w("        STA ${X}", .{lim_tmp});
+                ctx = .{ .is_buf = false, .ptr_tmp = ptr_tmp, .lim_slot = lim_tmp };
+                try self.w("        LDY #1", .{});
+            },
+            else => return self.fail(pat.line, "a match subject is a bytes field or a buf", Error.Semantics),
+        }
+        defer while (tmps > 0) : (tmps -= 1) self.popTmp();
+
+        var i: usize = 0;
+        while (i < pat.elems.len) {
+            switch (pat.elems[i]) {
+                .lit_str, .lit_int => {
+                    // coalesce the constant run and compare it in words
+                    var blob = struple.Packer.init(self.arena);
+                    while (i < pat.elems.len) : (i += 1) {
+                        switch (pat.elems[i]) {
+                            .lit_str => |s| blob.appendString(s) catch return Error.OutOfMemory,
+                            .lit_int => |v| blob.appendUint(v) catch return Error.OutOfMemory,
+                            .bind => break,
+                        }
+                    }
+                    const b = blob.bytes();
+                    try self.patBound(ctx, @intCast(b.len), l_fail);
+                    var off: u16 = 0;
+                    while (off < b.len) : (off += 8) {
+                        const k: u16 = @intCast(@min(8, b.len - off));
+                        try self.patLoad(ctx);
+                        if (k < 8) {
+                            const mask = (@as(u64, 1) << @intCast(k * 8)) - 1;
+                            try self.w("        AND ##${X}", .{mask});
+                        }
+                        try self.w("        CMP ##${X}", .{chunkWord(b[off..])});
+                        try self.w("        BNE L{d}", .{l_fail});
+                        try self.patAdvance(ctx, k);
+                    }
+                },
+                .bind => |bname| {
+                    i += 1;
+                    const bslot = try self.getOrAddSlot(bname);
+                    const t_w = try self.pushTmp();
+                    const t_val = try self.pushTmp();
+                    defer {
+                        self.popTmp();
+                        self.popTmp();
+                    }
+                    const l_nz = self.label();
+                    const l_end = self.label();
+                    const l_loop = self.label();
+                    try self.patBound(ctx, 1, l_fail);
+                    try self.patLoad(ctx);
+                    try self.w("        AND #$FF", .{});
+                    try self.w("        CMP #$20", .{});
+                    try self.w("        BNE L{d}", .{l_nz});
+                    try self.w("        LDA #0              ; canonical zero", .{});
+                    try self.w("        STA ${X}", .{bslot});
+                    try self.patAdvance(ctx, 1);
+                    try self.w("        BRA L{d}", .{l_end});
+                    // positive fixed 1..8 only — anything else fails the match
+                    try self.w("L{d}:   SEC", .{l_nz});
+                    try self.w("        SBC #$20", .{});
+                    try self.w("        CMP #9", .{});
+                    try self.w("        BCS L{d}", .{l_fail});
+                    try self.w("        STA ${X}", .{t_w});
+                    try self.w("        CLC", .{});
+                    try self.w("        ADC #1", .{});
+                    try self.w("        STA ${X}", .{self.off_t});
+                    // bounds: cursor + 1 + w within the subject
+                    {
+                        const l_ok = self.label();
+                        try self.patCursorToA(ctx);
+                        try self.w("        CLC", .{});
+                        try self.w("        ADC ${X}", .{self.off_t});
+                        try self.w("        CMP ${X}", .{ctx.lim_slot});
+                        try self.w("        BEQ L{d}", .{l_ok});
+                        try self.w("        BCS L{d}", .{l_fail});
+                        try self.w("L{d}:", .{l_ok});
+                    }
+                    try self.patAdvance(ctx, 1);
+                    try self.w("        LDA #0", .{});
+                    try self.w("        STA ${X}", .{t_val});
+                    const c_loop = self.cost;
+                    try self.w("L{d}:   LDA ${X}", .{ l_loop, t_val });
+                    try self.w("        ASL #8", .{});
+                    try self.w("        STA ${X}", .{t_val});
+                    try self.patLoad(ctx);
+                    try self.w("        AND #$FF", .{});
+                    try self.w("        ORA ${X}", .{t_val});
+                    try self.w("        STA ${X}", .{t_val});
+                    try self.patAdvance(ctx, 1);
+                    try self.w("        DEC ${X}", .{t_w});
+                    try self.w("        LDA ${X}", .{t_w});
+                    try self.w("        BNE L{d}", .{l_loop});
+                    self.cost +|= (self.cost - c_loop) *| 7; // ≤ 8 magnitude bytes
+                    try self.w("        LDA ${X}", .{t_val});
+                    try self.w("        STA ${X}", .{bslot});
+                    try self.w("L{d}:", .{l_end});
+                },
+            }
+        }
+        if (pat.rest) |rname| {
+            const rslot = try self.getOrAddSlot(rname);
+            try self.w("; ..{s}: view = cursor<<32 | remaining", .{rname});
+            try self.patCursorToA(ctx);
+            try self.w("        STA ${X}", .{self.off_t});
+            try self.w("        LDA ${X}", .{ctx.lim_slot});
+            try self.w("        SEC", .{});
+            try self.w("        SBC ${X}", .{self.off_t});
+            try self.w("        STA ${X}", .{self.off_acc});
+            try self.patCursorToA(ctx);
+            try self.w("        ASL #32", .{});
+            try self.w("        ORA ${X}", .{self.off_acc});
+            try self.w("        STA ${X}", .{rslot});
+        } else {
+            // no rest: the pattern owns the whole subject
+            try self.patCursorToA(ctx);
+            try self.w("        CMP ${X}", .{ctx.lim_slot});
+            try self.w("        BNE L{d}", .{l_fail});
+        }
+    }
+
     /// The delivery dispatch (item 4): the message tag once in A, then a
     /// compare ladder — two instructions per non-matching case, guards
     /// reloading the stashed tag on failure. A sole unguarded case skips
@@ -2376,7 +3060,7 @@ const Gen = struct {
         for (handlers) |*h| {
             if (h.* != .case) continue;
             case_count += 1;
-            if (h.case.where != null) any_guard = true;
+            if (h.case.where != null or h.case.pat != null) any_guard = true;
         }
         if (case_count == 0) {
             try self.w("        BRA L{d}", .{loop_label});
@@ -2417,10 +3101,9 @@ const Gen = struct {
             self.bind = c.bind;
             self.bind_msg = msg;
             var l_fail: ?usize = null;
-            if (c.where) |g| {
-                l_fail = self.label();
-                try self.branchIfFalse(g, l_fail.?);
-            }
+            if (c.where != null or c.pat != null) l_fail = self.label();
+            if (c.where) |g| try self.branchIfFalse(g, l_fail.?);
+            if (c.pat) |*p| try self.emitPattern(p, l_fail.?);
             self.in_handler = true;
             const bm = self.beginBurst();
             try self.stmts(c.body);
@@ -2681,11 +3364,27 @@ pub fn compile(
     var prog = try parser.parseProgram();
 
     // Layout: tags in declaration order (1-based), fields packed at their
-    // own alignment, wire size padded to 8.
+    // own alignment, wire size padded to 8. A `bytes` field (A2.5) sits
+    // last: one length byte, then the payload filling the envelope.
     for (prog.messages, 0..) |*m, i| {
         m.tag = @intCast(i + 1);
         var off: u16 = 2; // the tag word
-        for (m.fields) |*f| {
+        for (m.fields, 0..) |*f, fi| {
+            if (f.ty == .bytes_) {
+                if (fi + 1 != m.fields.len) {
+                    if (diag) |d| d.message = "a bytes field goes last (v1)";
+                    return Error.Semantics;
+                }
+                // 8-aligned so the length byte + payload stage and
+                // forward as whole words.
+                f.offset = std.mem.alignForward(u16, off, 8);
+                if (f.offset + 2 > abi.land_cap) {
+                    if (diag) |d| d.message = "no room left for a bytes field";
+                    return Error.Semantics;
+                }
+                off = abi.land_cap; // length byte + payload take the rest
+                continue;
+            }
             const a = f.ty.size();
             off = std.mem.alignForward(u16, off, a);
             f.offset = off;
@@ -2739,7 +3438,7 @@ pub fn compile(
         });
     }
     for (actor.vars) |v| {
-        if (v.array > 0) continue; // RAM arrays aren't read back by name
+        if (v.array > 0 or v.buf_cap > 0) continue; // arrays and bufs aren't scalar readbacks
         try vars.append(.{ .name = try alloc.dupe(u8, v.name), .off = gen.slots.get(v.name).? });
     }
     var bufs_out = std.ArrayList(BufOut).init(alloc);

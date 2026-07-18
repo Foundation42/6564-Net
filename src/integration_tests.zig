@@ -936,6 +936,142 @@ test "A2: pack — the machine and the host half agree on every byte" {
     try testing.expectEqualSlices(u8, p2.bytes(), near[k2.data..][0..p2.bytes().len]);
 }
 
+test "A2.7: skip is total on the machine — the full corpus, under scorch" {
+    // The machine half of struple #13: `.count()` compiles to the total
+    // element walk, and every corpus vector — including big ints,
+    // decimal, map and set, which joe cannot decode — must walk to the
+    // exact end with the host reader's element count. Registers poisoned
+    // at every park, per the amendment's conformance clause.
+    const struple = @import("struple.zig");
+    const src =
+        \\actor Skipper() {
+        \\    var key buf [280]u8
+        \\    var n u64 = 0
+        \\    n = key.count()
+        \\}
+    ;
+    var r: joe.Result = undefined;
+    var diag = joe.Diagnostic{};
+    r = try joe.compile(testing.allocator, src, "Skipper", .{}, &diag);
+    defer r.deinit();
+    var adiag = asm6564.Diagnostic{};
+    var out = try asm6564.assemble(testing.allocator, r.asm_text, &adiag);
+    defer out.deinit();
+    const key = bufOf(&r, "key");
+    const n_off = for (r.vars) |v| {
+        if (std.mem.eql(u8, v.name, "n")) break v.off;
+    } else unreachable;
+
+    const corpus = @embedFile("struple_vectors.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, corpus, .{});
+    defer parsed.deinit();
+    var walked: usize = 0;
+    for (parsed.value.array.items) |entry| {
+        const hex = entry.object.get("bytes").?.string;
+        const want = try testing.allocator.alloc(u8, hex.len / 2);
+        defer testing.allocator.free(want);
+        _ = try std.fmt.hexToBytes(want, hex);
+
+        var hr = struple.Reader.init(want);
+        var host_n: u64 = 0;
+        while (!hr.done()) {
+            _ = try hr.skipRaw();
+            host_n += 1;
+        }
+
+        var m = try machine.Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .scorch_parks = true,
+        });
+        defer m.deinit();
+        m.load(0, out.origin, out.code);
+        const near = &m.cores[0].contexts[0].near;
+        @memcpy(near[key.data..][0..want.len], want);
+        std.mem.writeInt(u64, near[key.len_slot..][0..8], want.len, .little);
+        try m.spawn(0, 0, out.origin, 0x8000, 0);
+        _ = try m.run();
+        try testing.expectEqual(machine.CtxState.halted, m.cores[0].contexts[0].state);
+        try testing.expectEqual(host_n, std.mem.readInt(u64, near[n_off..][0..8], .little));
+        walked += 1;
+    }
+    try testing.expect(walked >= 60); // the whole corpus, not a sample
+}
+
+test "A2.7: the machine's int encoder reproduces the corpus vectors" {
+    const struple = @import("struple.zig");
+    const src =
+        \\actor PackOne(v u64) {
+        \\    var key buf [32]u8
+        \\    pack key, (v)
+        \\}
+    ;
+    var r: joe.Result = undefined;
+    var diag = joe.Diagnostic{};
+    r = try joe.compile(testing.allocator, src, "PackOne", .{}, &diag);
+    defer r.deinit();
+    var adiag = asm6564.Diagnostic{};
+    var out = try asm6564.assemble(testing.allocator, r.asm_text, &adiag);
+    defer out.deinit();
+    const key = bufOf(&r, "key");
+    const v_off = r.params[0].off;
+
+    const corpus = @embedFile("struple_vectors.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, corpus, .{});
+    defer parsed.deinit();
+    var packed_n: usize = 0;
+    for (parsed.value.array.items) |entry| {
+        const hex = entry.object.get("bytes").?.string;
+        const want = try testing.allocator.alloc(u8, hex.len / 2);
+        defer testing.allocator.free(want);
+        _ = try std.fmt.hexToBytes(want, hex);
+        // joe utters unsigned ints: single-element non-negative ≤ u64
+        var hr = struple.Reader.init(want);
+        const el = (hr.next() catch continue) orelse continue;
+        if (el != .int or !hr.done()) continue;
+        if (el.int < 0 or el.int > std.math.maxInt(u64)) continue;
+
+        var m = try machine.Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .scorch_parks = true,
+        });
+        defer m.deinit();
+        m.load(0, out.origin, out.code);
+        const near = &m.cores[0].contexts[0].near;
+        std.mem.writeInt(u64, near[v_off..][0..8], @intCast(el.int), .little);
+        try m.spawn(0, 0, out.origin, 0x8000, 0);
+        _ = try m.run();
+        const got_len = std.mem.readInt(u64, near[key.len_slot..][0..8], .little);
+        try testing.expectEqual(want.len, got_len);
+        try testing.expectEqualSlices(u8, want, near[key.data..][0..want.len]);
+        packed_n += 1;
+    }
+    try testing.expect(packed_n >= 6);
+}
+
+test "A2.4: keys.joe — dispatch on structured keys is memcmp, scorched too" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/keys.joe");
+    for ([_]bool{ false, true }) |burnt| {
+        var o = try joe_run.simulate(testing.allocator, src, .{
+            .loss_ppm4k = 0,
+            .dup_ppm4k = 0,
+            .scorch = burnt,
+        });
+        defer o.deinit();
+        // three keys: one bound with a rest view, one exact, one that
+        // falls through both patterns to the wildcard
+        try testing.expectEqual(@as(u64, 1), o.varOf("router", "users_seen").?);
+        try testing.expectEqual(@as(u64, 42), o.varOf("router", "user_id").?);
+        try testing.expectEqual(@as(u64, 9), o.varOf("router", "rest_len").?);
+        try testing.expectEqual(@as(u64, 1), o.varOf("router", "posts_seen").?);
+        try testing.expectEqual(@as(u64, 7), o.varOf("router", "post_id").?);
+        try testing.expectEqual(@as(u64, 1), o.varOf("router", "missed").?);
+        try testing.expectEqual(@as(u64, 3), o.varOf("asker", "step").?);
+    }
+}
+
 test "item 4: the joe corpus is scorch-invariant — nothing trusts the banked file" {
     // The bank-collapse verifier: registers (A, X, Y, SP, P) are
     // poisoned at every real park. If any compiled program ran on the
@@ -985,6 +1121,7 @@ test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
         .{ .src = @embedFile("programs/forkjoin.joe"), .actors = &.{ "Root", "Lieutenant", "Worker" } },
         .{ .src = @embedFile("programs/pipeline.joe"), .actors = &.{ "Source", "Stage", "Sink" } },
         .{ .src = @embedFile("programs/hello.joe"), .actors = &.{"Greeter"} },
+        .{ .src = @embedFile("programs/keys.joe"), .actors = &.{ "Asker", "Router" } },
     };
     for (corpus) |entry| {
         for (entry.actors) |name| {

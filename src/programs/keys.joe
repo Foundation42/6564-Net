@@ -1,0 +1,70 @@
+// keys.joe — Amendment 2's client surface, end to end: pack a struple
+// key into a buffer, ship it as a bytes field, and dispatch on its
+// STRUCTURE at the receiver — constant prefixes fuse to word compares
+// against pre-packed bytes, `?x` decodes and binds one element, `..rest`
+// binds the remainder as a view, and a pattern with no rest demands end
+// of stream. Matching a structured key costs what a tag compare costs,
+// scaled by key length. The store peripheral (A2.5) will speak exactly
+// these bytes; today the router proves the dispatch.
+//
+// Flow control is the corpus's own: the reply is the ack. One key in
+// flight, the next sent when the router answers — so the cap-2 landing
+// ring never sees a crowd, at any placement, on any seed.
+
+message Get { key bytes }
+message Ok { }
+
+actor Asker(router addr) {
+    var key buf [64]u8
+    var step u64 = 0
+
+    pack key, ("users", 42, "profile")
+    send router, Get{key}
+
+    serve {
+        case Ok(_):
+            step += 1
+            if step == 1 {
+                pack key, ("posts", 7)
+                send router, Get{key}
+            }
+            if step == 2 {
+                pack key, ("tags", 1)
+                send router, Get{key}
+            }
+            if step == 3 { quiesce }
+    }
+}
+
+actor Router(reply addr) {
+    var users_seen u64 = 0
+    var user_id u64 = 0
+    var rest_len u64 = 0
+    var posts_seen u64 = 0
+    var post_id u64 = 0
+    var missed u64 = 0
+
+    serve {
+        case Get(g) where g.key is ("users", ?id, ..rest):
+            users_seen += 1
+            user_id = id
+            rest_len = rest & 4294967295
+            send reply, Ok{}
+
+        case Get(g) where g.key is ("posts", ?pid):
+            posts_seen += 1
+            post_id = pid
+            send reply, Ok{}
+
+        case Get(_):
+            missed += 1
+            send reply, Ok{}
+    }
+}
+
+// Declaration order is spawn order reversed: the router, declared last,
+// is parked and listening before the first key moves.
+system {
+    asker = Asker(router)
+    router = Router(asker)
+}

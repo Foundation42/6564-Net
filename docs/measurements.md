@@ -721,3 +721,66 @@ corpus assertion, ring guard moved 130 → 70 = the prediction, not the
 achievement). Frozen asm table untouched — the hand corpus never
 changed, which is the point: the convention was measured, not the
 programmer.
+
+## Amendment 2, phase one: bytes are honest, and #13 speaks (2026-07-18)
+
+Christian's `docs/joe-v1-ammendment-2.md` (struple as joe's tuple
+encoding; views as indices; the store as a §7 device) began landing the
+day it arrived — before item 5, by its own logic: the client surface is
+pure scalar work, the conformance oracle already existed with twelve
+byte-identical implementations behind it, and scorch was still warm.
+
+**The joe/6564 implementation is struple's thirteenth**, split exactly
+as the machine splits: `src/struple.zig` is the host half (the subset
+packer joe's compiler pre-packs constants with, the reader the tests
+oracle against), and the code joe EMITS is the machine half. Both are
+driven by the vendored corpus (`src/struple_vectors.json`, verbatim):
+
+- Host half: every subset vector byte-identical in both directions;
+  every vector — big ints, decimal, map, set included — skips totally.
+- Machine half, under scorch, per A2.7: **the full corpus walks on the
+  simulator** — `.count()` compiles to the total element skip (all 18
+  type codes, framed scans, complemented big-int length prefixes,
+  decimal sign/exponent/digit structure), and every vector lands the
+  host reader's exact element count at the exact final byte. The int
+  encoder (`pack key, (v)`) reproduces every utterable corpus vector
+  byte-for-byte — type code $20+n, big-endian magnitude, peeled
+  MSB-first by counted shifts because variable shift counts do not
+  exist on this machine.
+
+**The surface**: `var key buf [64]u8` (near-page slab + length slot),
+`pack key, ("users", id, "profile")` (constants pre-pack at compile
+time into immediate word stores; a variable u64 appends at runtime
+through unaligned near_x stores against the slab's 8-byte slack),
+`key bytes` message fields (length byte + payload, 8-aligned, filling
+the envelope; one per message, last, forwardable whole), and A2.4's
+prize: `case Get(g) where g.key is ("users", ?id, ..rest)` — constant
+prefixes fuse into 8-byte word compares against pre-packed bytes, `?x`
+decodes and binds one element (a non-subset element fails the match,
+honestly, it does not fault), `..rest` binds a view, and no rest means
+end-of-stream. Dispatch on a structured key costs word compares.
+`keys.joe` proves it end to end: three packed keys through a router,
+one bound with a rest view (len 9, the encoded "profile"), one exact,
+one falling through both patterns to the wildcard — scorched and not.
+
+**A finding worth its ledger line: the on-chip self-send outruns the
+park.** The first keys.joe machine-gunned three sends from one burst
+and starved its co-resident router into rejecting the third — because
+at 4-cycle on-chip latency the A1.1 self-send loop's next message has
+ALWAYS already landed when LSTN runs, so "one park per slice" is one
+CHECK per slice, and the burst never yields the core. Three lessons,
+two old and one new: the loader's each-declaration-owns-its-cores rule
+exists precisely for this (I had overridden it with `on 0` — don't);
+flow control without transport verdicts is the corpus's own
+result-is-the-ack pattern (keys.joe now stop-and-waits, robust at any
+placement on any seed); and serve-loop fairness on a shared core
+(should the dispatcher YLD between bursts?) is a genuine design
+question for Christian — recorded, not decided.
+
+Deferred to A2-ii with the store (item 6): region-backed bufs, the
+store device itself (`~/dev/substr` is the polyfill behind the §7.5
+contract), sized `bytes[N]` fields (Put/Scan want two per message),
+f64/uuid/timestamp machine-side encode, view navigation beyond
+`.count()`, and D1's key-as-location — remembered, non-normative.
+
+109 tests. Frozen table intact; ring still 55.

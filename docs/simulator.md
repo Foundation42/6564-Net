@@ -557,6 +557,52 @@ parks — was measured, not assumed. Implementation notes:
   ceiling) is the one new silicon mechanism the collapse requires — it
   rides with the v2.6 spec draft, not the simulator measurement.
 
+## joe Amendment 2, phase one (docs/joe-v1-ammendment-2.md)
+
+struple is joe's tuple encoding; the joe/6564 codec is the format's
+thirteenth implementation, conformance-driven by the vendored corpus
+(`src/struple_vectors.json` — the language-neutral contract, verbatim).
+Implementation notes:
+
+- **Two halves, one contract.** `src/struple.zig` is the host half:
+  the canonical subset packer (`pack`'s compile-time constant
+  pre-packing), the reader/skip the tests oracle against, and the
+  subset classifier (transcode failure = reserved). The machine half
+  is what joe emits; A2.7's clause — full corpus, on the simulator,
+  under scorch — is a suite test, not a claim.
+- **`buf [N]u8`** is a near-page slab (8 bytes of slack past capacity,
+  so unaligned `near_x` word stores always land in owned ground) plus
+  a length slot. A pack target's length resets every life; a buf never
+  packed keeps its bytes — that is the harness staging contract.
+- **`pack`** pre-packs constant runs at compile time into immediate
+  word stores; a variable u64 encodes at runtime with the top-byte
+  peel (counted shifts only — the ISA has no variable shift, so a
+  skip counter walks the 8 rotations). Overflow is a compile error
+  where static, BRK where data-dependent (`pack_overflow` is v2.6
+  spec work; v1 crashes honestly).
+- **`bytes` message fields**: one per message, last, 8-aligned —
+  length byte + payload filling the 64-byte envelope, staged and
+  forwarded as whole words. Sized `bytes[N]` (Put/Scan want two per
+  message) is deferred to the store phase.
+- **`is` patterns** lower as: bounds check, fused word compares
+  against pre-packed constant bytes, per-`?x` integer decode loops
+  (≤ 8 magnitude bytes, charged ×8 by A1.3), `..rest` view bind
+  (cursor<<32 | remaining), end-of-stream check when no rest. A
+  pattern is ladder-integrated exactly like a `where` guard: failure
+  reloads the stashed tag and tries the next case. Subjects: a bound
+  message's bytes field (walked with Y through a landing pointer) or
+  a local buf (walked with X against the slab).
+- **`.count()`** emits the total-skip walker — all 18 type codes,
+  including the four joe cannot decode. Data-dependent by nature:
+  A1.3 flags it, and a watchdogged actor must `bounded` it.
+- **The on-chip self-send outruns the park** (finding): at 4-cycle
+  same-core latency, a self-send loop's next message has always
+  landed before LSTN runs, so the loop never parks and the core never
+  rotates — a co-resident actor starves. The loader's ownership rule
+  already prevents co-residency unless overridden; serve-loop
+  fairness (YLD between bursts?) is an open design question for the
+  v2.6 conversation.
+
 ## Stats and tracing
 
 `Machine.stats`: instructions, context switches, sends, delivered, lost,

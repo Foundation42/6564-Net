@@ -104,6 +104,17 @@ loop, on-chip and lossless, one park per slice (`crunch.joe`) — and
 `bounded` is *checked*: the compiler charges every emitted instruction
 its ISA-table cycles, so an understated budget is a compile error and
 the watchdog remains judge only of the data-dependent claims.
+Amendment 2 makes bytes honest: **struple** — the memcmp-orderable
+tuple format with twelve byte-identical implementations — is joe's
+tuple encoding, and the joe/6564 codec is the **thirteenth**, driven
+by the same language-neutral corpus, on the simulator, with every
+register poisoned at every park. `pack key, ("users", id, "profile")`
+pre-packs constants at compile time; `case Get(g) where g.key is
+("users", ?id, ..rest)` dispatches on key *structure* — the constant
+prefix is a word-compare against pre-packed bytes, so matching a
+structured key costs what a tag compare costs, scaled by key length
+(`keys.joe`). Skip is total in silicon: `.count()` walks every type
+in the tower, including the four joe cannot decode.
 
 **mandel** renders the Mandelbrot set in IEEE 754 double precision on
 a 6502 descendant (`sim6564 mandel`): Tier 0 scalar FP lives on the
