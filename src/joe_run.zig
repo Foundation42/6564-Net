@@ -65,7 +65,7 @@ pub const Options = struct {
     contended_lstn: bool = true,
 };
 
-pub const VarOut = struct { name: []const u8, value: u64 };
+pub const VarOut = struct { name: []const u8, value: u64, f64: bool = false };
 
 pub const InstanceOut = struct {
     name: []const u8,
@@ -491,6 +491,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             try vars.append(.{
                 .name = try alloc.dupe(u8, v.name),
                 .value = std.mem.readInt(u64, ctx.near[v.off..][0..8], .little),
+                .f64 = v.f64,
             });
         }
         try insts.append(.{
@@ -563,7 +564,13 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
         if (inst.state == .faulted)
             try stdout.print(" ({s})", .{@tagName(inst.fault)});
         try stdout.print(" [{d} B]", .{inst.code_bytes});
-        for (inst.vars) |v| try stdout.print("  {s}={d}", .{ v.name, v.value });
+        for (inst.vars) |v| {
+            if (v.f64) {
+                try stdout.print("  {s}={d}", .{ v.name, @as(f64, @bitCast(v.value)) });
+            } else {
+                try stdout.print("  {s}={d}", .{ v.name, v.value });
+            }
+        }
         try stdout.print("\n", .{});
     }
     if (o.instances.len > shown) {

@@ -3936,6 +3936,8 @@ pub const Slot = struct {
     name: []const u8,
     off: u16,
     addr: bool = false,
+    /// An f64 slot: the value is float bits — display it as one.
+    f64: bool = false,
     /// A []addr parameter: `off` holds the count; the windows go to RAM
     /// at block + `area` (group_cap entries reserved).
     group: bool = false,
@@ -4149,7 +4151,11 @@ pub fn compile(
     }
     for (actor.vars) |v| {
         if (v.array > 0 or v.buf_cap > 0 or v.ty == .vec_) continue; // wide things aren't scalar readbacks
-        try vars.append(.{ .name = try alloc.dupe(u8, v.name), .off = gen.slots.get(v.name).? });
+        try vars.append(.{
+            .name = try alloc.dupe(u8, v.name),
+            .off = gen.slots.get(v.name).?,
+            .f64 = v.ty == .f64_,
+        });
     }
     var bufs_out = std.ArrayList(BufOut).init(alloc);
     errdefer bufs_out.deinit();
