@@ -154,6 +154,12 @@ pub const Config = struct {
     max_cycles: u64 = 10_000_000,
     /// Print scheduler / RBC / fabric events to stderr as they happen.
     trace: bool = false,
+    /// Contended-LSTN rule ("immediate hot-path delivery is a privilege of
+    /// an idle core"): an LSTN that finds its ring non-empty still rotates
+    /// when another context on the core is runnable. Fairness is the
+    /// machine's job — joe never learns about cores. v2.6 candidate,
+    /// default on with the pricing in docs/measurements.md.
+    contended_lstn: bool = true,
     /// The bank-collapse verifier (handoff item 1/§1): poison A, X, Y, SP
     /// and P at every voluntary park (LSTN that actually parks, YLD). This
     /// is the maximally hostile implementation the collapsed-register
@@ -167,6 +173,19 @@ pub const Config = struct {
 /// The poison stamped into registers at a scorched park — recognizable in
 /// any trace, guaranteed not to look like a valid pointer or count.
 pub const scorch_pattern: u64 = 0xDEAD_6564_DEAD_6564;
+
+/// Is any OTHER live context runnable on this core? The contended-LSTN
+/// test — one scan of state the scheduler already holds.
+fn otherRunnable(core: *Core, self_ctx: u8) bool {
+    var i: usize = 0;
+    while (i < core.runq.count) : (i += 1) {
+        const e = core.runq.peekItem(i);
+        if (e.ctx == self_ctx) continue;
+        const c = &core.contexts[e.ctx];
+        if (c.state == .ready and c.gen == e.gen) return true;
+    }
+    return false;
+}
 
 fn scorch(ctx: *Context) void {
     ctx.a = scorch_pattern;
@@ -1367,6 +1386,25 @@ pub const Machine = struct {
                     ctx.park_slot = desc_slot;
                     if (self.cfg.scorch_parks) scorch(ctx);
                     // Resume after the LSTN once the ring has data.
+                    return .switched_out;
+                }
+                // Contended LSTN (v2.6 candidate, measured before adopted):
+                // immediate hot-path delivery is a privilege of an idle
+                // core. If another context here is runnable, LSTN rotates —
+                // requeued to resume past the LSTN, registers volatile
+                // exactly as at any park. On-chip delivery outruns the
+                // park (4 cycles beats the loop back to LSTN), so without
+                // this a hot self-send loop monopolizes the core and an
+                // unwatchdogged neighbor starves invisibly — the species
+                // of failure this machine exists to exterminate. The
+                // rotation is a pure function of run-queue state, so
+                // replay stays bit-exact; the item-4 collapse made the
+                // switch itself zero mechanism, so fairness is nearly
+                // free precisely where a neighbor exists to deserve it.
+                if (self.cfg.contended_lstn and otherRunnable(core, ctx_idx)) {
+                    self.trace("c{d}x{d} @{d} LSTN rotates: slot{d} hot but the core is contended", .{ core.id, ctx_idx, core.clock, desc_slot });
+                    try core.runq.writeItem(.{ .ctx = ctx_idx, .gen = ctx.gen, .ip = ctx.ip });
+                    if (self.cfg.scorch_parks) scorch(ctx);
                     return .switched_out;
                 }
             },

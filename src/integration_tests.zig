@@ -1072,6 +1072,87 @@ test "A2.4: keys.joe — dispatch on structured keys is memcmp, scorched too" {
     }
 }
 
+test "contended LSTN: hot delivery is a privilege of an idle core" {
+    // The pricing benchmark for the v2.6 candidate. The machine-gun
+    // shape that exposed the hole: a self-send looper co-resident with
+    // its server. On-chip delivery (4cy) beats the loop back to LSTN,
+    // so without the rule the asker's slices fuse into one unparked
+    // burst, the router starves unseen (no watchdog — nothing trips),
+    // and the third key dies on the cap-2 ring. With the rule, the
+    // contended LSTN rotates and every key lands. Same seed, same
+    // placement, one branch of difference.
+    const joe_run = @import("joe_run.zig");
+    const src =
+        \\message Get { key bytes }
+        \\message Go { }
+        \\actor Asker(router addr) {
+        \\    var key buf [64]u8
+        \\    var step u64 = 0
+        \\    send self, Go{}
+        \\    serve {
+        \\        case Go(_):
+        \\            step += 1
+        \\            if step == 1 {
+        \\                pack key, ("users", 42, "profile")
+        \\                send router, Get{key}
+        \\                send self, Go{}
+        \\            }
+        \\            if step == 2 {
+        \\                pack key, ("posts", 7)
+        \\                send router, Get{key}
+        \\                send self, Go{}
+        \\            }
+        \\            if step == 3 {
+        \\                pack key, ("tags", 1)
+        \\                send router, Get{key}
+        \\                quiesce
+        \\            }
+        \\    }
+        \\}
+        \\actor Router() {
+        \\    var seen u64 = 0
+        \\    serve {
+        \\        case Get(_):
+        \\            seen += 1
+        \\    }
+        \\}
+        \\system {
+        \\    asker = Asker(router) on 0
+        \\    router = Router() on 0
+        \\}
+    ;
+    // Without the rule: the starvation, reproduced honestly.
+    var bad = try joe_run.simulate(testing.allocator, src, .{
+        .loss_ppm4k = 0,
+        .dup_ppm4k = 0,
+        .contended_lstn = false,
+    });
+    defer bad.deinit();
+    try testing.expect(bad.stats.rejects >= 1);
+    try testing.expect(bad.varOf("router", "seen").? < 3);
+    // With it: every key lands, and nothing else in the corpus moved.
+    var good = try joe_run.simulate(testing.allocator, src, .{
+        .loss_ppm4k = 0,
+        .dup_ppm4k = 0,
+    });
+    defer good.deinit();
+    try testing.expectEqual(@as(u64, 0), good.stats.rejects);
+    try testing.expectEqual(@as(u64, 3), good.varOf("router", "seen").?);
+}
+
+test "contended LSTN: the idle-core hot path keeps its privilege" {
+    // crunch's self-send loop shares its core with nobody runnable, so
+    // the rule must not tax it: cycle-identical with the rule on or off.
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/crunch.joe");
+    var on = try joe_run.simulate(testing.allocator, src, .{});
+    defer on.deinit();
+    var off = try joe_run.simulate(testing.allocator, src, .{ .contended_lstn = false });
+    defer off.deinit();
+    try testing.expectEqual(off.cycles, on.cycles);
+    try testing.expectEqual(@as(u64, 500500), on.varOf("sink", "total").?);
+}
+
 test "item 4: the joe corpus is scorch-invariant — nothing trusts the banked file" {
     // The bank-collapse verifier: registers (A, X, Y, SP, P) are
     // poisoned at every real park. If any compiled program ran on the

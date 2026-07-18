@@ -59,6 +59,10 @@ pub const Options = struct {
     /// Item 4's verifier: poison registers at every real park. Compiled
     /// joe must run identically — it never trusts the banked file.
     scorch: bool = false,
+    /// The contended-LSTN rule (v2.6 candidate): hot-path delivery is a
+    /// privilege of an idle core. Off reproduces the starvation for the
+    /// pricing benchmark.
+    contended_lstn: bool = true,
 };
 
 pub const VarOut = struct { name: []const u8, value: u64 };
@@ -325,6 +329,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         .max_cycles = opts.max_cycles,
         .trace = opts.trace,
         .scorch_parks = opts.scorch,
+        .contended_lstn = opts.contended_lstn,
     });
     defer m.deinit();
 

@@ -784,3 +784,58 @@ f64/uuid/timestamp machine-side encode, view navigation beyond
 `.count()`, and D1's key-as-location — remembered, non-normative.
 
 109 tests. Frozen table intact; ring still 55.
+
+## Contended LSTN: hot delivery is a privilege of an idle core (2026-07-18)
+
+Christian's verdict on the self-send finding, priced as prescribed —
+and first, his diagnostic question answered from the source: **the
+burst budget runs on the dispatch clock** (machine.zig: `burst_start`
+is set only in `dispatch()`, and the trip check reads `clock −
+burst_start`). A never-parking loop is therefore ONE accumulating
+burst: a *watchdogged* hot loop does eventually trip — the belt
+already existed. keys.joe's asker ran happily because system-block
+instances carry no watchdog: the starved neighbor was invisible
+exactly and only for the unwatchdogged. That is the hole the rule
+closes — and it closes it in the machine, not in joe, because joe
+does not know what a core is. Fairness is not the program's job.
+
+**The rule, one branch:** an LSTN that finds its ring non-empty still
+rotates when another live context on the core is runnable — requeued
+past the LSTN, registers volatile exactly as at any park (scorch
+poisons the rotation too). The check is a pure function of run-queue
+state the scheduler already holds, so bit-exact replay is untouched.
+
+**The price, measured:**
+
+| benchmark | rule off | rule on |
+|---|---|---|
+| ring.joe (8 co-resident, cy) | 44,208 | **44,208** |
+| hand ring (cy/pass) | 60 | **60** |
+| hand pingpong (cy) | 11,022 | **11,022** |
+| crunch.joe (self-send loop, idle core, cy) | 41,091 | **41,091** |
+| machine-gun keys (co-resident) | 1+ rejects, 2/3 keys | **0 rejects, 3/3** |
+
+Zero cycles, everywhere — and the ring rows are not vacuous: the
+rotation count there is zero because at steady state the ring never
+*enters* the hot path (the 4-cycle on-chip delivery exceeds the
+2-cycle loop-back to LSTN, so every node genuinely parks). The rule
+fires only where a burst is long enough for its own next message to
+beat it back to LSTN — pack work, compute slices — and exactly there
+a starving neighbor exists to deserve the rotation. Item 4's collapse
+made the switch zero mechanism, so the fairness costs one honest
+branch: **the collapse funds the fairness.**
+
+This also repairs A1.1's falsified clause with a better one: not
+"every iteration parks" but "every iteration parks *when anyone needs
+the core*" — the hot path survives precisely where it is harmless.
+
+Residual, as directed (belt to the braces): since the budget clock is
+dispatch-based, the belt already accumulates across unparked bursts
+for watchdogged actors; whether an *unwatchdogged* context should
+also face some ceiling on an unparked run is left as a v2.6 spec
+question — with contended LSTN in place, such a run can only occur on
+an idle core, where nobody is harmed by it.
+
+Suite: 111 tests (the starvation is now a regression test in both
+directions). Default: on. v2.6 records "contended LSTN parks" with
+this table as its pricing.
