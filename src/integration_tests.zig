@@ -1320,6 +1320,30 @@ test "tier 1: a 256-element dot product, bit-exact against the host mirror" {
     });
 }
 
+test "A1.4: vecmath.joe — SIMD is a data type with operators, bit-exact" {
+    const joe_run = @import("joe_run.zig");
+    const src = @embedFile("programs/vecmath.joe");
+    var o = try joe_run.simulate(testing.allocator, src, .{});
+    defer o.deinit();
+    try testing.expectEqual(machine.CtxState.halted, o.instance("calc").?.state);
+    // host mirror, op for op: lanewise (x*2)+1, then the spec'd tree
+    var w: [8]f64 = undefined;
+    for (0..8) |i| w[i] = (@as(f64, @floatFromInt(i + 1)) * 2.0) + 1.0;
+    const tree = ((w[0] + w[1]) + (w[2] + w[3])) + ((w[4] + w[5]) + (w[6] + w[7]));
+    try testing.expectEqual(@as(u64, @bitCast(tree)), o.varOf("calc", "sum").?);
+    try testing.expectEqual(@as(u64, @bitCast(@as(f64, 17.0))), o.varOf("calc", "top").?);
+    try testing.expectEqual(@as(u64, @bitCast(@as(f64, 3.0))), o.varOf("calc", "low").?);
+    // permute([0×8]) broadcasts lane 0 — the sum proves the picks
+    try testing.expectEqual(@as(u64, @bitCast(@as(f64, 8.0))), o.varOf("calc", "picked").?);
+    // scalar float path: 1/3 to the bit, and FTOI's honest truncation
+    const third: f64 = 1.0 / 3.0;
+    try testing.expectEqual(@as(u64, @bitCast(third)), o.varOf("calc", "third").?);
+    const scaled: f64 = third * 300.0;
+    try testing.expectEqual(@as(u64, @intFromFloat(@trunc(scaled))), o.varOf("calc", "scaled").?);
+    // float compares through FCMP's flags
+    try testing.expectEqual(@as(u64, 1), o.varOf("calc", "flag").?);
+}
+
 test "A2.5: store.joe — the substrate's shape, polyfilled by an ordinary actor" {
     // §7.5's proof obligation, discharged: the Put/Get/Del contract with
     // canonical struple keys, served entirely from joe — byte equality,
@@ -1476,6 +1500,7 @@ test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
         .{ .src = @embedFile("programs/hello.joe"), .actors = &.{"Greeter"} },
         .{ .src = @embedFile("programs/keys.joe"), .actors = &.{ "Asker", "Router" } },
         .{ .src = @embedFile("programs/store.joe"), .actors = &.{ "Store", "Client" } },
+        .{ .src = @embedFile("programs/vecmath.joe"), .actors = &.{"Calc"} },
     };
     for (corpus) |entry| {
         for (entry.actors) |name| {

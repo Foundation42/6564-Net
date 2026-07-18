@@ -139,14 +139,21 @@ const Type = enum {
     /// one length byte then the bytes, filling the envelope's remainder.
     /// v1: at most one per message, in last position.
     bytes_,
+    /// `f64` — Tier 0 scalar float; bits in a u64 slot (A1.4).
+    f64_,
+    /// `vec` — eight f64 lanes in a 64-byte near-page slab; expressions
+    /// evaluate through the Tier 1 V file, which never survives a park,
+    /// so `var` stays the only thing that does (A1.4).
+    vec_,
 
     fn size(self: Type) u16 {
         return switch (self) {
             .u8_ => 1,
             .u16_ => 2,
             .u32_ => 4,
-            .u64_, .addr, .addr_slice => 8,
+            .u64_, .addr, .addr_slice, .f64_ => 8,
             .bytes_ => 0, // laid out specially; never masked or packed
+            .vec_ => 64,
         };
     }
 
@@ -155,6 +162,7 @@ const Type = enum {
             .{ "u8", Type.u8_ },   .{ "u16", Type.u16_ },
             .{ "u32", Type.u32_ }, .{ "u64", Type.u64_ },
             .{ "addr", Type.addr }, .{ "bytes", Type.bytes_ },
+            .{ "f64", Type.f64_ },  .{ "vec", Type.vec_ },
         };
         inline for (pairs) |p| {
             if (std.mem.eql(u8, name, p[0])) return p[1];
@@ -176,7 +184,7 @@ const Message = struct {
     wire_size: u16 = 0, // padded to 8
 };
 
-const BinOp = enum { add, sub, band, bor, bxor, shl, shr, eq, ne, lt, le, gt, ge, land };
+const BinOp = enum { add, sub, mul, div, band, bor, bxor, shl, shr, eq, ne, lt, le, gt, ge, land };
 
 const Expr = union(enum) {
     int: u64,
@@ -187,6 +195,17 @@ const Expr = union(enum) {
     /// `key.count()` — walk a buf's elements with the total skip (A2.2);
     /// data-dependent by nature, so A1.3's rules apply in full.
     count: []const u8,
+    /// A float literal, as its f64 bits.
+    float: u64,
+    /// `[1.0, 2.0, …]` — a vector literal, eight f64 lanes (zero-padded).
+    vlit: []u64,
+    /// `v.reduce(+|max|min)` — the Tier 1 reduction, into a scalar f64.
+    reduce: struct { base: *Expr, op: enum { sum, max, min } },
+    /// `v.permute([3,2,1,0,…])` — constant lane shuffle; `mask` is the
+    /// A-format index byte per lane.
+    permute: struct { base: *Expr, mask: u64 },
+    /// `f64(e)` / `int(e)` — the explicit conversions (ITOF / FTOI).
+    cast: struct { to_f64: bool, e: *Expr },
 };
 
 /// One element of an `is` tuple pattern (A2.4): constants fuse into a
@@ -322,6 +341,8 @@ const Program = struct {
 const TokKind = enum {
     ident,
     int,
+    /// A float literal; `value` holds the f64 bits.
+    float,
     string,
     lbrace,
     rbrace,
@@ -346,6 +367,8 @@ const TokKind = enum {
     ge,
     plus,
     minus,
+    star,
+    slash,
     amp,
     pipe,
     caret,
@@ -415,6 +438,7 @@ const Lexer = struct {
             .{ '+', TokKind.plus },   .{ '-', TokKind.minus },
             .{ '&', TokKind.amp },    .{ '|', TokKind.pipe },
             .{ '^', TokKind.caret },  .{ '?', TokKind.question },
+            .{ '*', TokKind.star },   .{ '/', TokKind.slash },
         };
         inline for (ones) |o| {
             if (c == o[0]) {
@@ -460,6 +484,34 @@ const Lexer = struct {
                 self.pos += 1;
             }
             if (!any) return Error.Syntax;
+            // A decimal literal may continue as a float: `1.5`, `2.5e-3`.
+            // `1..8` stays a range (the second dot disqualifies), and hex
+            // never grows a point.
+            if (base == 10) {
+                const s = self.src;
+                var p = self.pos;
+                var is_float = false;
+                if (p + 1 < s.len and s[p] == '.' and std.ascii.isDigit(s[p + 1])) {
+                    is_float = true;
+                    p += 1;
+                    while (p < s.len and std.ascii.isDigit(s[p])) p += 1;
+                }
+                if (p < s.len and (s[p] == 'e' or s[p] == 'E')) {
+                    var q = p + 1;
+                    if (q < s.len and (s[q] == '+' or s[q] == '-')) q += 1;
+                    if (q < s.len and std.ascii.isDigit(s[q])) {
+                        is_float = true;
+                        p = q;
+                        while (p < s.len and std.ascii.isDigit(s[p])) p += 1;
+                    }
+                }
+                if (is_float) {
+                    self.pos = p;
+                    const text = self.src[start..self.pos];
+                    const f = std.fmt.parseFloat(f64, text) catch return Error.Syntax;
+                    return .{ .kind = .float, .value = @bitCast(f), .text = text, .line = line };
+                }
+            }
             return .{ .kind = .int, .value = v, .text = self.src[start..self.pos], .line = line };
         }
         if (std.ascii.isAlphabetic(c) or c == '_') {
@@ -612,6 +664,8 @@ const Parser = struct {
             const ty = try self.parseType();
             if (ty == .addr_slice)
                 return self.fail("a message cannot carry a slice", Error.Semantics);
+            if (ty == .vec_)
+                return self.fail("a vec doesn't ride a message (v1) — send scalars or bytes", Error.Semantics);
             try fields.append(.{ .name = fname.text, .ty = ty });
             if (self.tok.kind == .comma) try self.advance();
         }
@@ -628,6 +682,8 @@ const Parser = struct {
             const ty = try self.parseType();
             if (ty == .bytes_)
                 return self.fail("bytes live in messages and bufs, not params (v1)", Error.Semantics);
+            if (ty == .vec_)
+                return self.fail("a vec is actor-local (v1) — params carry scalars", Error.Semantics);
             try params.append(.{ .name = pname.text, .ty = ty });
             if (self.tok.kind == .comma) try self.advance();
         }
@@ -1088,9 +1144,19 @@ const Parser = struct {
     }
 
     fn parseAdd(self: *Parser) Error!*Expr {
-        var l = try self.parsePrimary();
+        var l = try self.parseMul();
         while (self.tok.kind == .plus or self.tok.kind == .minus) {
             const op: BinOp = if (self.tok.kind == .plus) .add else .sub;
+            try self.advance();
+            l = try self.mkExpr(.{ .bin = .{ .op = op, .l = l, .r = try self.parseMul() } });
+        }
+        return l;
+    }
+
+    fn parseMul(self: *Parser) Error!*Expr {
+        var l = try self.parsePrimary();
+        while (self.tok.kind == .star or self.tok.kind == .slash) {
+            const op: BinOp = if (self.tok.kind == .star) .mul else .div;
             try self.advance();
             l = try self.mkExpr(.{ .bin = .{ .op = op, .l = l, .r = try self.parsePrimary() } });
         }
@@ -1104,6 +1170,30 @@ const Parser = struct {
                 try self.advance();
                 return self.mkExpr(.{ .int = v });
             },
+            .float => {
+                const v = self.tok.value;
+                try self.advance();
+                return self.mkExpr(.{ .float = v });
+            },
+            .lbracket => {
+                // `[1.0, 2.0, …]` — eight f64 lanes, zero-padded.
+                try self.advance();
+                var lanes = std.ArrayList(u64).init(self.arena);
+                while (self.tok.kind != .rbracket) {
+                    switch (self.tok.kind) {
+                        .float => try lanes.append(self.tok.value),
+                        .int => try lanes.append(@bitCast(@as(f64, @floatFromInt(self.tok.value)))),
+                        else => return self.fail("vector lanes are number literals (v1)", Error.Syntax),
+                    }
+                    try self.advance();
+                    if (self.tok.kind == .comma) try self.advance();
+                }
+                try self.advance(); // ]
+                if (lanes.items.len == 0 or lanes.items.len > 8)
+                    return self.fail("a vector holds 1..8 lanes", Error.Semantics);
+                while (lanes.items.len < 8) try lanes.append(@bitCast(@as(f64, 0.0)));
+                return self.mkExpr(.{ .vlit = try lanes.toOwnedSlice() });
+            },
             .lparen => {
                 try self.advance();
                 const e = try self.parseExpr();
@@ -1113,17 +1203,70 @@ const Parser = struct {
             .ident => {
                 const name = self.tok.text;
                 try self.advance();
+                if (self.tok.kind == .lparen) {
+                    // `f64(e)` / `int(e)` — the explicit conversions
+                    if (std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "int")) {
+                        try self.advance();
+                        const e = try self.parseExpr();
+                        _ = try self.expect(.rparen, ")");
+                        return self.mkExpr(.{ .cast = .{ .to_f64 = name[0] == 'f', .e = e } });
+                    }
+                    return self.fail("only `f64(…)` and `int(…)` call like functions (v1)", Error.Unsupported);
+                }
                 if (self.tok.kind == .dot) {
                     try self.advance();
                     const f = try self.expect(.ident, "field name");
                     if (self.tok.kind == .lparen) {
-                        // method call — v1 speaks `.count()` only; the
-                        // rest of view navigation rides with the store.
                         try self.advance();
-                        _ = try self.expect(.rparen, ")");
-                        if (!std.mem.eql(u8, f.text, "count"))
-                            return self.fail("view navigation beyond `.count()` rides with the store phase", Error.Unsupported);
-                        return self.mkExpr(.{ .count = name });
+                        if (std.mem.eql(u8, f.text, "count")) {
+                            _ = try self.expect(.rparen, ")");
+                            return self.mkExpr(.{ .count = name });
+                        }
+                        if (std.mem.eql(u8, f.text, "reduce")) {
+                            // `.reduce(+ | max | min)`
+                            const op: @FieldType(@FieldType(Expr, "reduce"), "op") = blk: {
+                                if (self.tok.kind == .plus) {
+                                    try self.advance();
+                                    break :blk .sum;
+                                }
+                                if (self.isKw("max")) {
+                                    try self.advance();
+                                    break :blk .max;
+                                }
+                                if (self.isKw("min")) {
+                                    try self.advance();
+                                    break :blk .min;
+                                }
+                                return self.fail("reduce takes `+`, `max` or `min` (v1)", Error.Unsupported);
+                            };
+                            _ = try self.expect(.rparen, ")");
+                            return self.mkExpr(.{ .reduce = .{
+                                .base = try self.mkExpr(.{ .ident = name }),
+                                .op = op,
+                            } });
+                        }
+                        if (std.mem.eql(u8, f.text, "permute")) {
+                            _ = try self.expect(.lbracket, "[");
+                            var mask: u64 = 0;
+                            var i: u6 = 0;
+                            while (self.tok.kind != .rbracket) {
+                                const n = try self.expect(.int, "a lane index");
+                                if (n.value > 7 or i >= 8)
+                                    return self.fail("permute takes up to 8 lane indices 0..7", Error.Semantics);
+                                mask |= n.value << (i * 8);
+                                i += 1;
+                                if (self.tok.kind == .comma) try self.advance();
+                            }
+                            try self.advance(); // ]
+                            // unnamed lanes keep their place
+                            while (i < 8) : (i += 1) mask |= @as(u64, i) << (i * 8);
+                            _ = try self.expect(.rparen, ")");
+                            return self.mkExpr(.{ .permute = .{
+                                .base = try self.mkExpr(.{ .ident = name }),
+                                .mask = mask,
+                            } });
+                        }
+                        return self.fail("v1 methods: `.count()`, `.reduce(op)`, `.permute([…])`", Error.Unsupported);
                     }
                     return self.mkExpr(.{ .field = .{ .base = name, .name = f.text } });
                 }
@@ -1171,17 +1314,28 @@ fn operandMode(op: []const u8) ?isa.Mode {
 }
 
 fn cycFor(mn: isa.Mnemonic, mode: ?isa.Mode) u64 {
+    // Both pages: the accountant bills from the same tables the machine
+    // does, base and extended alike.
     if (mode) |md| {
         for (isa.table) |enc| {
+            if (enc.mnemonic == mn and enc.mode == md) return enc.cycles;
+        }
+        for (isa.xtable) |enc| {
             if (enc.mnemonic == mn and enc.mode == md) return enc.cycles;
         }
     } else {
         for (isa.table) |enc| {
             if (enc.mnemonic == mn and (enc.mode == .impl or enc.mode == .acc)) return enc.cycles;
         }
+        for (isa.xtable) |enc| {
+            if (enc.mnemonic == mn and (enc.mode == .impl or enc.mode == .acc)) return enc.cycles;
+        }
     }
     var worst: u64 = 0;
     for (isa.table) |enc| {
+        if (enc.mnemonic == mn) worst = @max(worst, enc.cycles);
+    }
+    for (isa.xtable) |enc| {
         if (enc.mnemonic == mn) worst = @max(worst, enc.cycles);
     }
     return worst;
@@ -1299,6 +1453,8 @@ const Gen = struct {
     /// off_masks + 8k, staged at init when the actor has any bufs — the
     /// ISA has no variable shifts, so the mask is a table lookup.
     off_masks: u16 = 0,
+    /// Staging slab for vector literals in expression position.
+    off_vlit: u16 = 0,
     /// First free near slot after the fixed layout — loop variables and
     /// bindings are handed out from here.
     next_slot: u16 = 0,
@@ -1309,6 +1465,10 @@ const Gen = struct {
     /// 8 bytes of slack past capacity so unaligned word stores of partial
     /// appends land in owned ground.
     bufs: std.StringHashMap(BufInfo),
+    /// `vec` variables (A1.4): 64-byte near-page slabs. Expressions pass
+    /// through the V file; every statement loads and stores, so nothing
+    /// wide ever needs to survive a park — the convention by construction.
+    vecs: std.StringHashMap(u16),
     /// Spawn records live after the internals: 48 bytes each —
     /// {ctx, entry, sp, arg} (the SPWN block, loader-staged), +32 the
     /// child's timer-SQE address (for disarm-on-death), +40 the restart
@@ -1380,7 +1540,7 @@ const Gen = struct {
             off += 8;
         }
         for (self.actor.vars) |v| {
-            if (v.array > 0 or v.buf_cap > 0) continue; // arrays and bufs get their own homes
+            if (v.array > 0 or v.buf_cap > 0 or v.ty == .vec_) continue; // wide things get their own homes
             try self.slots.put(v.name, off);
             off += 8;
         }
@@ -1397,7 +1557,8 @@ const Gen = struct {
         self.off_self = off + 80;
         self.off_tmp = off + 88; // 4 slots
         self.off_masks = off + 120; // 8 slots (index k*8, k = 1..7)
-        self.spawn_base = off + 184;
+        self.off_vlit = off + 184; // 64 B
+        self.spawn_base = off + 248;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
@@ -1441,6 +1602,13 @@ const Gen = struct {
             aoff += 8 + std.mem.alignForward(u16, v.buf_cap + 8, 8);
             if (@as(u32, aoff) + 8 > isa.mactab_base)
                 return self.fail(0, "near page exhausted (buffers)", Error.Semantics);
+        }
+        for (self.actor.vars) |v| {
+            if (v.ty != .vec_) continue;
+            try self.vecs.put(v.name, aoff);
+            aoff += 64;
+            if (@as(u32, aoff) + 8 > isa.mactab_base)
+                return self.fail(0, "near page exhausted (vectors)", Error.Semantics);
         }
         self.next_slot = aoff;
         if (abi.array_off + area > abi.block_size - abi.data_off - 0x400)
@@ -1523,7 +1691,180 @@ const Gen = struct {
     /// scalar near-page slot — so binary ops and compares skip the
     /// evaluate-spill-reload dance entirely (item 4: registers are free
     /// within a burst; the near page is for state that crosses parks).
-    const Operand = union(enum) { imm: u64, slot: u16 };
+    /// `imm64` is a value that must never take the sign-extending imm8
+    /// form — f64 bits, chiefly.
+    const Operand = union(enum) { imm: u64, imm64: u64, slot: u16 };
+
+    /// The static type of an expression (A1.4's minimal discipline: f64
+    /// and vec never mix with integers silently).
+    fn exprType(self: *Gen, e: *const Expr) Type {
+        switch (e.*) {
+            .int => return .u64_,
+            .float => return .f64_,
+            .vlit, .permute => return .vec_,
+            .reduce => return .f64_,
+            .cast => |c| return if (c.to_f64) .f64_ else .u64_,
+            .count, .index => return .u64_,
+            .ident => |name| {
+                if (self.vecs.contains(name)) return .vec_;
+                for (self.actor.params) |p| {
+                    if (std.mem.eql(u8, p.name, name)) return p.ty;
+                }
+                for (self.actor.vars) |v| {
+                    if (std.mem.eql(u8, v.name, name)) return v.ty;
+                }
+                return .u64_; // loop vars, pattern binds, internals
+            },
+            .field => |fx| {
+                if (self.bind != null and std.mem.eql(u8, self.bind.?, fx.base)) {
+                    if (self.bind_msg) |m| {
+                        for (m.fields) |*fl| {
+                            if (std.mem.eql(u8, fl.name, fx.name)) return fl.ty;
+                        }
+                    }
+                }
+                return .u64_;
+            },
+            .bin => |b| {
+                const lt = self.exprType(b.l);
+                const rt = self.exprType(b.r);
+                if (lt == .vec_ or rt == .vec_) return .vec_;
+                if (lt == .f64_ or rt == .f64_) return .f64_;
+                return .u64_;
+            },
+        }
+    }
+
+    /// Evaluate a scalar in float context: an int literal promotes to its
+    /// f64 value at compile time; everything else must already be f64.
+    fn evalFloatScalar(self: *Gen, e: *const Expr) Error!void {
+        if (e.* == .int) {
+            try self.w("        LDA ##${X}", .{@as(u64, @bitCast(@as(f64, @floatFromInt(e.int))))});
+            return;
+        }
+        if (self.exprType(e) != .f64_)
+            return self.fail(0, "mixing integers and floats wants an explicit f64()/int()", Error.Semantics);
+        try self.evalInto(e);
+    }
+
+    fn simpleOperandF(self: *Gen, e: *const Expr) ?Operand {
+        switch (e.*) {
+            .float => |b| return .{ .imm64 = b },
+            .int => |v| return .{ .imm64 = @bitCast(@as(f64, @floatFromInt(v))) },
+            .ident => |name| {
+                if (self.exprType(e) != .f64_) return null;
+                if (self.slots.get(name)) |s| return .{ .slot = s };
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Float binary arithmetic: A ⟵ A op M through the Tier 0 ops — no
+    /// carry discipline, no masks, IEEE the whole way.
+    fn floatBin(self: *Gen, b: anytype) Error!void {
+        const mn: []const u8 = switch (b.op) {
+            .add => "FADD",
+            .sub => "FSUB",
+            .mul => "FMUL",
+            .div => "FDIV",
+            else => return self.fail(0, "float ops are + - * / (v1)", Error.Semantics),
+        };
+        if (self.simpleOperandF(b.r)) |opr| {
+            try self.evalFloatScalar(b.l);
+            try self.opSimpleRt(mn, opr);
+            return;
+        }
+        const tmp = try self.pushTmp();
+        try self.evalFloatScalar(b.r);
+        try self.w("        STA ${X}", .{tmp});
+        try self.evalFloatScalar(b.l);
+        try self.w("        {s} ${X}", .{ mn, tmp });
+        self.popTmp();
+    }
+
+    fn opSimpleRt(self: *Gen, mn: []const u8, opr: Operand) Error!void {
+        switch (opr) {
+            .imm => |v| try self.w("        {s} {s}", .{ mn, try self.imm(v) }),
+            .imm64 => |v| try self.w("        {s} ##${X}", .{ mn, v }),
+            .slot => |s| try self.w("        {s} ${X}", .{ mn, s }),
+        }
+    }
+
+    /// Evaluate a vector expression into V[d] (A1.4). Every leaf loads
+    /// from the near page and every statement stores back — the V file
+    /// is burst scratch by construction, exactly as volatile as A.
+    fn vecEvalInto(self: *Gen, e: *const Expr, d: u8) Error!void {
+        if (d > 6)
+            return self.fail(0, "vector expression too deep (v1)", Error.Unsupported);
+        switch (e.*) {
+            .ident => |name| {
+                const slab = self.vecs.get(name) orelse
+                    return self.fail(0, "not a vec variable", Error.Semantics);
+                try self.w("        LDX {s}", .{try self.imm(slab)});
+                try self.w("        VLD {d}", .{d});
+            },
+            .vlit => |lanes| {
+                for (lanes, 0..) |bits, i| {
+                    try self.w("        LDA ##${X}", .{bits});
+                    try self.w("        STA ${X}", .{self.off_vlit + i * 8});
+                }
+                try self.w("        LDX {s}", .{try self.imm(self.off_vlit)});
+                try self.w("        VLD {d}", .{d});
+            },
+            .permute => |p| {
+                try self.vecEvalInto(p.base, d);
+                try self.w("        LDA ##${X}", .{p.mask});
+                try self.w("        VPERM {d}, {d}", .{ d, d });
+            },
+            .bin => |b| {
+                const mn: []const u8 = switch (b.op) {
+                    .add => "VFADD",
+                    .sub => "VFSUB",
+                    .mul => "VFMUL",
+                    .div => "VFDIV",
+                    else => return self.fail(0, "vec ops are + - * / (v1; masks ride with their first workload)", Error.Unsupported),
+                };
+                const lt = self.exprType(b.l);
+                const rt = self.exprType(b.r);
+                if (lt == .vec_ and rt == .vec_) {
+                    try self.vecEvalInto(b.l, d);
+                    try self.vecEvalInto(b.r, d + 1);
+                } else if (lt == .vec_) {
+                    try self.vecEvalInto(b.l, d);
+                    try self.evalFloatScalar(b.r);
+                    try self.w("        VBCA {d}", .{d + 1});
+                } else {
+                    try self.evalFloatScalar(b.l);
+                    try self.w("        VBCA {d}", .{d});
+                    try self.vecEvalInto(b.r, d + 1);
+                }
+                try self.w("        {s} {d}, {d}", .{ mn, d, d + 1 });
+            },
+            else => return self.fail(0, "not a vector expression", Error.Semantics),
+        }
+    }
+
+    /// Store a vector expression into a slab — a literal writes straight
+    /// through, anything else rides V0.
+    fn storeVec(self: *Gen, slab: u16, e: *const Expr) Error!void {
+        if (e.* == .vlit) {
+            for (e.vlit, 0..) |bits, i| {
+                try self.w("        LDA ##${X}", .{bits});
+                try self.w("        STA ${X}", .{slab + i * 8});
+            }
+            return;
+        }
+        if (self.exprType(e) != .vec_) {
+            // `v = 2.0` — a scalar broadcast assignment
+            try self.evalFloatScalar(e);
+            try self.w("        VBCA 0", .{});
+        } else {
+            try self.vecEvalInto(e, 0);
+        }
+        try self.w("        LDX {s}", .{try self.imm(slab)});
+        try self.w("        VST 0", .{});
+    }
 
     fn simpleOperand(self: *Gen, e: *const Expr) ?Operand {
         switch (e.*) {
@@ -1544,6 +1885,7 @@ const Gen = struct {
     fn opSimple(self: *Gen, comptime mnem: []const u8, opr: Operand) Error!void {
         switch (opr) {
             .imm => |v| try self.w("        " ++ mnem ++ " {s}", .{try self.imm(v)}),
+            .imm64 => |v| try self.w("        " ++ mnem ++ " ##${X}", .{v}),
             .slot => |s| try self.w("        " ++ mnem ++ " ${X}", .{s}),
         }
     }
@@ -1598,6 +1940,27 @@ const Gen = struct {
                 // element counts are data — A1.3's rules apply in full
                 self.cost_dyn = true;
             },
+            .float => |bits| try self.w("        LDA ##${X}", .{bits}),
+            .cast => |c| {
+                if (c.to_f64) {
+                    if (self.exprType(c.e) == .f64_)
+                        return self.fail(0, "f64() of a float is already one", Error.Semantics);
+                    try self.evalInto(c.e);
+                    try self.w("        ITOF", .{});
+                } else {
+                    try self.evalFloatScalar(c.e);
+                    try self.w("        FTOI", .{});
+                }
+            },
+            .reduce => |r| {
+                try self.vecEvalInto(r.base, 0);
+                try self.w("        {s} 0", .{switch (r.op) {
+                    .sum => @as([]const u8, "VRADD"),
+                    .max => "VRMAX",
+                    .min => "VRMIN",
+                }});
+            },
+            .vlit, .permute => return self.fail(0, "a vector value needs a vec home", Error.Semantics),
             .field => |f| {
                 if (self.exit_bind != null and std.mem.eql(u8, self.exit_bind.?, f.base)) {
                     // w.id = the dead worker's context id; w.life = the
@@ -1643,6 +2006,13 @@ const Gen = struct {
                         "comparisons live in `if`/`where`, not in values (v1)",
                         Error.Unsupported,
                     ),
+                    .mul, .div => {
+                        if (self.exprType(e) == .vec_)
+                            return self.fail(0, "a vector value needs a vec home", Error.Semantics);
+                        if (self.exprType(e) != .f64_)
+                            return self.fail(0, "no integer × or ÷ in the machine — shift-add, or take it to f64", Error.Unsupported);
+                        try self.floatBin(b);
+                    },
                     .shl, .shr => {
                         // Counted shifts want a constant count.
                         if (b.r.* != .int)
@@ -1652,6 +2022,15 @@ const Gen = struct {
                         try self.w("        {s} #{d}", .{ mn, b.r.int });
                     },
                     .add, .sub, .band, .bor, .bxor => {
+                        const t = self.exprType(e);
+                        if (t == .vec_)
+                            return self.fail(0, "a vector value needs a vec home", Error.Semantics);
+                        if (t == .f64_) {
+                            if (b.op != .add and b.op != .sub)
+                                return self.fail(0, "bitwise ops are integer ops", Error.Semantics);
+                            try self.floatBin(b);
+                            return;
+                        }
                         if (self.simpleOperand(b.r)) |opr| {
                             // A = l, then one direct-operand instruction.
                             try self.evalInto(b.l);
@@ -1876,6 +2255,45 @@ const Gen = struct {
             .eq, .ne, .lt, .le, .gt, .ge => {},
             else => return self.fail(0, "a condition must compare something (v1)", Error.Unsupported),
         }
+        // Float comparisons ride FCMP's conventions: Z eq, N lt, C ge;
+        // unordered raises V alone, so every comparison with NaN is
+        // false — except `!=`, which IEEE makes true (Z stays clear).
+        if (self.exprType(b.l) == .f64_ or self.exprType(b.r) == .f64_) {
+            switch (b.op) {
+                .eq, .ne, .lt, .le, .gt, .ge => {},
+                else => return self.fail(0, "a float condition compares (v1)", Error.Unsupported),
+            }
+            if (self.simpleOperandF(b.r)) |opr| {
+                try self.evalFloatScalar(b.l);
+                try self.opSimpleRt("FCMP", opr);
+            } else {
+                const tmp = try self.pushTmp();
+                try self.evalFloatScalar(b.r);
+                try self.w("        STA ${X}", .{tmp});
+                try self.evalFloatScalar(b.l);
+                try self.w("        FCMP ${X}", .{tmp});
+                self.popTmp();
+            }
+            switch (b.op) {
+                .eq => try self.w("        BNE L{d}", .{target}),
+                .ne => try self.w("        BEQ L{d}", .{target}),
+                .lt => try self.w("        BPL L{d}", .{target}),
+                .ge => try self.w("        BCC L{d}", .{target}),
+                .gt => {
+                    try self.w("        BCC L{d}", .{target});
+                    try self.w("        BEQ L{d}", .{target});
+                },
+                .le => {
+                    const ok = self.label();
+                    try self.w("        BEQ L{d}", .{ok});
+                    try self.w("        BMI L{d}", .{ok});
+                    try self.w("        BRA L{d}", .{target});
+                    try self.w("L{d}:", .{ok});
+                },
+                else => unreachable,
+            }
+            return;
+        }
         // A = left, M = right; CMP sets flags from A − M (unsigned).
         if (b.r.* == .int and b.r.int == 0 and (b.op == .eq or b.op == .ne)) {
             // `x == 0` / `x != 0`: every evaluation ends in an instruction
@@ -1945,8 +2363,45 @@ const Gen = struct {
                     self.popTmp();
                     return;
                 }
+                if (self.vecs.get(a.name)) |slab| {
+                    if (a.op != .set)
+                        return self.fail(0, "vec assignment is `=` (v1)", Error.Unsupported);
+                    try self.storeVec(slab, a.expr);
+                    return;
+                }
                 const slot = self.slots.get(a.name) orelse
                     return self.fail(0, "unknown variable", Error.Semantics);
+                const ident_e = Expr{ .ident = a.name };
+                const is_f = self.exprType(&ident_e) == .f64_;
+                if (!is_f and self.exprType(a.expr) == .f64_)
+                    return self.fail(0, "a float into an integer wants int()", Error.Semantics);
+                if (is_f) {
+                    switch (a.op) {
+                        .set => {
+                            try self.evalFloatScalar(a.expr);
+                            try self.w("        STA ${X}", .{slot});
+                        },
+                        .add, .sub => {
+                            const mn: []const u8 = if (a.op == .add) "FADD" else "FSUB";
+                            if (self.simpleOperandF(a.expr)) |opr| {
+                                try self.w("        LDA ${X}", .{slot});
+                                try self.opSimpleRt(mn, opr);
+                            } else if (a.op == .add) {
+                                try self.evalFloatScalar(a.expr);
+                                try self.w("        FADD ${X}", .{slot});
+                            } else {
+                                const tmp = try self.pushTmp();
+                                try self.evalFloatScalar(a.expr);
+                                try self.w("        STA ${X}", .{tmp});
+                                try self.w("        LDA ${X}", .{slot});
+                                try self.w("        FSUB ${X}", .{tmp});
+                                self.popTmp();
+                            }
+                            try self.w("        STA ${X}", .{slot});
+                        },
+                    }
+                    return;
+                }
                 switch (a.op) {
                     .set => {
                         try self.evalInto(a.expr);
@@ -2909,6 +3364,10 @@ const Gen = struct {
         // var initializers
         for (self.actor.vars) |v| {
             if (v.init) |e| {
+                if (v.ty == .vec_) {
+                    try self.storeVec(self.vecs.get(v.name).?, e);
+                    continue;
+                }
                 try self.evalInto(e);
                 try self.w("        STA ${X}", .{self.slots.get(v.name).?});
             }
@@ -3665,6 +4124,7 @@ pub fn compile(
         .strings = .init(arena),
         .arrays = .init(arena),
         .bufs = .init(arena),
+        .vecs = .init(arena),
         .bursts = .init(arena),
         .brecs = .init(arena),
     };
@@ -3688,7 +4148,7 @@ pub fn compile(
         });
     }
     for (actor.vars) |v| {
-        if (v.array > 0 or v.buf_cap > 0) continue; // arrays and bufs aren't scalar readbacks
+        if (v.array > 0 or v.buf_cap > 0 or v.ty == .vec_) continue; // wide things aren't scalar readbacks
         try vars.append(.{ .name = try alloc.dupe(u8, v.name), .off = gen.slots.get(v.name).? });
     }
     var bufs_out = std.ArrayList(BufOut).init(alloc);

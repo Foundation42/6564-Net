@@ -943,3 +943,42 @@ first — it rides next, with the same lowering discipline.
 
 116 tests. Null-cost holds by construction: nothing that doesn't
 speak `$42 $?7` moved a cycle; frozen table intact; ring still 55.
+
+## A1.4: the vector package lands in joe (2026-07-18)
+
+SIMD is a data type with operators, not a loop — and now joe says so.
+The prerequisite was f64 entering the type grammar: float literals
+(with e-notation), `f64` vars/params/message fields, `+ - * /` through
+the Tier 0 ops, comparisons through FCMP's flag conventions (every
+NaN comparison false except `!=`, exactly IEEE), and the explicit
+conversions `f64(e)`/`int(e)` (ITOF/FTOI — no silent coercion, though
+integer LITERALS promote in float context, so `v * 2` means what it
+says). Integer × and ÷ remain honestly absent: the machine has no MUL,
+and joe won't pretend ("shift-add, or take it to f64").
+
+**`vec` is eight f64 lanes in a 64-byte near-page slab.** Expressions
+ride the V file and every statement stores back — so the Tier 1
+volatility convention holds *by construction*: there is no syntax that
+keeps wide state live across a park. Element-wise `+ - * /` with
+scalar broadcast on either side, `.reduce(+ | max | min)` through the
+spec-fixed tree, `.permute([…])` with constant indices folded into
+the A-format mask at compile time. Deferred with reasons attached:
+compare→mask rides with VSEL and its first workload; `map` waits for
+functions to exist; gather/scatter are region-typed (item 6).
+
+`vecmath.joe`: 659 bytes, 462 cycles, and every result bit-exact
+against a host mirror — the tree sum of `v*2+1` over lanes 1..8
+(80.0), max 17, min 3, a permute-broadcast proven through its sum,
+1/3 to the bit, and one lovely footnote: `int((1.0/3.0) * 300.0)` is
+**100**, not 99 — the product rounds to exactly 100.0 under RNE
+before FTOI ever sees it, and the machine and the mirror agree on
+that bit for bit. Determinism includes the surprises.
+
+Also fixed in passing: the A1.3 cost accountant now bills from BOTH
+opcode pages — FP and vector instructions were invisible to the
+bound checker before this (joe had never emitted them; now it does,
+and a watchdogged actor's float handlers are charged honestly).
+
+117 tests. The A1.4 grammar is complete except where the machine
+itself isn't yet (masks, map, gather) — each deferral named, none
+silent.

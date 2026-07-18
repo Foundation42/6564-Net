@@ -1,0 +1,40 @@
+// vecmath.joe — Amendment 1's vector package (A1.4), in the flesh.
+//
+// SIMD is a data type with operators, not a loop: eight f64 lanes in a
+// `vec`, element-wise arithmetic with scalar broadcast, reductions
+// through the spec-fixed pairwise tree, constant permutes. A `vec`
+// variable is a 64-byte near-page slab; every statement rides the V
+// file and stores back, so nothing wide ever needs to survive a park —
+// the volatility convention holds by construction, not by care.
+//
+// The programmer writes math; the lanes are the hardware's business.
+
+actor Calc() {
+    var v vec = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    var w vec
+    var sum f64 = 0.0
+    var top f64 = 0.0
+    var low f64 = 0.0
+    var picked f64 = 0.0
+    var third f64 = 0.0
+    var scaled u64 = 0
+    var flag u64 = 0
+
+    w = v * 2.0 + 1.0
+    sum = w.reduce(+)
+    top = w.reduce(max)
+    low = w.reduce(min)
+
+    w = v.permute([0, 0, 0, 0, 0, 0, 0, 0])
+    picked = w.reduce(+)
+
+    third = 1.0 / 3.0
+    scaled = int(third * 300.0)
+
+    if sum > 79.5 { flag = 1 }
+    if low < 0.0 { flag = 5 }
+}
+
+system {
+    calc = Calc()
+}
