@@ -1116,3 +1116,43 @@ for v2.6's table, noted and not smuggled.
 
 123 tests. The §7 order of work is now COMPLETE through item 7;
 item 8 — the v2.6 draft — is all that remains, and its basket is full.
+
+## Item 8: the v2.6 draft — transcription, not design (2026-07-18)
+
+The capstone, and Christian named its character before it was written:
+the basket held no guesses, so the spec draft was the transcription of
+evidence. `docs/6564-net-architecture-v2.6.md` (v2.5 archived):
+
+- §2.2 rewritten around the collapse — "41 bytes, and none of it is
+  saved"; context = near page + run-queue entry + control block; the
+  clobber set enumerated; ring 60 hand / 55.26 compiled; scorch as
+  the mechanical proof obligation.
+- §3.3 the control block (write-protected: an actor must not edit its
+  own leash); §3.4 the shared, park-volatile V file.
+- §5.2 contended LSTN normative, with its rationale and its zero-price
+  claim; §5.4 gains WDEX with the dispatch-clock semantics and the
+  checked-`bounded` language note.
+- §6.2 widened to registered regions: descriptor-table-as-region-table,
+  grant-on-submit, completion-as-fence, revoke-by-one-store with
+  late-DMA reject, remote pulls legitimized, the $6772 convention,
+  saturation-is-backpressure.
+- §7.4 gains the matmul row; §7.5 gains the numeric addendum (the
+  `deterministic` flag, set/clear semantics); new §7.6 accelerator
+  actors.
+- §8.1 the extended page ($42, non-stacking) + both FP tiers with
+  reduction-order-in-the-contract; §8.2 MAC adopted as optional with
+  its −31.4%/+3.0% numbers; WDEX joins the §8 table; SPWN's row
+  reflects that there are no registers left to reset.
+- §10 gains the joe campaign summary; §11 gains five new questions
+  (capability transfer as three-costumes-one-mechanism, exactly-once
+  framing, shared code pages, the unwatchdogged-burst ceiling, vector
+  width) — every deferral this campaign filed, none smuggled.
+- The closing line no longer promises: "Nothing in this revision was
+  designed at the desk. It was all transcribed from the machine."
+
+123 tests; every measured number in the draft has a guard in the
+suite. THE POST-v2.5 HANDOFF IS COMPLETE — all eight items. The
+frontier beyond the spec: store hardware behind store.joe's proven
+contract, rocci-bird's device row (display/pad/APU, PresentDone as
+the frame clock), sized bytes fields, buf arrays, VSEL-and-masks,
+and D1's key-as-location — each waiting on the table, honestly.
