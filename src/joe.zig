@@ -329,6 +329,10 @@ const Stmt = union(enum) {
     /// `pack key, ("users", id, "profile")` — encode a struple tuple into
     /// a declared buffer (A2.3). Canonical only; capacity checked.
     pack: struct { buf: []const u8, elems: []PackElem, line: usize },
+    /// `grant frame to boss` (A4 movement 3) — hand a region capability
+    /// to another actor. Probate, not bequest: the grantee an actor
+    /// names is its supervisor, which the exit link already legitimizes.
+    grant_: struct { region: []const u8, to: []const u8, line: usize },
     /// `copy dst, src` — bytes into a buf from another buf or from the
     /// bound message's bytes field. The store's Put, among others.
     copy_: struct { dst: []const u8, src: *Expr, line: usize },
@@ -1252,7 +1256,14 @@ const Parser = struct {
             try self.advance();
             return .{ .let_ = .{ .name = bname.text, .expr = try self.parseExpr(), .line = line } };
         }
-        inline for (.{ "chain", "region", "grant", "log" }) |kw| {
+        if (try self.eatKw("grant")) {
+            const rname = try self.expect(.ident, "a region name");
+            if (!try self.eatKw("to"))
+                return self.fail("a grant names its grantee: `grant frame to boss`", Error.Syntax);
+            const to = try self.expect(.ident, "the grantee");
+            return .{ .grant_ = .{ .region = rname.text, .to = to.text, .line = line } };
+        }
+        inline for (.{ "chain", "region", "log" }) |kw| {
             if (self.isKw(kw))
                 return self.fail("`" ++ kw ++ "` is not in v1 yet", Error.Unsupported);
         }
@@ -1742,6 +1753,11 @@ const Gen = struct {
     /// `send self` ships through this slot: a capability to the actor's
     /// own RX ring, loader-staged (Amendment 1's self-send loop).
     off_self: u16 = 0,
+    /// A4 movement 3: the window of this actor's supervisor — staged
+    /// for spawned children, because the exit link already establishes
+    /// that relationship and probate needs no other grantee.
+    off_boss: u16 = 0,
+    uses_boss: bool = false,
     /// Expression temporaries (item 4): a static near-page stack, depth
     /// known at compile time. Compiled code never touches SP after init —
     /// under the collapsed-register convention even the stack pointer is
@@ -1912,6 +1928,7 @@ const Gen = struct {
         self.off_tarmed = off + 64;
         self.off_elem = off + 72;
         self.off_self = off + 80;
+        self.off_boss = off + 96; // A4 m3: the executor's window (a child's supervisor)
         self.off_tmp = off + 88; // 4 slots
         self.off_masks = off + 120; // 8 slots (index k*8, k = 1..7)
         self.off_vlit = off + 184; // 64 B
@@ -3117,6 +3134,33 @@ const Gen = struct {
                 const slot = try self.getOrAddSlot(l.name);
                 try self.w("        STA ${X}", .{slot});
                 try self.lets.put(l.name, ty == .f64_);
+            },
+            .grant_ => |g| {
+                // A4 movement 3: the estate, handed to the executor.
+                const rp = self.regions.getPtr(g.region) orelse
+                    return self.fail(g.line, "`grant` hands on a `region` variable", Error.Semantics);
+                if (rp.locked)
+                    return self.fail(g.line, "this region is granted out to silicon here (§6.2)", Error.Semantics);
+                const tslot: u16 = if (std.mem.eql(u8, g.to, "boss")) blk: {
+                    self.uses_boss = true;
+                    break :blk self.off_boss;
+                } else self.slots.get(g.to) orelse
+                    return self.fail(g.line, "unknown grantee", Error.Semantics);
+                try self.w("; grant {s} to {s}: the capability moves, the memory stays", .{ g.region, g.to });
+                try self.w("        LDA #4              ; SQE: op = grant", .{});
+                try self.w("        STA !${X}", .{self.layout.sqBase()});
+                try self.w("        LDA ${X}", .{tslot});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
+                try self.w("        LDA {s}", .{try self.imm(rp.slot)});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 16});
+                // verbs the heir receives: read|write, never `grant` —
+                // v1 lends one level deep, per A4.4's decision.
+                try self.w("        LDA ##${X}", .{@as(u64, 1) << 32 | 0x3});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 24});
+                try self.w("        SEND 0", .{});
+                // The region is no longer ours: the compiler's copy of
+                // the surrender the RBC just performed.
+                rp.locked = true;
             },
             .clear_ => |c| {
                 const bi = self.bufs.get(c.buf) orelse
@@ -5151,6 +5195,9 @@ pub const Result = struct {
     /// Set when the actor says `send self` (Amendment 1): the near slot
     /// where the loader stages a capability to the actor's own RX ring.
     self_slot: ?u16,
+    /// Where the loader stages a child's capability to its supervisor
+    /// (A4 movement 3), when the actor grants anything to `boss`.
+    boss_slot: ?u16 = null,
     /// Set when the actor asks a device (A3.3): every answering device
     /// it holds a capability to needs its reply window aimed back here.
     asks_devices: bool = false,
@@ -5406,6 +5453,7 @@ pub fn compile(
         .uses_timer = gen.uses_timer,
         .timer_period = gen.timer_period,
         .self_slot = if (gen.uses_self) gen.off_self else null,
+        .boss_slot = if (gen.uses_boss) gen.off_boss else null,
         .asks_devices = gen.asks_devices,
         .bufs = try bufs_out.toOwnedSlice(),
     };

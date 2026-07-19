@@ -518,6 +518,19 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(p.core, p.ctx, ring.slot_rx), joe.abi.token, .msg);
             std.mem.writeInt(u64, near[soff..][0..8], ring.windowAddr(slot, 0), .little);
         }
+        if (c.r.boss_slot) |boff| {
+            // A4 movement 3: a child's capability to its executor. The
+            // exit link already says who that is — this is the same
+            // relationship, pointed the other way, so probate needs no
+            // new notion of legitimacy.
+            if (p.parent) |pi| {
+                const parent = all.items[pi];
+                const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(parent.core, parent.ctx, ring.slot_rx), joe.abi.token, .msg);
+                std.mem.writeInt(u64, near[boff..][0..8], ring.windowAddr(slot, 0), .little);
+            } else {
+                return fail("{s}: grants to `boss` but nobody spawned it", .{p.name});
+            }
+        }
         if (c.r.uses_timer) {
             m.setPtt(p.core, 255, .{
                 .prefix_lo = ring.PttEntry.loFrom(0xFFFF, 0, ring.slot_rx),

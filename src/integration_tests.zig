@@ -500,6 +500,37 @@ test "cq overflow: a lost delivery kills the context; a lost verdict does not" {
     }
 }
 
+test "A4 movement 3: probate from joe — the estate reaches the executor" {
+    // `grant frame to boss` in a dying actor's last breath. The grantee an
+    // actor names is its supervisor, because the exit link already
+    // establishes that relationship — no clairvoyance about heirs, and no
+    // grant-to-a-future-incarnation.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Draw { }
+        \\actor Screen(tick u64) {
+        \\    var frame region [64]u64
+        \\    frame[0] = 6564
+        \\    grant frame to boss
+        \\    halt ok
+        \\}
+        \\actor Cabinet() {
+        \\    var deaths u64 = 0
+        \\    spawn Screen(1) restarts 0 watchdog 0
+        \\    serve {
+        \\        case exit(w, crash(code)):
+        \\            deaths += 1
+        \\    }
+        \\}
+        \\system {
+        \\    cab = Cabinet()
+        \\}
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    // One capability moved, and the screen is properly dead.
+    try testing.expectEqual(@as(u64, 1), o.stats.grants);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability
