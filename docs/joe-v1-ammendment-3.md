@@ -1,6 +1,6 @@
 # joe — v1 Amendment 3: The Device Conversation
 
-**Status: adopted (Christian's read-through, 2026-07-19). Drawn from the harness retirement's expression gaps — mandel/periph/http had no joe voice — and the rocci-bird sketch, which uses half of what follows as if it already existed.**
+**Status: adopted and IMPLEMENTED (2026-07-19). Drawn from the harness retirement's expression gaps — mandel/periph/http had no joe voice — and the rocci-bird sketch, which uses half of what follows as if it already existed. §A3.11 records what building it changed.**
 
 *Verdict in one line: devices answer with the tag you gave them, bytes get a raw voice, `let` names what a burst may keep, and records give near-page state a shape.*
 
@@ -233,6 +233,45 @@ masks (ride with VSEL and its first workload), narrow scalars
 item), device *subscriptions* beyond push-contracts, and region
 succession (Q9's fourth costume). Named so they're seen, deferred so
 A3 ships.
+
+## A3.11 What building it changed (2026-07-19)
+
+Shipped as drafted, with five additions the programs demanded and one
+rule the machine handed back:
+
+- **`-> _`, the tell form.** A block write is not an ask, but it still
+  needs the row's framing — one dialect per device, not two.
+- **The reply window IS the request for a reply.** periph.joe could not
+  sequence a write before reading it back: a driver that cannot see
+  transport verdicts has no other ordering point. So a device that
+  answers now answers writes too *when you leave a return address*, and
+  says nothing when the window word is zero — which is exactly what
+  periph.asm stages, so the assembly contract never moved. The rule
+  generalizes: **leave an address, get an answer.**
+- **`payload.len`.** A device's raw bytes have no length byte; the
+  fabric already counted them, and the completion record carries the
+  count. `ch.data.len` reads it. Nothing in-band, nothing invented.
+- **`send tty, ch.data`** forwards a reply's payload — and *copies it
+  out of the landing buffer first*, because AUTO_REPOST space belongs
+  to hardware: pointing an SQE into it silently dropped chunks until
+  the compiler learned to stage. A staging-overflow compile error came
+  with it (the RAM-overlap lesson, charged at compile time).
+- **`append b, some_const`** — a const's bytes, whole.
+- **A3.1's park rule proved simpler than drafted.** Every park in v1
+  sits at a block boundary, so block-scoped lets can never cross one;
+  the liveness check is one comment away for the day a construct parks
+  mid-block.
+
+Programs, all suite-guarded: **mandel.joe** (22 rows character-for-
+character with mandel.asm and the host oracle — a third implementation
+of one picture), **periph.joe** (the row walked in the language, same
+entropy stream, disk verified, its own cycle bill), **http.joe** (868
+bytes of Example Domain off a real socket — headers, chunked body,
+terminating chunk). Three bugs the fetch found: joe's escape decoder
+did not know `\r` (two decoders had drifted apart — now one), the
+landing-buffer aliasing above, and a retry timer that re-asked while an
+answer was in flight, interleaving a socket stream. Two of the three
+are now the compiler's knowledge for good.
 
 ---
 

@@ -1200,3 +1200,44 @@ regression of scope: scatter's parametric worker count fixed at the
 contract's 8 (the staged fan-out chain is deployment, and deployment
 now lives in the file). README's forkjoin makespan corrected 61k → the
 measured 55,000. Guide: docs/asm-guide.md.
+
+## Amendment 3 — the device conversation (2026-07-19)
+
+Christian's read-through adopted the draft same-day; implemented in one
+run. The tidy-up was the survey party and this is the road: mandel,
+periph and http had no joe voice, and rocci-bird had been writing half
+this surface as if it existed.
+
+| piece | shipped |
+|---|---|
+| A3.1 `let` | burst-local binding, item 4's semantics made law: dies at its block's end (every v1 park is a block boundary), typed from its initializer, no shadowing, no reassignment. Corpus recompiles unchanged. |
+| A3.2 raw bytes | `const`, byte indexing, `clear`/`append`, `send tty, b`. **pack speaks struple to actors; append speaks raw to devices** — two dialects, one boundary. |
+| A3.3 echoed tags | §7.3 addendum across the tower: uniform ask framing (tag, window, args), replies echo the tag with data at +8. joe's `message Ask {…} -> Reply {…}` pairing; `-> _` tells. periph.asm + http_get.asm/demo_web reframed and re-verified. |
+| A3.4 records | `struct` as named near-page offsets; scalars only. |
+| A3.5 device row | Entropy/Rtc/Block/Net nameable in a joe `system`, per-device tokens, reply windows aimed back at the asker. |
+
+Programs: **mandel.joe** — 22 rows character-for-character against
+mandel.asm and the host oracle (three implementations, one set of
+bits). **periph.joe** — entropy stream identical to the assembly
+errand, disk round-trip verified, own cycle bill in hex. **http.joe** —
+868 bytes of Example Domain over a real socket, headers + chunked body
++ terminating chunk, the §7.5 story told from the language.
+
+Rules the machine handed back, each priced by a program that failed
+without it:
+
+- **The reply window is the request for a reply.** periph.joe could not
+  order a write before its read-back — a driver that cannot see
+  transport verdicts has no other sequencing point. A device that
+  answers now answers writes too when a return address is present, and
+  stays silent when the window word is zero, which is what periph.asm
+  stages: the assembly contract never moved.
+- **Never hand hardware a pointer into hardware's own buffer.**
+  Forwarding a reply payload straight from AUTO_REPOST space dropped
+  chunks; the compiler now stages the copy, and overflowing the staging
+  area is a compile error (the RAM-overlap lesson, charged early).
+- **The fabric already counted the bytes** — `payload.len` reads the
+  completion's count field, so a raw reply needs no in-band framing.
+- One drift repaired: joe had two string-escape decoders and only one
+  knew `\n`; neither knew `\r`, so every CRLF was "rn" and cloudflare
+  answered 400 Bad Request. One decoder now.
