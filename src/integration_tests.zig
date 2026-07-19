@@ -459,6 +459,47 @@ test "determinism: identical seeds produce identical runs" {
     try testing.expectEqualDeep(results[0], results[1]);
 }
 
+// ── CQ overflow: which losses are survivable (§11 q6, promoted) ─────────
+
+test "cq overflow: a lost delivery kills the context; a lost verdict does not" {
+    // Two records into a CQ with room for one. The verdict (a send ack)
+    // is re-derivable — the peer retries, the timer fires again — so it
+    // drops and counts. The delivery exists nowhere else: losing it is
+    // the silent-forever failure, so the context dies and its exit link
+    // can speak.
+    for ([_]ring.Tag{ .send, .deliver }) |second| {
+        var m = try Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .ram_size = 0x4000,
+        });
+        defer m.deinit();
+        m.setRing(0, 0, ring.slot_cq, .{
+            .base = 0x2000,
+            .cap_log2 = 0, // one record, and no more
+            .entry_size = ring.cq_entry_size,
+            .watermark = 0,
+            .companion_cq = ring.slot_cq,
+            .head = 0,
+            .tail = 0,
+            .token = 0,
+        });
+        m.load(0, 0x1000, &.{0xDB}); // HLT
+        try m.spawn(0, 0, 0x1000, 0x3000, 0);
+        m.postCompletion(0, 0, ring.slot_cq, .{ .tag = .send, .status = .ok, .byte_count = 0, .cookie = 1 });
+        m.postCompletion(0, 0, ring.slot_cq, .{ .tag = second, .status = .ok, .byte_count = 0, .cookie = 2 });
+        try testing.expectEqual(@as(u64, 1), m.stats.cq_overflows);
+        const ctx = &m.cores[0].contexts[0];
+        if (second == .deliver) {
+            try testing.expectEqual(machine.Fault.cq_overflow, ctx.fault);
+            try testing.expectEqual(machine.CtxState.faulted, ctx.state);
+        } else {
+            try testing.expectEqual(machine.Fault.none, ctx.fault);
+            try testing.expect(ctx.state != .faulted);
+        }
+    }
+}
+
 // ── The generic .asm runner: the retired harnesses' scenarios, run from
 //    the programs' own contracts (src/asm_run.zig). Each program carries
 //    its deployment; tests that need another shape hand simulateSystem a

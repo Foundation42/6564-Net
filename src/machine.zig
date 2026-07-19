@@ -53,6 +53,13 @@ pub const Fault = enum {
     /// WDEX declared a burst budget above the supervisor's ceiling (§5.4):
     /// asking for more leash than authorized is a fault, not a longer leash.
     wdex_ceiling,
+    /// A completion record found no room in this context's CQ (§11 q6,
+    /// promoted): sizing a CQ is software's contract, like ring layout,
+    /// and breaking it kills the context that owns the queue instead of
+    /// silently losing its mail. A dropped timeout record used to mean
+    /// an eternal park — a failure no supervisor could see. Now the
+    /// exit link fires and someone can answer for it.
+    cq_overflow,
 };
 
 pub const CtxState = enum {
@@ -768,8 +775,16 @@ pub const Machine = struct {
     }
 
     /// Post a completion record to a context's CQ and wake any listener.
-    /// CQ overflow drops the record and counts it — sized CQs are software's
-    /// responsibility; see docs/simulator.md.
+    /// Sizing a CQ is software's contract (like ring layout); breaking it
+    /// is not a dropped letter but a dead context — the record is still
+    /// lost, but the loss becomes supervisable instead of eternal (§11
+    /// q6, promoted in v2.6).
+    /// Post a completion from outside the machine — tests exercising the
+    /// queue contract directly.
+    pub fn postCompletion(self: *Machine, core_idx: u16, ctx_idx: u8, cq_slot: u8, c: ring.Completion) void {
+        self.cqPost(core_idx, ctx_idx, cq_slot, c);
+    }
+
     fn cqPost(self: *Machine, core_idx: u16, ctx_idx: u8, cq_slot: u8, c: ring.Completion) void {
         const core = &self.cores[core_idx];
         const ctx = &core.contexts[ctx_idx];
@@ -783,6 +798,24 @@ pub const Machine = struct {
         });
         if (!ok) {
             self.stats.cq_overflows += 1;
+            // Which records may be lost quietly? Only the ones someone
+            // else will say again. A transport verdict — an ack, a
+            // reject, a timeout — is re-derivable by construction: the
+            // peer retries, the timer fires again, and a protocol that
+            // reads no verdicts (every compiled joe actor) never wanted
+            // it. A DELIVERY or an EXIT is different: the message and
+            // the obituary exist nowhere else, and losing one is the
+            // silent-forever failure — a park with no wake, a death
+            // with no mourner. Those kill the context that could not
+            // hold them, so the exit link can speak (§11 q6, promoted).
+            const irreplaceable = c.tag == .deliver or c.tag == .exit;
+            if (irreplaceable and ctx.state != .faulted and ctx.state != .idle) {
+                ctx.state = .faulted;
+                ctx.fault = .cq_overflow;
+                ctx.fault_addr = ctx.ip;
+                if (core.current == ctx_idx) core.current = null;
+                self.notifyExit(core, ctx_idx, ctx);
+            }
             return;
         }
         self.wake(core_idx, ctx_idx, cq_slot);

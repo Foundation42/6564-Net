@@ -446,6 +446,8 @@ One bit, one rule, no ambiguity. Software wanting fire-and-forget semantics copi
 
 **Warning — slot reuse.** The ownership clear is applied to the descriptor location captured at accept time. Software that reuses an SQ slot before its previous operation's completion has posted is touching in-flight state: the eventual clear may land on the reused entry. This is the undefined-effect clause above, made concrete; it will bite on real silicon exactly as it does in simulation. Do not reuse a slot until its completion is observed.
 
+**Warning — never point hardware at hardware's own buffer.** The same family, from the other end. A submission whose payload address lies inside a receive ring's landing space is a race with the RBC: an `AUTO_REPOST` buffer is re-granted as its delivery is popped, so the bytes may be overwritten before the outbound datagram is formed. The rule is one line — *forward a payload by copying it into memory you own, never by pointing at where it landed* — and it is not a simulation artifact: it is what buffer ownership means when both ends of a copy belong to the fabric. (Found by a joe program forwarding a device reply straight from its landing buffer; the compiler now stages the copy, and the loss it caused looked exactly like a lossy network, which is the dangerous part.)
+
 **Registered regions (v2.6).** The same one rule, widened from one
 transmit buffer to one span of memory, composed entirely from
 mechanisms this page already had — **the descriptor table is the
@@ -557,6 +559,10 @@ A device that answers — a clock, an entropy well, a block store — answers th
 Device replies are **fire-and-forget silicon**: a device does not retry, hold pending state, or wait for acknowledgment. A lost reply costs the requester another ask — so device protocols are idempotent request/retry, the same discipline every actor already lives by (§10). A reply may also race its own request-ack home across the fabric; drivers that wait on the ack must be prepared to see the answer first.
 
 **The echoed tag (Amendment 3 addendum).** Every asking device's request begins with a **caller-tag word**: silicon never interprets it and echoes it verbatim as the reply's first word. This is the accelerator contract's reserved word (§7.6), generalized to the whole row — the machine shipped the convention twice before it was named. The reply wears the tag you gave it, so a serve loop can match a device's answer exactly as it matches any message; an untagged raw answer no longer exists on the row. Uniform ask framing: word0 = tag, word1 = reply window, device arguments from word2; uniform reply framing: the echoed tag, then data from +8. Devices that never answer — the console is a raw sink, payload-is-text — carry no tag word: a sink has nothing to echo. Devices that *push* unasked (a pad, a display's vblank) are the same convention minus the request: their contracts name their tags.
+
+**The reply window is the request for a reply.** Word1 is not decoration on operations that had nothing to say: a device answers **when, and only when, the request leaves a valid return address**. A block write with a window word echoes the tag once the sector is the caller's; the same write with word1 zero says nothing, and the fabric ack remains the whole receipt, exactly as before. This is not politeness — it is the only **sequencing point** available to a driver that cannot read transport verdicts. Such a driver exists by construction: a compiled joe actor never sees an ack, so without an answer it cannot know its write landed before its read-back departs. One rule, two audiences: *leave an address, get an answer.*
+
+**Raw replies carry no in-band framing; the fabric already counted.** A device's payload has no length byte and no terminator. The completion record's count field is the length — it is written by the same hardware that filled the buffer, and inventing a second copy inside the payload would only create something to disagree with. A tag-only reply (count = 8) therefore means "nothing to report, ask again", and a reply with data means data: the receiver subtracts the header from the count and has its extent. Software that wants a self-describing payload is free to put struple in it (§7.5 says protocol lives above the contract), but the row itself frames nothing.
 
 ### 7.4 The v1 Device Set
 
@@ -738,7 +744,7 @@ The three representative workloads all run, built entirely from CQ feedback and 
 ### Measured Claims
 
 - **60 cycles per message pass** on Armstrong's ring (§2.2), flat across two orders of magnitude of scale, regression-guarded.
-- 200 complete actors (register bank + near page) on one core, with room to spare.
+- 200 complete actors (near page + control block) on one core, with room to spare — and that figure predates v2.6: it was bank-bound, and the bank is gone (§2.2). What a context costs now is its near page and its leash; the ceiling wants re-measuring against memory, not against a register file that no longer exists.
 - Zero-cycle context switch exercised on every park and yield in every test.
 
 ### The Mechanism Campaign (v2.2)
@@ -838,6 +844,13 @@ Recorded honestly, for future revisions. Two of v2's questions are resolved; the
     device with no dedup (a teletype) prints twice. Proposed shape:
     device contracts default to exactly-once framing and *declare*
     relaxation, mirroring the `deterministic` flag's honesty. Undecided.
+    Note the structural asymmetry the echoed tag (§7.3) exposes: a
+    device that answers has a caller tag to dedup *by*, while a
+    tag-less sink has nothing to compare — the console cannot dedup
+    even in principle, so under "exactly-once by default, declare
+    relaxation" it is the first and most certain declarer. Any framing
+    that pretends otherwise would be asking sinks to keep state they
+    were defined not to have.
 11. **Shared code pages** — the MAC re-trial's ceiling: MACTAB is
     per-context, so routine reuse stops at the actor boundary. Demos
     already run many actors from one program image; whether shared
