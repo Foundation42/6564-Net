@@ -1,6 +1,6 @@
 # joe — v1 Amendment 3: The Device Conversation
 
-**Status: DRAFT for review — drawn from the harness retirement's expression gaps (mandel/periph/http have no joe voice) and the rocci-bird sketch, which uses half of what follows as if it already existed. Nothing here is adopted until it survives the read-through.**
+**Status: adopted (Christian's read-through, 2026-07-19). Drawn from the harness retirement's expression gaps — mandel/periph/http had no joe voice — and the rocci-bird sketch, which uses half of what follows as if it already existed.**
 
 *Verdict in one line: devices answer with the tag you gave them, bytes get a raw voice, `let` names what a burst may keep, and records give near-page state a shape.*
 

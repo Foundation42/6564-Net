@@ -245,6 +245,10 @@ const AssignOp = enum { set, add, sub };
 
 const Stmt = union(enum) {
     assign: struct { name: []const u8, idx: ?*Expr, op: AssignOp, expr: *Expr },
+    /// `let x = e` — a burst-local binding (Amendment 3): lives for the
+    /// rest of its block, never crosses a park, cannot be reassigned.
+    /// Where it lives is codegen's business; the lifetime is the contract.
+    let_: struct { name: []const u8, expr: *Expr, line: usize },
     send: struct { target: []const u8, target_idx: ?*Expr, msg: []const u8, args: []*Expr, line: usize },
     for_range: struct { name: []const u8, from: *Expr, to: *Expr, body: []Stmt },
     for_group: struct { idx: []const u8, elem: []const u8, group: []const u8, body: []Stmt, line: usize },
@@ -1062,7 +1066,14 @@ const Parser = struct {
                 "joe has no `while` (Amendment 1): unbounded iteration is a self-send loop, one park per slice",
                 Error.Semantics,
             );
-        inline for (.{ "chain", "let", "region", "grant", "log" }) |kw| {
+        if (try self.eatKw("let")) {
+            const bname = try self.expect(.ident, "binding name");
+            if (self.tok.kind != .assign)
+                return self.fail("a let is `let name = expr`", Error.Syntax);
+            try self.advance();
+            return .{ .let_ = .{ .name = bname.text, .expr = try self.parseExpr(), .line = line } };
+        }
+        inline for (.{ "chain", "region", "grant", "log" }) |kw| {
             if (self.isKw(kw))
                 return self.fail("`" ++ kw ++ "` is not in v1 yet", Error.Unsupported);
         }
@@ -1496,6 +1507,10 @@ const Gen = struct {
 
     // Near-page slot offsets, assigned in layout().
     slots: std.StringHashMap(u16),
+    /// Live `let` bindings (Amendment 3): name → is-f64. A let's slot
+    /// rides in `slots` like any binding; this map is what makes it a
+    /// let — typed, immutable, and removed at its block's end.
+    lets: std.StringHashMap(bool),
     off_w0: u16 = 0,
     off_ptr: u16 = 0,
     off_t: u16 = 0,
@@ -1988,6 +2003,7 @@ const Gen = struct {
             },
             .ident => |name| {
                 if (self.vecs.contains(name)) return .vec_;
+                if (self.lets.get(name)) |isf| return if (isf) .f64_ else .u64_;
                 for (self.actor.params) |p| {
                     if (std.mem.eql(u8, p.name, name)) return p.ty;
                 }
@@ -2725,12 +2741,47 @@ const Gen = struct {
     // ── Statements ───────────────────────────────────────────────────────
 
     fn stmts(self: *Gen, list: []const Stmt) Error!void {
-        for (list) |*s| try self.stmt(s);
+        // A block is a let scope: bindings made here die here — and since
+        // every park lives at a block boundary (serve's LSTN), a let can
+        // never cross one. When a future construct parks mid-block, the
+        // liveness check moves here and starts naming parks in errors.
+        var block_lets: [8]?[]const u8 = @splat(null);
+        var n_lets: usize = 0;
+        for (list) |*s| {
+            if (s.* == .let_) {
+                if (n_lets == block_lets.len)
+                    return self.fail(s.let_.line, "more than 8 live lets in one block — some of these are state, and state is a var", Error.Semantics);
+                block_lets[n_lets] = s.let_.name;
+                n_lets += 1;
+            }
+            try self.stmt(s);
+        }
+        for (block_lets[0..n_lets]) |bn| {
+            _ = self.slots.remove(bn.?);
+            _ = self.lets.remove(bn.?);
+        }
     }
 
     fn stmt(self: *Gen, s: *const Stmt) Error!void {
         switch (s.*) {
+            .let_ => |l| {
+                if (self.slots.contains(l.name))
+                    return self.fail(l.line, "this name is already bound — a let does not shadow", Error.Semantics);
+                const ty = self.exprType(l.expr);
+                if (ty == .vec_)
+                    return self.fail(l.line, "a vec is a slab, not a binding — use a var", Error.Semantics);
+                if (ty == .f64_) {
+                    try self.evalFloatScalar(l.expr);
+                } else {
+                    try self.evalInto(l.expr);
+                }
+                const slot = try self.getOrAddSlot(l.name);
+                try self.w("        STA ${X}", .{slot});
+                try self.lets.put(l.name, ty == .f64_);
+            },
             .assign => |a| {
+                if (self.lets.contains(a.name))
+                    return self.fail(0, "a let is a binding, not a variable — this wants a var", Error.Semantics);
                 if (a.idx) |ix| {
                     // arr[e] = v — evaluate v first (it may clobber Y).
                     const arr = self.arrays.get(a.name) orelse
@@ -4669,6 +4720,7 @@ pub fn compile(
         .layout = layout,
         .diag = diag,
         .slots = std.StringHashMap(u16).init(arena),
+        .lets = std.StringHashMap(bool).init(arena),
         .strings = .init(arena),
         .arrays = .init(arena),
         .bufs = .init(arena),
@@ -4888,6 +4940,58 @@ test "joe A1.3: bounded without a watchdog is gratuitous too" {
     var diag = Diagnostic{};
     try testing.expectError(Error.Semantics, compile(testing.allocator, src, "A", .{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message, "nobody is counting") != null);
+}
+
+test "joe A3.1: let binds, scopes to its block, and refuses reassignment" {
+    var r = try compile(testing.allocator,
+        \\actor A() {
+        \\    var x u64 = 0
+        \\    var y f64 = 0.0
+        \\    serve {
+        \\        case Go(_):
+        \\            let t = x + 3
+        \\            let f = y * 2.0
+        \\            x = t + t
+        \\            if f > 1.5 { x += 1 }
+        \\    }
+        \\}
+        \\message Go { }
+    , "A", .{}, null);
+    defer r.deinit();
+    // f64-typed let: the comparison compiled through FCMP.
+    try testing.expect(std.mem.indexOf(u8, r.asm_text, "FCMP") != null);
+}
+
+test "joe A3.1: a let is a binding, not a variable" {
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator,
+        \\actor A() {
+        \\    var x u64 = 0
+        \\    serve {
+        \\        case Go(_):
+        \\            let t = x + 1
+        \\            t = 5
+        \\    }
+        \\}
+        \\message Go { }
+    , "A", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "binding, not a variable") != null);
+}
+
+test "joe A3.1: a let does not shadow" {
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator,
+        \\actor A() {
+        \\    var x u64 = 0
+        \\    serve {
+        \\        case Go(_):
+        \\            let x = 3
+        \\            x = x
+        \\    }
+        \\}
+        \\message Go { }
+    , "A", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "does not shadow") != null);
 }
 
 test "joe: the system block parses into a plan" {
