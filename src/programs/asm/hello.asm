@@ -7,8 +7,18 @@
 ; is the receipt that the console took the bytes — and if it never comes,
 ; we say it again. Politeness through idempotence.
 ;
-; Harness contract:
-;   PTT 0 → console ($FF00)     desc slots: 0 SQ ($2400), 1 CQ
+; The harness contract, as directives the loader executes (src/asm_run.zig):
+; a console capability (the SQE below routes by address, so a grant is all
+; we need), the SQ the code stages at $2400, and a CQ for the receipts.
+
+        .actor Hello(console cap)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq cap=16
+
+        .system
+        hello = Hello(console)
+        console = Console()
+        .endsystem
 
         .org $1000
         LDA #1

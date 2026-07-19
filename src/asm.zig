@@ -7,6 +7,41 @@
 //!   .org $1000        set origin     .qword v,…  emit 64-bit words
 //!   .byte v,…         emit bytes     .ascii "…"  emit text
 //!
+//! ## Contract directives
+//!
+//! Every hand-written program documents its deployment in a "Harness
+//! contract" comment. These directives are that contract made machine-
+//! readable: they emit no bytes and change no encodings — they fill
+//! `Output.meta`, which the generic loader (src/asm_run.zig) executes the
+//! way each demo_*.zig harness once did by hand.
+//!
+//!   .actor Name(next cap @ $840, fuse arg @ A)
+//!                        the actor and its params. `cap` is a capability:
+//!                        `= N` pins PTT slot N (the code bakes window
+//!                        constants); `@ addr` lets the loader pick a slot
+//!                        and stage the window pointer at addr. `arg` is a
+//!                        number: `@ A` arrives in the accumulator at
+//!                        spawn, `@ addr` is staged. `cap[]`/`arg[]` stage
+//!                        an 8-byte-stride array at addr (group refs).
+//!   .ring 2 rx cap=2 auto_repost post=2 size=8
+//!                        a descriptor the loader stages: slot, kind
+//!                        (sq|cq|rx), capacity (a power of two), optional
+//!                        pinned base=addr (when the code addresses the
+//!                        storage), auto_repost, `post=N size=M` landing
+//!                        entries (cookie = buffer address), `grant` for a
+//!                        pre-granted tail.
+//!   .timer = 1 period=2500
+//!                        the black-hole capability (spec §6.3): `= N`
+//!                        pins the PTT slot, `@ addr` stages its window
+//!                        pointer; period becomes the fabric timeout.
+//!   .stage $B00 1, 2, 3  qwords the loader writes before spawn (near
+//!                        page below $1000, core RAM at and above it).
+//!   .var name $850       a named readback cell for the outcome report.
+//!   .use "pong.asm"      another actor's source joins the system.
+//!   .system … .endsystem the deployment, in joe's system-block grammar —
+//!                        one dialect for the whole machine; lines are
+//!                        captured verbatim for joe's planner.
+//!
 //!   LDA #42           imm8 (sign-extended); #expr picks imm8 when it fits
 //!   LDA ##$FF00_0000  imm64 (## forces the wide form)
 //!   LDA $0F8          near page      LDA $0F8,X    near indexed
@@ -43,10 +78,67 @@ pub const Diagnostic = struct {
     message: []const u8 = "",
 };
 
+pub const ParamKind = enum { cap, arg };
+pub const ParamWhere = union(enum) {
+    /// Bare `cap` — grant only: the code builds target addresses itself
+    /// (SQE routing by prefix match); no slot pinned, nothing staged.
+    none,
+    /// `arg @ A` — the spawn argument register.
+    reg_a,
+    /// `@ addr` — staged at a near ($000-$FFF) or RAM cell.
+    cell: u64,
+    /// `cap = N` — pinned PTT slot; the code bakes the window constant.
+    slot: u16,
+};
+
+/// One parameter of a `.actor` signature.
+pub const MetaParam = struct {
+    name: []const u8,
+    kind: ParamKind,
+    /// `cap[]` / `arg[]`: a group reference staged as an 8-byte-stride array.
+    group: bool = false,
+    where: ParamWhere,
+};
+
+/// One `.ring` descriptor for the loader to stage.
+pub const MetaRing = struct {
+    slot: u8,
+    kind: enum { sq, cq, rx },
+    cap_log2: u8,
+    /// Pinned storage base; null lets the loader allocate.
+    base: ?u64 = null,
+    auto_repost: bool = false,
+    /// Landing entries to post (RX): count and buffer size, cookie = buffer.
+    post: u16 = 0,
+    size: u16 = 8,
+    /// Pre-grant the whole tail (no RECV in the code).
+    grant: bool = false,
+};
+
+pub const MetaStage = struct { addr: u64, values: []u64 };
+pub const MetaVar = struct { name: []const u8, addr: u64 };
+pub const MetaTimer = struct { slot: ?u16 = null, cell: ?u64 = null, period: u64 };
+
+/// The machine-readable harness contract (see the header comment). Every
+/// slice is owned by `Output.alloc`; absent pieces are empty/null, so a
+/// directive-free source has an empty meta and nothing downstream changes.
+pub const Meta = struct {
+    actor: ?[]const u8 = null,
+    params: []MetaParam = &.{},
+    rings: []MetaRing = &.{},
+    stages: []MetaStage = &.{},
+    vars: []MetaVar = &.{},
+    timer: ?MetaTimer = null,
+    uses: [][]const u8 = &.{},
+    /// Verbatim lines between .system/.endsystem — joe's system grammar.
+    system: ?[]const u8 = null,
+};
+
 pub const Output = struct {
     origin: u64,
     code: []u8,
     symbols: std.StringHashMap(u64),
+    meta: Meta = .{},
     alloc: std.mem.Allocator,
 
     pub fn deinit(self: *Output) void {
@@ -54,12 +146,28 @@ pub const Output = struct {
         var it = self.symbols.keyIterator();
         while (it.next()) |k| self.alloc.free(k.*);
         self.symbols.deinit();
+        freeMeta(self.alloc, &self.meta);
     }
 
     pub fn symbol(self: *const Output, name: []const u8) ?u64 {
         return self.symbols.get(name);
     }
 };
+
+fn freeMeta(alloc: std.mem.Allocator, meta: *Meta) void {
+    if (meta.actor) |a| alloc.free(a);
+    for (meta.params) |p| alloc.free(p.name);
+    alloc.free(meta.params);
+    alloc.free(meta.rings);
+    for (meta.stages) |s| alloc.free(s.values);
+    alloc.free(meta.stages);
+    for (meta.vars) |v| alloc.free(v.name);
+    alloc.free(meta.vars);
+    for (meta.uses) |u| alloc.free(u);
+    alloc.free(meta.uses);
+    if (meta.system) |s| alloc.free(s);
+    meta.* = .{};
+}
 
 /// Assemble a full source text. On error, `diag` (if non-null) carries the
 /// offending line number and a static message.
@@ -119,6 +227,17 @@ const Assembler = struct {
     pc: u64 = 0,
     origin: ?u64 = null,
     diag: Diagnostic = .{},
+    // Contract accumulators — transferred to Output.meta on success.
+    meta_actor: ?[]const u8 = null,
+    meta_params: std.ArrayListUnmanaged(MetaParam) = .{},
+    meta_rings: std.ArrayListUnmanaged(MetaRing) = .{},
+    meta_stages: std.ArrayListUnmanaged(MetaStage) = .{},
+    meta_vars: std.ArrayListUnmanaged(MetaVar) = .{},
+    meta_timer: ?MetaTimer = null,
+    meta_uses: std.ArrayListUnmanaged([]const u8) = .{},
+    system_text: std.ArrayListUnmanaged(u8) = .{},
+    saw_system: bool = false,
+    in_system: bool = false,
 
     fn init(alloc: std.mem.Allocator) Assembler {
         return .{ .alloc = alloc, .symbols = std.StringHashMap(u64).init(alloc) };
@@ -134,6 +253,17 @@ const Assembler = struct {
         var it = self.symbols.keyIterator();
         while (it.next()) |k| self.alloc.free(k.*);
         self.symbols.deinit();
+        if (self.meta_actor) |a| self.alloc.free(a);
+        for (self.meta_params.items) |p| self.alloc.free(p.name);
+        self.meta_params.deinit(self.alloc);
+        self.meta_rings.deinit(self.alloc);
+        for (self.meta_stages.items) |s| self.alloc.free(s.values);
+        self.meta_stages.deinit(self.alloc);
+        for (self.meta_vars.items) |v| self.alloc.free(v.name);
+        self.meta_vars.deinit(self.alloc);
+        for (self.meta_uses.items) |u| self.alloc.free(u);
+        self.meta_uses.deinit(self.alloc);
+        self.system_text.deinit(self.alloc);
     }
 
     fn fail(self: *Assembler, line_no: usize, msg: []const u8, err: Error) Error {
@@ -147,8 +277,20 @@ const Assembler = struct {
         var line_no: usize = 0;
         while (lines.next()) |raw| {
             line_no += 1;
+            if (self.in_system) {
+                const t = std.mem.trim(u8, raw, " \t\r");
+                if (std.ascii.eqlIgnoreCase(t, ".endsystem")) {
+                    self.in_system = false;
+                } else {
+                    try self.system_text.appendSlice(self.alloc, raw);
+                    try self.system_text.append(self.alloc, '\n');
+                }
+                continue;
+            }
             try self.line(line_no, raw);
         }
+        if (self.in_system)
+            return self.fail(line_no, ".system without .endsystem", Error.BadDirective);
         // Pass 2: resolve and emit.
         const org = self.origin orelse 0;
         if (self.pc < org) return Error.BadDirective;
@@ -162,9 +304,23 @@ const Assembler = struct {
                 try self.emit(ins.line, ins.pc, ins.enc, ins.shape, buf);
             },
         };
+        const meta = Meta{
+            .actor = self.meta_actor,
+            .params = try self.meta_params.toOwnedSlice(self.alloc),
+            .rings = try self.meta_rings.toOwnedSlice(self.alloc),
+            .stages = try self.meta_stages.toOwnedSlice(self.alloc),
+            .vars = try self.meta_vars.toOwnedSlice(self.alloc),
+            .timer = self.meta_timer,
+            .uses = try self.meta_uses.toOwnedSlice(self.alloc),
+            .system = if (self.saw_system)
+                try self.system_text.toOwnedSlice(self.alloc)
+            else
+                null,
+        };
+        self.meta_actor = null;
         const symbols = self.symbols;
         self.symbols = std.StringHashMap(u64).init(self.alloc);
-        return .{ .origin = org, .code = code, .symbols = symbols, .alloc = self.alloc };
+        return .{ .origin = org, .code = code, .symbols = symbols, .meta = meta, .alloc = self.alloc };
     }
 
     fn define(self: *Assembler, line_no: usize, name: []const u8, value: u64) Error!void {
@@ -231,6 +387,21 @@ const Assembler = struct {
             self.pc = v;
             return;
         }
+        if (std.ascii.eqlIgnoreCase(name, ".actor")) return self.dirActor(line_no, rest);
+        if (std.ascii.eqlIgnoreCase(name, ".ring")) return self.dirRing(line_no, rest);
+        if (std.ascii.eqlIgnoreCase(name, ".timer")) return self.dirTimer(line_no, rest);
+        if (std.ascii.eqlIgnoreCase(name, ".stage")) return self.dirStage(line_no, rest);
+        if (std.ascii.eqlIgnoreCase(name, ".var")) return self.dirVar(line_no, rest);
+        if (std.ascii.eqlIgnoreCase(name, ".use")) return self.dirUse(line_no, rest);
+        if (std.ascii.eqlIgnoreCase(name, ".system")) {
+            if (self.saw_system)
+                return self.fail(line_no, "duplicate .system block", Error.BadDirective);
+            self.saw_system = true;
+            self.in_system = true;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(name, ".endsystem"))
+            return self.fail(line_no, ".endsystem without .system", Error.BadDirective);
         var bytes: std.ArrayListUnmanaged(u8) = .{};
         errdefer bytes.deinit(self.alloc);
         if (std.ascii.eqlIgnoreCase(name, ".qword")) {
@@ -256,6 +427,193 @@ const Assembler = struct {
         if (self.origin == null) self.origin = self.pc;
         try self.items.append(self.alloc, .{ .data = .{ .pc = self.pc, .bytes = bytes } });
         self.pc += bytes.items.len;
+    }
+
+    fn evalStr(self: *Assembler, line_no: usize, text: []const u8) Error!u64 {
+        return self.eval(line_no, try self.parseExpr(line_no, text));
+    }
+
+    fn dirActor(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
+        if (self.meta_actor != null)
+            return self.fail(line_no, "duplicate .actor", Error.BadDirective);
+        var head = rest;
+        var body: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, rest, '(')) |open| {
+            const close = std.mem.lastIndexOfScalar(u8, rest, ')') orelse
+                return self.fail(line_no, ".actor missing ')'", Error.BadDirective);
+            head = std.mem.trim(u8, rest[0..open], " \t");
+            body = std.mem.trim(u8, rest[open + 1 .. close], " \t");
+        }
+        if (!validSymbol(head))
+            return self.fail(line_no, ".actor needs a name", Error.BadDirective);
+        self.meta_actor = try self.alloc.dupe(u8, head);
+        if (body.len == 0) return;
+        var parts = std.mem.splitScalar(u8, body, ',');
+        while (parts.next()) |part| {
+            const p = std.mem.trim(u8, part, " \t");
+            const sp = std.mem.indexOfAny(u8, p, " \t") orelse
+                return self.fail(line_no, "param needs `name cap|arg @|= where`", Error.BadDirective);
+            const pname = p[0..sp];
+            if (!validSymbol(pname))
+                return self.fail(line_no, "bad param name", Error.BadDirective);
+            var spec = std.mem.trim(u8, p[sp..], " \t");
+            var kind: ParamKind = undefined;
+            var group = false;
+            var matched = false;
+            for ([_][]const u8{ "cap[]", "arg[]", "cap", "arg" }) |kw| {
+                if (std.mem.startsWith(u8, spec, kw)) {
+                    kind = if (kw[0] == 'c') .cap else .arg;
+                    group = kw.len == 5;
+                    spec = std.mem.trim(u8, spec[kw.len..], " \t");
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched)
+                return self.fail(line_no, "param kind must be cap or arg", Error.BadDirective);
+            if (spec.len == 0) {
+                // Bare `cap`: grant only, the code routes by address.
+                if (kind != .cap or group)
+                    return self.fail(line_no, "only a scalar cap can be bare (grant only)", Error.BadDirective);
+                try self.meta_params.append(self.alloc, .{
+                    .name = try self.alloc.dupe(u8, pname),
+                    .kind = kind,
+                    .where = .none,
+                });
+                continue;
+            }
+            if (spec.len < 2 or (spec[0] != '@' and spec[0] != '='))
+                return self.fail(line_no, "param needs `@ where` or `= slot`", Error.BadDirective);
+            const sep = spec[0];
+            const val = std.mem.trim(u8, spec[1..], " \t");
+            const where: ParamWhere = if (sep == '=') blk: {
+                if (kind != .cap or group)
+                    return self.fail(line_no, "only a scalar cap pins a PTT slot", Error.BadDirective);
+                const s = try self.evalStr(line_no, val);
+                if (s > 254) return self.fail(line_no, "PTT slot out of range", Error.ValueOutOfRange);
+                break :blk .{ .slot = @intCast(s) };
+            } else if (std.ascii.eqlIgnoreCase(val, "A")) blk: {
+                if (kind != .arg or group)
+                    return self.fail(line_no, "only a scalar arg rides the accumulator", Error.BadDirective);
+                break :blk .reg_a;
+            } else .{ .cell = try self.evalStr(line_no, val) };
+            try self.meta_params.append(self.alloc, .{
+                .name = try self.alloc.dupe(u8, pname),
+                .kind = kind,
+                .group = group,
+                .where = where,
+            });
+        }
+    }
+
+    fn dirRing(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
+        var toks = std.mem.tokenizeAny(u8, rest, " \t");
+        const slot_tok = toks.next() orelse
+            return self.fail(line_no, ".ring needs `slot kind …`", Error.BadDirective);
+        const slot = try self.evalStr(line_no, slot_tok);
+        if (slot > 63) return self.fail(line_no, "descriptor slot out of range", Error.ValueOutOfRange);
+        const kind_tok = toks.next() orelse
+            return self.fail(line_no, ".ring needs a kind (sq|cq|rx)", Error.BadDirective);
+        var r = MetaRing{
+            .slot = @intCast(slot),
+            .kind = if (std.ascii.eqlIgnoreCase(kind_tok, "sq")) .sq //
+            else if (std.ascii.eqlIgnoreCase(kind_tok, "cq")) .cq //
+            else if (std.ascii.eqlIgnoreCase(kind_tok, "rx")) .rx //
+            else return self.fail(line_no, "ring kind must be sq, cq or rx", Error.BadDirective),
+            .cap_log2 = 0,
+        };
+        var saw_cap = false;
+        while (toks.next()) |tok| {
+            if (std.ascii.eqlIgnoreCase(tok, "auto_repost")) {
+                r.auto_repost = true;
+            } else if (std.ascii.eqlIgnoreCase(tok, "grant")) {
+                r.grant = true;
+            } else if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
+                const key = tok[0..eq];
+                const v = try self.evalStr(line_no, tok[eq + 1 ..]);
+                if (std.ascii.eqlIgnoreCase(key, "cap")) {
+                    if (v == 0 or (v & (v - 1)) != 0 or v > 256)
+                        return self.fail(line_no, "ring cap must be a power of two ≤ 256", Error.ValueOutOfRange);
+                    r.cap_log2 = @intCast(@ctz(v));
+                    saw_cap = true;
+                } else if (std.ascii.eqlIgnoreCase(key, "base")) {
+                    r.base = v;
+                } else if (std.ascii.eqlIgnoreCase(key, "post")) {
+                    r.post = @intCast(@min(v, 256));
+                } else if (std.ascii.eqlIgnoreCase(key, "size")) {
+                    r.size = @intCast(@min(v, 4096));
+                } else return self.fail(line_no, "unknown .ring key", Error.BadDirective);
+            } else return self.fail(line_no, "unknown .ring flag", Error.BadDirective);
+        }
+        if (!saw_cap) return self.fail(line_no, ".ring needs cap=N", Error.BadDirective);
+        try self.meta_rings.append(self.alloc, r);
+    }
+
+    fn dirTimer(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
+        if (self.meta_timer != null)
+            return self.fail(line_no, "duplicate .timer", Error.BadDirective);
+        if (rest.len < 2 or (rest[0] != '=' and rest[0] != '@'))
+            return self.fail(line_no, ".timer needs `= slot` or `@ cell`", Error.BadDirective);
+        var toks = std.mem.tokenizeAny(u8, rest[1..], " \t");
+        const val = toks.next() orelse
+            return self.fail(line_no, ".timer needs a slot or cell", Error.BadDirective);
+        var t = MetaTimer{ .period = 2500 };
+        if (rest[0] == '=') {
+            const s = try self.evalStr(line_no, val);
+            if (s > 254) return self.fail(line_no, "PTT slot out of range", Error.ValueOutOfRange);
+            t.slot = @intCast(s);
+        } else {
+            t.cell = try self.evalStr(line_no, val);
+        }
+        while (toks.next()) |tok| {
+            if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
+                if (std.ascii.eqlIgnoreCase(tok[0..eq], "period")) {
+                    t.period = try self.evalStr(line_no, tok[eq + 1 ..]);
+                    continue;
+                }
+            }
+            return self.fail(line_no, "unknown .timer key", Error.BadDirective);
+        }
+        self.meta_timer = t;
+    }
+
+    fn dirStage(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
+        const sp = std.mem.indexOfAny(u8, rest, " \t") orelse
+            return self.fail(line_no, ".stage needs `addr v, …`", Error.BadDirective);
+        const addr = try self.evalStr(line_no, rest[0..sp]);
+        var values: std.ArrayListUnmanaged(u64) = .{};
+        errdefer values.deinit(self.alloc);
+        var it = std.mem.splitScalar(u8, std.mem.trim(u8, rest[sp..], " \t"), ',');
+        while (it.next()) |part| {
+            const v = try self.evalStr(line_no, std.mem.trim(u8, part, " \t"));
+            try values.append(self.alloc, v);
+        }
+        try self.meta_stages.append(self.alloc, .{
+            .addr = addr,
+            .values = try values.toOwnedSlice(self.alloc),
+        });
+    }
+
+    fn dirVar(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
+        var toks = std.mem.tokenizeAny(u8, rest, " \t");
+        const vname = toks.next() orelse
+            return self.fail(line_no, ".var needs `name addr`", Error.BadDirective);
+        if (!validSymbol(vname))
+            return self.fail(line_no, "bad .var name", Error.BadDirective);
+        const addr_tok = toks.next() orelse
+            return self.fail(line_no, ".var needs an address", Error.BadDirective);
+        if (toks.next() != null)
+            return self.fail(line_no, ".var takes exactly `name addr`", Error.BadDirective);
+        try self.meta_vars.append(self.alloc, .{
+            .name = try self.alloc.dupe(u8, vname),
+            .addr = try self.evalStr(line_no, addr_tok),
+        });
+    }
+
+    fn dirUse(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
+        if (rest.len < 2 or rest[0] != '"' or rest[rest.len - 1] != '"')
+            return self.fail(line_no, ".use needs a quoted file name", Error.BadDirective);
+        try self.meta_uses.append(self.alloc, try self.alloc.dupe(u8, rest[1 .. rest.len - 1]));
     }
 
     fn mnemonic(self: *Assembler, line_no: usize, word: []const u8) Error!isa.Mnemonic {
@@ -629,6 +987,55 @@ test "data directives" {
     try testing.expectEqual(@as(usize, 16 + 3 + 2), out.code.len);
     try testing.expectEqual(@as(u64, 0x1122), std.mem.readInt(u64, out.code[0..8], .little));
     try testing.expectEqualSlices(u8, "hi", out.code[19..21]);
+}
+
+test "contract directives fill meta and emit no bytes" {
+    const src =
+        \\ .actor RingNode(next cap @ $840, fuse arg @ A, ws cap[] @ $A00, con cap = 0)
+        \\ .ring 1 cq cap=4
+        \\ .ring 2 rx cap=2 auto_repost post=2 size=8 base=$4000
+        \\ .timer = 3 period=3000
+        \\ .stage $B00 1, 2, 3
+        \\ .var finisher $850
+        \\ .use "pong.asm"
+        \\ .system
+        \\    n0 = RingNode(n1, 800)
+        \\ .endsystem
+        \\ .org $1000
+        \\ HLT
+    ;
+    var out = try assemble(testing.allocator, src, null);
+    defer out.deinit();
+    // The contract is metadata: one HLT is the whole program.
+    try testing.expectEqual(@as(usize, 1), out.code.len);
+    const m = &out.meta;
+    try testing.expectEqualStrings("RingNode", m.actor.?);
+    try testing.expectEqual(@as(usize, 4), m.params.len);
+    try testing.expectEqualStrings("next", m.params[0].name);
+    try testing.expectEqual(ParamKind.cap, m.params[0].kind);
+    try testing.expectEqual(@as(u64, 0x840), m.params[0].where.cell);
+    try testing.expectEqual(ParamWhere.reg_a, m.params[1].where);
+    try testing.expect(m.params[2].group);
+    try testing.expectEqual(@as(u16, 0), m.params[3].where.slot);
+    try testing.expectEqual(@as(usize, 2), m.rings.len);
+    try testing.expectEqual(@as(u8, 2), m.rings[0].cap_log2);
+    try testing.expect(m.rings[1].auto_repost);
+    try testing.expectEqual(@as(u16, 2), m.rings[1].post);
+    try testing.expectEqual(@as(u64, 0x4000), m.rings[1].base.?);
+    try testing.expectEqual(@as(u16, 3), m.timer.?.slot.?);
+    try testing.expectEqual(@as(u64, 3000), m.timer.?.period);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, m.stages[0].values);
+    try testing.expectEqualStrings("finisher", m.vars[0].name);
+    try testing.expectEqualStrings("pong.asm", m.uses[0]);
+    try testing.expect(std.mem.indexOf(u8, m.system.?, "n0 = RingNode(n1, 800)") != null);
+}
+
+test "a directive-free source has an empty meta" {
+    var out = try assemble(testing.allocator, ".org $1000\nHLT\n", null);
+    defer out.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), out.meta.actor);
+    try testing.expectEqual(@as(usize, 0), out.meta.params.len);
+    try testing.expectEqual(@as(?[]const u8, null), out.meta.system);
 }
 
 test "errors carry line numbers" {

@@ -49,6 +49,13 @@ const usage_text =
     \\      device on the peripheral row (§7) — SEND is the only I/O
     \\      instruction there is (programs/asm/hello.asm).
     \\
+    \\  sim6564 run <file.joe|file.asm> [seed] [loss_ppm4k] [trace] [scorch]
+    \\      Run any program whose source carries its deployment: a .joe
+    \\      file with a `system` block, or a .asm file whose harness
+    \\      contract is written as directives (.actor/.ring/.system —
+    \\      src/asm.zig) with `.use` pulling in its partners. One loader
+    \\      discipline, one report, either language.
+    \\
     \\  sim6564 joe [file.joe] [seed] [loss_ppm4k] [trace] [scorch]
     \\      Compile and run any .joe file that carries a `system` block —
     \\      the deployment is data in the source, so there is no per-
@@ -196,6 +203,51 @@ pub fn main() !void {
             if (std.mem.eql(u8, s, "scorch")) opts.scorch = true;
         }
         return sim.joe_run.run(alloc, source, opts);
+    }
+
+    if (std.mem.eql(u8, first, "run")) {
+        const path = args.next() orelse {
+            std.debug.print("usage: sim6564 run <file.joe|file.asm> [seed] [loss_ppm4k] [trace] [scorch]\n", .{});
+            std.process.exit(2);
+        };
+        var opts = sim.joe_run.Options{};
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        if (args.next()) |s| {
+            opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+            if (opts.loss_ppm4k == 0) opts.dup_ppm4k = 0;
+        }
+        while (args.next()) |s| {
+            if (std.mem.eql(u8, s, "trace")) opts.trace = true;
+            if (std.mem.eql(u8, s, "scorch")) opts.scorch = true;
+        }
+        // Files for this command live in an arena: the lead, then every
+        // `.use` partner, resolved relative to the lead's directory.
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const lead = std.fs.cwd().readFileAlloc(arena, path, 1 << 20) catch |err| {
+            std.debug.print("run: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        };
+        if (std.mem.endsWith(u8, path, ".joe"))
+            return sim.joe_run.run(alloc, lead, opts);
+        if (!std.mem.endsWith(u8, path, ".asm")) {
+            std.debug.print("run: {s}: expected a .joe or .asm file\n", .{path});
+            std.process.exit(2);
+        }
+        const dir = std.fs.path.dirname(path) orelse ".";
+        const uses = sim.asm_run.usesOf(arena, lead) catch std.process.exit(1);
+        var sources = std.ArrayList(sim.asm_run.Source).init(arena);
+        try sources.append(.{ .name = std.fs.path.basename(path), .text = lead });
+        for (uses) |u| {
+            const upath = try std.fs.path.join(arena, &.{ dir, u });
+            const text = std.fs.cwd().readFileAlloc(arena, upath, 1 << 20) catch |err| {
+                std.debug.print("run: cannot read {s} (.use from {s}): {s}\n", .{ upath, path, @errorName(err) });
+                std.process.exit(1);
+            };
+            try sources.append(.{ .name = u, .text = text });
+        }
+        return sim.asm_run.run(alloc, sources.items, opts);
     }
 
     if (std.mem.eql(u8, first, "joec")) {

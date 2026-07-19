@@ -14,12 +14,31 @@
 ; completion cookie is the landing buffer's address — where THIS message
 ; landed.
 ;
-; Harness contract (per node):
-;   near $840 = window pointer to the next node's ring (own PTT slot)
-;   desc slots: 1 CQ, 2 RX (cap 2, AUTO_REPOST, entries staged by harness,
-;   cookie = buffer address)
-;   spawn arg (A): N·M for the injecting node, 0 for everyone else
-;   near $850 = finisher flag (set by whoever completes the final pass)
+; The contract, as directives (per node): a capability to the next node's
+; ring staged as a window pointer at near $840, a CQ, an AUTO_REPOST RX
+; with two posted landing cells (cookie = buffer address), the remaining-
+; pass counter in A for the injector (0 for everyone else), and the
+; finisher flag at near $850 for the outcome report.
+;
+; The .system block is eight of us on one core, the message home at n0 —
+; the same deployment ring.joe declares, in the same grammar. Larger rings
+; are the harnesses' business (demo_dies runs this file across 16 dies).
+
+        .actor RingNode(next cap @ $840, fuse arg @ A)
+        .ring 1 cq cap=4
+        .ring 2 rx cap=2 auto_repost post=2 size=8
+        .var finisher $850
+
+        .system
+        n0 = RingNode(n1, 800) on 0
+        n1 = RingNode(n2, 0) on 0
+        n2 = RingNode(n3, 0) on 0
+        n3 = RingNode(n4, 0) on 0
+        n4 = RingNode(n5, 0) on 0
+        n5 = RingNode(n6, 0) on 0
+        n6 = RingNode(n7, 0) on 0
+        n7 = RingNode(n0, 0) on 0
+        .endsystem
 
         .org $1000
         RECV 2              ; grant landing space before anything moves…

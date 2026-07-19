@@ -538,6 +538,12 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
 pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
     var o = try simulate(alloc, source, opts);
     defer o.deinit();
+    try report(&o, opts, "joe");
+}
+
+/// Print an Outcome the standard way — shared with the .asm runner
+/// (src/asm_run.zig): one report format for the whole machine.
+pub fn report(o: *const Outcome, opts: Options, label: []const u8) !void {
     const stdout = std.io.getStdOut().writer();
     // Translate the machine's stop reason into system terms: it stops
     // when the fabric goes quiet, and quiet-with-corpses can be exactly
@@ -556,12 +562,13 @@ pub fn run(alloc: std.mem.Allocator, source: []const u8, opts: Options) !void {
         .max_cycles => "hit max_cycles — something never went quiet",
     };
     try stdout.print(
-        \\sim6564 — joe: system of {d} instance(s)
+        \\sim6564 — {s}: system of {d} instance(s)
         \\  seed 0x{X}, loss {d}/4096 ({d:.1}%), dup {d}/4096
         \\
         \\  outcome: {s}
         \\
     , .{
+        label,
         o.instances.len,
         opts.seed,
         opts.loss_ppm4k,
