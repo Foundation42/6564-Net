@@ -228,6 +228,20 @@ trusted the banked file; now there is no banked file to trust.
 
 ---
 
+### 2.3 Every Static Check Is the Early Copy of a Dynamic One (v2.6)
+
+A rule the implementation kept discovering, promoted here because it is now load-bearing in three places and states this machine's trust model better than any list of guarantees:
+
+> **A compiler never extends trust. It only moves a reject earlier in time.**
+
+Every static check in this tower has a runtime twin that would catch the same thing later, and the twin is the one that decides:
+
+- **`bounded` is the watchdog moved to compile time.** The compiler bills each emitted instruction from the ISA tables and refuses an understated budget; the watchdog would have force-faulted the same burst at cycle N. Data-dependent claims the compiler cannot price are simply left to the twin (§5.4).
+- **The dialect check is the RBC moved to compile time.** The compiler compares a payload's claim against the endpoint the system block wires; the RBC compares the same two values at accept. A hand-written program that lies is rejected by the machine, which is why the right can be said to live in the capability rather than in the language (§6.4).
+- **`scorch` is the same idea run backwards** — a dynamic check proving a static convention. The compiler promises registers never cross a park; poisoning them at every park proves it, and the corpus running cycle-identical scorched is the evidence (§2.2).
+
+The practical value is diagnostic. **When a static check has no runtime twin, that is a smell, and usually a hole.** The gap Amendment 3 shipped with — "the compiler holds the dialect line" while the RBC checked nothing — was exactly this shape, and inspection under this rule would have found it without a program having to fail first. A check that only the compiler makes is a promise the machine has not agreed to keep.
+
 ## 3. Register and Memory Architecture
 
 ### 3.1 The Near Page
@@ -527,6 +541,17 @@ Any memory reachable from a network is memory that must defend itself. The 6564-
 - Tokens are minted and revoked by privileged software. Revocation is immediate: clear the descriptor field.
 
 This composes naturally with capability-based operating systems — a PTT entry *is* a capability in the object-capability sense, and the OS's capability graph maps directly onto silicon-enforced reachability.
+
+**The rights word is two fields, and they check differently (v2.6).** Conflating them is the mistake this section exists to prevent:
+
+| field | what it says | check | attenuable |
+|---|---|---|---|
+| **dialect** | what the endpoint **is** — `raw` sink, `msg` actor, `ask` device (§7.3) | **equality**, at accept | **no** — a weakened dialect is nonsense |
+| **verbs** | what the holder **may do** — read, write, send, and `grant` (reserved for transfer) | **subset**, at accept | yes — that is what attenuation means |
+
+A submission carries a **claim** of what its payload is (the SQE's reserved hint word; a register send claims `msg` by construction, since one cannot print a register). The RBC compares claim against dialect one step after the rights test, on the path that already checks tokens — measured at **zero cycles**, the frozen tables byte-identical. Mismatch is a capability-family reject: both ends told, no bytes moved. This is what makes the §7.3 misdirection hazard unrepresentable — a `msg` image at an `ask` device would have the device read a message tag as a reply window *in its own PTT space*, synthesizing a wild capability out of a number.
+
+**`any` is unset, not top.** A dialect field may read `any`, meaning *no declaration was made*: a loader-era entry, wired before the field existed or by a loader with nothing to say. Its checks are **skipped, not satisfied**. This is deliberate and it is not a lattice: `any` is not a permissive value that concrete dialects refine, so replacing it is not attenuation — there is nothing there to attenuate. Two consequences follow, both load-bearing for capability transfer: **a derived entry may never carry `any`** (minting a capability is precisely when the grantor must state what it is for), and `any` is therefore scaffolding that transfer cannot propagate — it ends where the static wiring ends.
 
 ### 6.5 Leaving the Die: the IO Plane
 

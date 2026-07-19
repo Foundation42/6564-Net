@@ -289,8 +289,17 @@ pub const RxEntry = struct {
 /// a teletype — which is precisely why it lives beside the verbs
 /// instead of among them.
 pub const Dialect = enum(u2) {
-    /// Unset: no claim is checked. Legacy wiring and hand-written code
-    /// that has not opted in.
+    /// **UNSET — the absence of a declaration, not a value.** `any` is a
+    /// loader-era affordance: an entry wired before dialects existed, or
+    /// by a loader that had nothing to say. Its checks are SKIPPED, not
+    /// satisfied — it is not a top element, and narrowing it is not
+    /// attenuation, because there is nothing there to attenuate.
+    ///
+    /// Two consequences follow, and both are load-bearing for capability
+    /// transfer (A4 movement 2): a DERIVED entry may never carry `any` —
+    /// minting a capability is exactly the moment you should have to say
+    /// what it is for — and `any` is therefore scaffolding by
+    /// construction, not a hole the kernel inherits.
     any = 0,
     /// A sink that takes bytes: payload is content, nothing is framed.
     raw = 1,
