@@ -7,11 +7,31 @@
 ; is the workload that ring flag was built for: the pop is the only
 ; bookkeeping, and absorption rate is pop rate.
 ;
-; Harness contract:
-;   desc slots: 1 CQ (deep), 2 RX (cap 256, AUTO_REPOST, entries staged by
-;   the loader with cookie = cell address, tail pre-granted)
-;   RAM $2600 = expected message count
-;   near: $860 count, $868 checksum (harness reads both)
+; The contract, as directives: a deep CQ, and the cap-256 AUTO_REPOST RX
+; with 256 loader-posted landing entries (cookie = buffer address) and the
+; tail pre-granted — this program never issues RECV. The expected total is
+; staged at $2600; count and checksum read back from near $860/$868. One
+; deviation from the demo harness: its CQ held 512 records, and `.ring
+; cap` stops at 256 — harmless here, because a sink that never sends has
+; at most one unpopped record per landing buffer, so the moment a 256-CQ
+; fills the RX ring is already empty and admission rejects identically.
+;
+; The .system block is the flood. The sink is declared first: it takes
+; core 0 alone (the demo's placement) and its readbacks lead the report.
+; Spawn order is pure pre-run staging — the rings are the loader's work,
+; so deliveries can land before their owner has ever run.
+
+        .actor FanInSink(expected arg @ $2600)
+        .ring 1 cq cap=256
+        .ring 2 rx cap=256 auto_repost post=256 size=8 grant
+        .var count $860
+        .var checksum $868
+        .use "flood_sender.asm"
+
+        .system
+        sink = FanInSink(10000)
+        senders = FloodSender[10000](sink, index)
+        .endsystem
 
         .org $1000
 serve:  LSTN 1

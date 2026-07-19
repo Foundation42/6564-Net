@@ -4,6 +4,47 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sim = @import("sim6564");
 
+// The classic workloads, embedded so their verbs work from any directory.
+// Each program carries its deployment; parametric verbs hand the runner a
+// synthesized system block — the old harnesses reduced to their data.
+const classics = struct {
+    const pingpong = [_]sim.asm_run.Source{
+        .{ .name = "ping.asm", .text = @embedFile("programs/asm/ping.asm") },
+        .{ .name = "pong.asm", .text = @embedFile("programs/asm/pong.asm") },
+    };
+    const supervise = [_]sim.asm_run.Source{
+        .{ .name = "supervisor.asm", .text = @embedFile("programs/asm/supervisor.asm") },
+        .{ .name = "worker.asm", .text = @embedFile("programs/asm/worker.asm") },
+    };
+    const scatter = [_]sim.asm_run.Source{
+        .{ .name = "scatter_coord.asm", .text = @embedFile("programs/asm/scatter_coord.asm") },
+        .{ .name = "scatter_worker.asm", .text = @embedFile("programs/asm/scatter_worker.asm") },
+    };
+    const pipeline = [_]sim.asm_run.Source{
+        .{ .name = "pipe_source.asm", .text = @embedFile("programs/asm/pipe_source.asm") },
+        .{ .name = "pipe_stage.asm", .text = @embedFile("programs/asm/pipe_stage.asm") },
+        .{ .name = "pipe_sink.asm", .text = @embedFile("programs/asm/pipe_sink.asm") },
+    };
+    const ring = [_]sim.asm_run.Source{
+        .{ .name = "ring_node.asm", .text = @embedFile("programs/asm/ring_node.asm") },
+    };
+    const bigbrother = [_]sim.asm_run.Source{
+        .{ .name = "fanin_sink.asm", .text = @embedFile("programs/asm/fanin_sink.asm") },
+        .{ .name = "flood_sender.asm", .text = @embedFile("programs/asm/flood_sender.asm") },
+    };
+    const hello = [_]sim.asm_run.Source{
+        .{ .name = "hello.asm", .text = @embedFile("programs/asm/hello.asm") },
+    };
+    const mandel = [_]sim.asm_run.Source{
+        .{ .name = "mandel.asm", .text = @embedFile("programs/asm/mandel.asm") },
+    };
+    const periph = [_]sim.asm_run.Source{
+        .{ .name = "periph.asm", .text = @embedFile("programs/asm/periph.asm") },
+    };
+};
+
+const clean_fabric = sim.asm_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0 };
+
 const usage_text =
     \\sim6564 — 6564-Net reference simulator
     \\
@@ -25,8 +66,8 @@ const usage_text =
     \\      poison-pill shutdown (programs/asm/pipe_source.asm, pipe_stage.asm,
     \\      pipe_sink.asm). Defaults: seed 0x6564, loss 1024, 16 items, 2 stages.
     \\
-    \\  sim6564 scatter [seed] [loss_ppm4k] [workers] [trace]
-    \\      Fan a task out to up to 8 workers, gather squared results through
+    \\  sim6564 scatter [seed] [loss_ppm4k] [trace]
+    \\      Fan a task out to 8 workers, gather squared results through
     \\      one cap-8 RX ring; the result is the ack, stragglers are re-asked
     \\      on timer ticks (programs/asm/scatter_coord.asm, scatter_worker.asm).
     \\
@@ -143,34 +184,37 @@ pub fn main() !void {
     _ = args.next();
 
     const first = args.next() orelse
-        return sim.demo_pingpong.run(alloc, .{});
+        return sim.asm_run.runSystem(alloc, &classics.pingpong, null, .{ .loss_ppm4k = 1024 });
 
     if (std.mem.eql(u8, first, "help") or
         std.mem.eql(u8, first, "--help") or
         std.mem.eql(u8, first, "-h")) usage(0);
 
     if (std.mem.eql(u8, first, "supervise")) {
-        const trace = if (args.next()) |s| std.mem.eql(u8, s, "trace") else false;
-        return sim.demo_supervise.run(alloc, .{ .trace = trace });
+        var opts = sim.asm_run.Options{};
+        if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
+        return sim.asm_run.run(alloc, &classics.supervise, opts);
     }
 
     if (std.mem.eql(u8, first, "scatter")) {
-        var opts = sim.demo_scatter.Options{};
+        var opts = sim.asm_run.Options{};
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
-        if (args.next()) |s| opts.loss_ppm4k = @min(4096, parseOr(u16, s, "loss_ppm4k"));
-        if (args.next()) |s| opts.workers = @min(8, parseOr(u16, s, "workers"));
+        if (args.next()) |s| {
+            opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+            if (opts.loss_ppm4k == 0) opts.dup_ppm4k = 0;
+        }
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_scatter.run(alloc, opts);
+        return sim.asm_run.run(alloc, &classics.scatter, opts);
     }
 
     if (std.mem.eql(u8, first, "measure"))
         return sim.measure.run(alloc);
 
     if (std.mem.eql(u8, first, "hello")) {
-        var opts = sim.demo_hello.Options{};
+        var opts = clean_fabric;
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_hello.run(alloc, opts);
+        return sim.asm_run.run(alloc, &classics.hello, opts);
     }
 
     if (std.mem.eql(u8, first, "joe")) {
@@ -276,10 +320,10 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, first, "mandel")) {
-        var opts = sim.demo_mandel.Options{};
+        var opts = clean_fabric;
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_mandel.run(alloc, opts);
+        return sim.asm_run.run(alloc, &classics.mandel, opts);
     }
 
     if (std.mem.eql(u8, first, "dies")) {
@@ -344,18 +388,31 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, first, "periph")) {
-        var opts = sim.demo_periph.Options{};
+        var opts = clean_fabric;
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_periph.run(alloc, opts);
+        return sim.asm_run.run(alloc, &classics.periph, opts);
     }
 
     if (std.mem.eql(u8, first, "bigbrother")) {
-        var opts = sim.demo_bigbrother.Options{};
-        if (args.next()) |s| opts.senders = @min(10_000, parseOr(u64, s, "senders"));
-        if (args.next()) |s| opts.loss_ppm4k = @min(4096, parseOr(u16, s, "loss_ppm4k"));
+        var senders: u64 = 10_000;
+        var opts = clean_fabric;
+        if (args.next()) |s| senders = @max(1, @min(10_000, parseOr(u64, s, "senders")));
+        if (args.next()) |s| {
+            opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+            if (opts.loss_ppm4k != 0) opts.dup_ppm4k = 128;
+        }
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_bigbrother.run(alloc, opts);
+        const sys = try sim.asm_run.floodSystem(alloc, senders);
+        defer alloc.free(sys);
+        var o = try sim.asm_run.simulateSystem(alloc, &classics.bigbrother, sys, opts);
+        defer o.deinit();
+        try sim.joe_run.report(&o, opts, "asm");
+        try std.io.getStdOut().writer().print(
+            "  fan-in: {d} absorbed — {d} cycles per message\n",
+            .{ o.varOf("sink", "count") orelse 0, o.cycles / senders },
+        );
+        return;
     }
 
     if (std.mem.eql(u8, first, "forkjoin")) {
@@ -367,32 +424,57 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, first, "ring")) {
-        var opts = sim.demo_ring.Options{};
-        if (args.next()) |s| opts.nodes = @min(200, parseOr(u16, s, "nodes"));
-        if (args.next()) |s| opts.laps = @min(1000, parseOr(u64, s, "laps"));
+        var nodes: u16 = 64;
+        var laps: u64 = 100;
+        var opts = sim.asm_run.Options{};
+        if (args.next()) |s| nodes = @max(2, @min(200, parseOr(u16, s, "nodes")));
+        if (args.next()) |s| laps = @max(1, @min(1000, parseOr(u64, s, "laps")));
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_ring.run(alloc, opts);
+        const sys = try sim.asm_run.ringSystem(alloc, nodes, laps);
+        defer alloc.free(sys);
+        var o = try sim.asm_run.simulateSystem(alloc, &classics.ring, sys, opts);
+        defer o.deinit();
+        try sim.joe_run.report(&o, opts, "asm");
+        const passes = laps * nodes;
+        try std.io.getStdOut().writer().print(
+            "  Armstrong's ring: {d} passes — {d} cycles per pass\n",
+            .{ passes, o.cycles / passes },
+        );
+        return;
     }
 
     if (std.mem.eql(u8, first, "pipeline")) {
-        var opts = sim.demo_pipeline.Options{};
+        var items: u64 = 16;
+        var stages: u16 = 2;
+        var opts = sim.asm_run.Options{};
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
-        if (args.next()) |s| opts.loss_ppm4k = @min(4096, parseOr(u16, s, "loss_ppm4k"));
-        if (args.next()) |s| opts.items = @min(200, parseOr(u64, s, "items"));
-        if (args.next()) |s| opts.stages = @min(8, parseOr(u16, s, "stages"));
+        if (args.next()) |s| {
+            opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+            if (opts.loss_ppm4k == 0) opts.dup_ppm4k = 0;
+        }
+        if (args.next()) |s| items = @max(1, @min(200, parseOr(u64, s, "items")));
+        if (args.next()) |s| stages = @min(8, parseOr(u16, s, "stages"));
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_pipeline.run(alloc, opts);
+        const sys = try sim.asm_run.pipelineSystem(alloc, items, stages);
+        defer alloc.free(sys);
+        return sim.asm_run.runSystem(alloc, &classics.pipeline, sys, opts);
     }
 
     // Everything else is the ping-pong demo; a bare first argument is the
     // seed (back-compatible with the original positional CLI).
-    var opts = sim.demo_pingpong.Options{};
+    var rounds: u64 = 8;
+    var opts = sim.asm_run.Options{};
     if (!std.mem.eql(u8, first, "pingpong"))
         opts.seed = parseOr(u64, first, "seed")
     else if (args.next()) |s|
         opts.seed = parseOr(u64, s, "seed");
-    if (args.next()) |s| opts.loss_ppm4k = @min(4096, parseOr(u16, s, "loss_ppm4k"));
-    if (args.next()) |s| opts.rounds = @min(100, parseOr(u64, s, "rounds"));
+    if (args.next()) |s| {
+        opts.loss_ppm4k = @min(4095, parseOr(u16, s, "loss_ppm4k"));
+        if (opts.loss_ppm4k == 0) opts.dup_ppm4k = 0;
+    }
+    if (args.next()) |s| rounds = @max(1, @min(100, parseOr(u64, s, "rounds")));
     if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-    try sim.demo_pingpong.run(alloc, opts);
+    const sys = try std.fmt.allocPrint(alloc, "p = Ping(q, {d}) on 0\nq = Pong(p) on 1\n", .{rounds});
+    defer alloc.free(sys);
+    try sim.asm_run.runSystem(alloc, &classics.pingpong, sys, opts);
 }

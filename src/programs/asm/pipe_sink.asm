@@ -9,12 +9,26 @@
 ; quiesces around us. No timer chain here — nothing keeps us artificially
 ; awake.
 ;
-; Harness contract:
-;   PTT 2 → upstream ack ring
-;   desc slots: 1 CQ, 2 item RX (buf $2200, cookie $2A), 4 ack SQ
-;   RAM: $2600 = K, $2608 = n (stage count)
-;   near: $880 E (items consumed; K+1 = complete), $8C0 checksum of data
-;         vals, $8C8 verification errors (harness reads all three)
+; The contract, as directives the loader executes (src/asm_run.zig): the
+; upstream ack capability pinned at PTT 2 (its window constant is baked
+; into the ack SQE below; `rx=3` names the last stage's ack ring), and
+; the rings pinned where the code stages their entries — the cap-2
+; AUTO_REPOST item RX at slot 2, storage $2A00, and the ack SQ at
+; $2440. No timer ring and no black hole: nothing keeps us artificially
+; awake. K and the stage count n arrive through arguments at
+; $2600/$2608; the landing and ack buffers are reserved at $2200.
+; Consumed count ($880; K+1 = complete), the checksum of data vals
+; ($8C0) and verification errors ($8C8) read back into the report —
+; they are what the demo verifies.
+
+        .actor Sink(up cap = 2 rx=3, k arg @ $2600, n arg @ $2608)
+        .ring 1 cq cap=32
+        .ring 2 rx base=$2A00 cap=2 auto_repost
+        .ring 4 sq base=$2440 cap=1
+        .reserve $2200 $100
+        .var consumed $880
+        .var checksum $8C0
+        .var verify_errors $8C8
 
         .org $1000
         LDA #0

@@ -459,27 +459,85 @@ test "determinism: identical seeds produce identical runs" {
     try testing.expectEqualDeep(results[0], results[1]);
 }
 
+// ── The generic .asm runner: the retired harnesses' scenarios, run from
+//    the programs' own contracts (src/asm_run.zig). Each program carries
+//    its deployment; tests that need another shape hand simulateSystem a
+//    paragraph of system text — the harness reduced to its data. ──
+
+const asm_run = @import("asm_run.zig");
+
+const asm_src = struct {
+    const supervisor = [_]asm_run.Source{
+        .{ .name = "supervisor.asm", .text = @embedFile("programs/asm/supervisor.asm") },
+        .{ .name = "worker.asm", .text = @embedFile("programs/asm/worker.asm") },
+    };
+    const ring = [_]asm_run.Source{
+        .{ .name = "ring_node.asm", .text = @embedFile("programs/asm/ring_node.asm") },
+    };
+    const bigbrother = [_]asm_run.Source{
+        .{ .name = "fanin_sink.asm", .text = @embedFile("programs/asm/fanin_sink.asm") },
+        .{ .name = "flood_sender.asm", .text = @embedFile("programs/asm/flood_sender.asm") },
+    };
+    const scatter = [_]asm_run.Source{
+        .{ .name = "scatter_coord.asm", .text = @embedFile("programs/asm/scatter_coord.asm") },
+        .{ .name = "scatter_worker.asm", .text = @embedFile("programs/asm/scatter_worker.asm") },
+    };
+    const pipeline = [_]asm_run.Source{
+        .{ .name = "pipe_source.asm", .text = @embedFile("programs/asm/pipe_source.asm") },
+        .{ .name = "pipe_stage.asm", .text = @embedFile("programs/asm/pipe_stage.asm") },
+        .{ .name = "pipe_sink.asm", .text = @embedFile("programs/asm/pipe_sink.asm") },
+    };
+    const hello = [_]asm_run.Source{
+        .{ .name = "hello.asm", .text = @embedFile("programs/asm/hello.asm") },
+    };
+    const periph = [_]asm_run.Source{
+        .{ .name = "periph.asm", .text = @embedFile("programs/asm/periph.asm") },
+    };
+    const mandel = [_]asm_run.Source{
+        .{ .name = "mandel.asm", .text = @embedFile("programs/asm/mandel.asm") },
+    };
+};
+
+const clean_fabric = asm_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0 };
+const ringSystem = asm_run.ringSystem;
+const floodSystem = asm_run.floodSystem;
+
+fn ringFinishers(o: *const asm_run.Outcome) struct { count: usize, node0: bool } {
+    var count: usize = 0;
+    var node0 = false;
+    for (o.instances) |inst| {
+        for (inst.vars) |v| {
+            if (std.mem.eql(u8, v.name, "finisher") and v.value != 0) {
+                count += 1;
+                if (std.mem.eql(u8, inst.name, "n0")) node0 = true;
+            }
+        }
+    }
+    return .{ .count = count, .node0 = node0 };
+}
+
 // ── Phase 3: supervision ─────────────────────────────────────────────────
 
 test "supervision tree: restarts, budgets, watchdog, accumulated work" {
-    const o = try @import("demo_supervise.zig").simulate(testing.allocator, false);
+    var o = try asm_run.simulate(testing.allocator, &asm_src.supervisor, .{});
+    defer o.deinit();
     // Reliable workers met quota and exited clean.
-    try testing.expectEqual(@as(u64, 12), o.progress[1]);
-    try testing.expectEqual(@as(u64, 12), o.progress[3]);
+    try testing.expectEqual(@as(u64, 12), o.varOf("sup", "p1").?);
+    try testing.expectEqual(@as(u64, 12), o.varOf("sup", "p3").?);
     // The crasher produced 5 items per incarnation across 4 lives (initial +
     // 3 restarts) — its RAM progress cell survived every SPWN.
-    try testing.expectEqual(@as(u64, 20), o.progress[2]);
+    try testing.expectEqual(@as(u64, 20), o.varOf("sup", "p2").?);
     // The hanger produced 3 items per incarnation across 3 lives (initial +
     // 2 restarts); each life ended in a watchdog trip, not a BRK.
-    try testing.expectEqual(@as(u64, 9), o.progress[4]);
-    try testing.expectEqual(@as(u64, 3), o.watchdog_trips);
-    try testing.expectEqual(machine.Fault.watchdog, o.hanger_fault);
+    try testing.expectEqual(@as(u64, 9), o.varOf("sup", "p4").?);
+    try testing.expectEqual(@as(u64, 3), o.stats.watchdog_trips);
+    try testing.expectEqual(machine.Fault.watchdog, o.instance("w4").?.fault);
     // Total restarts across both budgets.
-    try testing.expectEqual(@as(u64, 5), o.restarts);
-    try testing.expect(o.supervisor_halted);
+    try testing.expectEqual(@as(u64, 5), o.varOf("sup", "restarts").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("sup").?.state);
     // Abandoned honestly: both unreliable workers' last lives stay faulted.
-    try testing.expectEqual(machine.CtxState.faulted, o.crasher_state);
-    try testing.expectEqual(machine.CtxState.faulted, o.hanger_state);
+    try testing.expectEqual(machine.CtxState.faulted, o.instance("w2").?.state);
+    try testing.expectEqual(machine.CtxState.faulted, o.instance("w4").?.state);
     try testing.expectEqual(machine.StopReason.faulted, o.reason);
 }
 
@@ -2049,22 +2107,52 @@ test "joe: fork-join — replication, groups, for; the tree is the reliability" 
     }
 }
 
+const mandel_cols = 64;
+const mandel_rows = 22;
+
+/// The independent host-f64 computation one mandel row must match.
+fn mandelOracleRow(alloc: std.mem.Allocator, row: usize) ![]u8 {
+    const pal = " .,:;~=+xoXO#%$&@";
+    const dx: f64 = 2.5 / 63.0;
+    const dy: f64 = 2.2 / 21.0;
+    var line = try alloc.alloc(u8, mandel_cols + 1);
+    var cy: f64 = 1.1;
+    for (0..row) |_| cy = cy - dy;
+    var cx: f64 = -2.0;
+    for (0..mandel_cols) |c| {
+        var zx: f64 = 0.0;
+        var zy: f64 = 0.0;
+        var n: usize = 0;
+        while (true) {
+            const zx2 = zx * zx;
+            const zy2 = zy * zy;
+            if (!(zy2 + zx2 < 4.0)) break;
+            const t = zx * zy;
+            zy = (t + t) + cy;
+            zx = (zx2 - zy2) + cx;
+            n += 1;
+            if (n == 16) break;
+        }
+        line[c] = pal[n];
+        cx = cx + dx;
+    }
+    line[mandel_cols] = '\n';
+    return line;
+}
+
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {
     // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
     // FSUB/FCMP results, every one of which must round exactly as the
     // host's IEEE doubles do, or a character somewhere is wrong.
-    const demo_mandel = @import("demo_mandel.zig");
-    const o = try demo_mandel.simulate(testing.allocator, .{});
-    defer testing.allocator.free(o.text);
+    var o = try asm_run.simulate(testing.allocator, &asm_src.mandel, clean_fabric);
+    defer o.deinit();
     try testing.expectEqual(machine.StopReason.all_halted, o.reason);
-    try testing.expectEqual(
-        @as(usize, (demo_mandel.cols + 1) * demo_mandel.rows),
-        o.text.len,
-    );
-    for (0..demo_mandel.rows) |r| {
-        const expected = try demo_mandel.oracleRow(testing.allocator, r);
+    const text = o.console.?;
+    try testing.expectEqual(@as(usize, (mandel_cols + 1) * mandel_rows), text.len);
+    for (0..mandel_rows) |r| {
+        const expected = try mandelOracleRow(testing.allocator, r);
         defer testing.allocator.free(expected);
-        const got = o.text[r * (demo_mandel.cols + 1) ..][0 .. demo_mandel.cols + 1];
+        const got = text[r * (mandel_cols + 1) ..][0 .. mandel_cols + 1];
         try testing.expectEqualStrings(expected, got);
     }
 }
@@ -2210,86 +2298,90 @@ test "SPWN of self or a nonexistent context faults the spawner" {
 // ── Phase 3: pipeline dataflow ───────────────────────────────────────────
 
 test "pipeline: every item transformed, delivered, verified across a lossy fabric" {
-    const o = try @import("demo_pipeline.zig").simulate(testing.allocator, .{
-        .seed = 0x6564,
-        .loss_ppm4k = 1024,
-        .items = 12,
-        .stages = 2,
-    });
-    try testing.expectEqual(@as(u64, 13), o.consumed); // 12 items + DONE
-    try testing.expectEqual(@as(u64, 0), o.verify_errors);
-    try testing.expectEqual(o.expected_checksum, o.checksum);
-    try testing.expect(o.source_halted);
-    try testing.expect(o.stages_done);
+    const sys = try asm_run.pipelineSystem(testing.allocator, 12, 2);
+    defer testing.allocator.free(sys);
+    var o = try asm_run.simulateSystem(testing.allocator, &asm_src.pipeline, sys, .{ .loss_ppm4k = 1024 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 13), o.varOf("sink", "consumed").?); // 12 items + DONE
+    try testing.expectEqual(@as(u64, 0), o.varOf("sink", "verify_errors").?);
+    // Σ ((s+1)·2^n − 1): 2 stages of double-and-decrement over 12 items.
+    try testing.expectEqual(@as(u64, 4 * (12 * 13 / 2) - 12), o.varOf("sink", "checksum").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("source").?.state);
+    // Both stages reached lame duck — the poison pill made it through.
+    try testing.expectEqual(@as(u64, 2), o.varOf("s1", "phase").?);
+    try testing.expectEqual(@as(u64, 2), o.varOf("s2", "phase").?);
     // Quiesced, not timed out: the lame-duck shutdown converged.
     try testing.expectEqual(machine.StopReason.deadlock, o.reason);
     try testing.expect(o.stats.lost > 0); // the fabric really was hostile
 }
 
 test "pipeline: zero stages (source direct to sink)" {
-    const o = try @import("demo_pipeline.zig").simulate(testing.allocator, .{
+    const sys = try asm_run.pipelineSystem(testing.allocator, 8, 0);
+    defer testing.allocator.free(sys);
+    var o = try asm_run.simulateSystem(testing.allocator, &asm_src.pipeline, sys, .{
         .seed = 7,
         .loss_ppm4k = 512,
-        .items = 8,
-        .stages = 0,
     });
-    try testing.expectEqual(@as(u64, 9), o.consumed);
-    try testing.expectEqual(@as(u64, 0), o.verify_errors);
-    try testing.expectEqual(o.expected_checksum, o.checksum);
-    try testing.expect(o.source_halted);
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 9), o.varOf("sink", "consumed").?);
+    try testing.expectEqual(@as(u64, 0), o.varOf("sink", "verify_errors").?);
+    try testing.expectEqual(@as(u64, (8 * 9 / 2) - 8), o.varOf("sink", "checksum").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("source").?.state);
     try testing.expectEqual(machine.StopReason.deadlock, o.reason);
 }
 
 // ── Phase 3: scatter-gather ──────────────────────────────────────────────
+// The converted contract bakes the demo's full 8-worker shape (the staged
+// fan-out chain is part of the program's contract now); Σ(i+3)² for
+// i=1..8 is 492.
 
 test "scatter-gather: all results gathered and verified over a lossy fabric" {
-    const o = try @import("demo_scatter.zig").simulate(testing.allocator, .{
-        .seed = 0x6564,
-        .loss_ppm4k = 1024,
-        .workers = 6,
-    });
-    try testing.expectEqual(@as(u64, 6), o.gathered);
-    try testing.expectEqual(o.expected_sum, o.sum);
-    try testing.expect(o.coordinator_halted);
+    var o = try asm_run.simulate(testing.allocator, &asm_src.scatter, .{ .loss_ppm4k = 1024 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 8), o.varOf("c", "gathered").?);
+    try testing.expectEqual(@as(u64, 492), o.varOf("c", "sum").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("c").?.state);
     try testing.expectEqual(machine.StopReason.deadlock, o.reason); // quiesced
     // The fabric was hostile and the retry loop actually worked for a living.
     try testing.expect(o.stats.lost > 0);
-    try testing.expect(o.scatter_sends >= 6);
+    try testing.expect(o.varOf("c", "scatter_sends").? >= 8);
 }
 
 test "scatter-gather: full fan-out saturates the cap-8 fan-in ring" {
-    const o = try @import("demo_scatter.zig").simulate(testing.allocator, .{
+    var o = try asm_run.simulate(testing.allocator, &asm_src.scatter, .{
         .seed = 1,
         .loss_ppm4k = 0,
-        .workers = 8,
+        .dup_ppm4k = 0,
     });
-    try testing.expectEqual(@as(u64, 8), o.gathered);
-    try testing.expectEqual(o.expected_sum, o.sum);
-    try testing.expect(o.coordinator_halted);
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 8), o.varOf("c", "gathered").?);
+    try testing.expectEqual(@as(u64, 492), o.varOf("c", "sum").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("c").?.state);
 }
 
 // ── Armstrong's ring (Programming Erlang, ch. 12) ────────────────────────
 
 test "armstrong ring: N x M passes, message comes home to node 0" {
-    const o = try @import("demo_ring.zig").simulate(testing.allocator, .{
-        .nodes = 8,
-        .laps = 4,
-    });
-    try testing.expectEqual(@as(u64, 32), o.passes);
-    try testing.expect(o.exactly_one_finisher);
-    try testing.expect(o.finisher_is_node0);
+    const sys = try ringSystem(testing.allocator, 8, 4);
+    defer testing.allocator.free(sys);
+    var o = try asm_run.simulateSystem(testing.allocator, &asm_src.ring, sys, .{});
+    defer o.deinit();
+    const fin = ringFinishers(&o);
+    try testing.expectEqual(@as(usize, 1), fin.count);
+    try testing.expect(fin.node0);
     try testing.expectEqual(machine.StopReason.deadlock, o.reason); // quiesced
 }
 
 test "armstrong ring: steady-state cost per pass stays two-digit" {
-    const o = try @import("demo_ring.zig").simulate(testing.allocator, .{
-        .nodes = 64,
-        .laps = 20,
-    });
-    try testing.expect(o.exactly_one_finisher and o.finisher_is_node0);
+    const sys = try ringSystem(testing.allocator, 64, 20);
+    defer testing.allocator.free(sys);
+    var o = try asm_run.simulateSystem(testing.allocator, &asm_src.ring, sys, .{});
+    defer o.deinit();
+    const fin = ringFinishers(&o);
+    try testing.expect(fin.count == 1 and fin.node0);
     // The §2.2 claim, as a regression guard: actor-to-actor messaging on one
     // core, scheduler included, stays under 100 cycles per pass.
-    try testing.expect(o.cycles_per_pass < 100);
+    try testing.expect(o.cycles / (64 * 20) < 100);
 }
 
 // ── MAC: one-byte vectored calls (pre-normative; MAC & chains sketch) ────
@@ -2451,13 +2543,13 @@ test "AUTO_REPOST on a capacity-1 ring faults: zero-width validity window" {
 }
 
 test "armstrong ring at full scale: 200 nodes, layout stripes stay disjoint" {
-    const o = try @import("demo_ring.zig").simulate(testing.allocator, .{
-        .nodes = 200,
-        .laps = 10,
-    });
-    try testing.expectEqual(@as(u64, 2000), o.passes);
-    try testing.expect(o.exactly_one_finisher and o.finisher_is_node0);
-    try testing.expect(o.cycles_per_pass < 100);
+    const sys = try ringSystem(testing.allocator, 200, 10);
+    defer testing.allocator.free(sys);
+    var o = try asm_run.simulateSystem(testing.allocator, &asm_src.ring, sys, .{});
+    defer o.deinit();
+    const fin = ringFinishers(&o);
+    try testing.expect(fin.count == 1 and fin.node0);
+    try testing.expect(o.cycles / 2000 < 100);
 }
 
 // ── LINK chains and AUTO_REARM (sketch §3.1, §3.2) ───────────────────────
@@ -2768,25 +2860,25 @@ test "big brother: 600 senders saturate the ring; deferred repost keeps sums exa
     // original pop-time-immediate AUTO_REPOST grant corrupted checksums in
     // exactly this regime (payload overwritten between pop and read); the
     // deferred grant must keep every value intact.
-    const o = try @import("demo_bigbrother.zig").simulate(testing.allocator, .{
-        .senders = 600,
-        .loss_ppm4k = 0,
-    });
+    const sys = try floodSystem(testing.allocator, 600);
+    defer testing.allocator.free(sys);
+    var o = try asm_run.simulateSystem(testing.allocator, &asm_src.bigbrother, sys, clean_fabric);
+    defer o.deinit();
     try testing.expectEqual(machine.StopReason.all_halted, o.reason);
-    try testing.expectEqual(@as(u64, 600), o.received);
-    try testing.expectEqual(o.expected_sum, o.sum);
+    try testing.expectEqual(@as(u64, 600), o.varOf("sink", "count").?);
+    try testing.expectEqual(@as(u64, 600 * 601 / 2), o.varOf("sink", "checksum").?);
     try testing.expect(o.stats.rejects > 0); // saturation really happened
     try testing.expectEqual(@as(u64, 0), o.stats.cq_overflows);
 }
 
 test "big brother: sub-saturation flood delivers first time" {
-    const o = try @import("demo_bigbrother.zig").simulate(testing.allocator, .{
-        .senders = 200,
-        .loss_ppm4k = 0,
-    });
+    const sys = try floodSystem(testing.allocator, 200);
+    defer testing.allocator.free(sys);
+    var o = try asm_run.simulateSystem(testing.allocator, &asm_src.bigbrother, sys, clean_fabric);
+    defer o.deinit();
     try testing.expectEqual(machine.StopReason.all_halted, o.reason);
-    try testing.expectEqual(@as(u64, 200), o.received);
-    try testing.expectEqual(o.expected_sum, o.sum);
+    try testing.expectEqual(@as(u64, 200), o.varOf("sink", "count").?);
+    try testing.expectEqual(@as(u64, 200 * 201 / 2), o.varOf("sink", "checksum").?);
 }
 
 test "fork-join matrix at full scale: 8x125, forked, relayed, joined" {
@@ -2804,40 +2896,45 @@ test "fork-join matrix at full scale: 8x125, forked, relayed, joined" {
 // ── The peripheral row (§7) ──────────────────────────────────────────────
 
 test "hello: the console device hears the machine's first words" {
-    const o = try @import("demo_hello.zig").simulate(testing.allocator, .{});
-    defer testing.allocator.free(o.text);
+    var o = try asm_run.simulate(testing.allocator, &asm_src.hello, clean_fabric);
+    defer o.deinit();
     try testing.expectEqual(machine.StopReason.all_halted, o.reason);
-    try testing.expectEqualStrings("HELLO, WORLD - THE 6564 SPEAKS.\n", o.text);
+    try testing.expectEqualStrings("HELLO, WORLD - THE 6564 SPEAKS.\n", o.console.?);
     try testing.expectEqual(@as(u64, 1), o.stats.dev_deliveries);
     try testing.expectEqual(@as(u64, 0), o.stats.dev_replies);
 }
 
 test "peripheral row: console, entropy, rtc and block all answer" {
-    const o = try @import("demo_periph.zig").simulate(testing.allocator, .{});
-    defer testing.allocator.free(o.text);
+    var o = try asm_run.simulate(testing.allocator, &asm_src.periph, clean_fabric);
+    defer o.deinit();
     try testing.expectEqual(machine.StopReason.all_halted, o.reason);
-    try testing.expect(o.block_ok);
-    try testing.expect(std.mem.startsWith(u8, o.text, "6564 PERIPHERAL BUS CHECK\n"));
-    try testing.expect(std.mem.indexOf(u8, o.text, "ENTROPY ") != null);
-    try testing.expect(std.mem.indexOf(u8, o.text, "CYCLES ") != null);
+    const text = o.console.?;
+    try testing.expect(std.mem.indexOf(u8, text, "BLOCK OK") != null);
+    try testing.expect(std.mem.startsWith(u8, text, "6564 PERIPHERAL BUS CHECK\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "ENTROPY ") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "CYCLES ") != null);
     // The program's RTC arithmetic must agree with the fabric's clock:
     // elapsed is bounded by the whole run.
-    try testing.expect(o.elapsed > 0 and o.elapsed < o.cycles);
+    const elapsed = o.varOf("p", "elapsed").?;
+    try testing.expect(elapsed > 0 and elapsed < o.cycles);
     try testing.expectEqual(@as(u64, 4), o.stats.dev_replies); // rtc x2, entropy, block read
     try testing.expectEqual(@as(u64, 0), o.stats.lost);
 }
 
 test "peripheral row is deterministic: same seed, same transcript" {
-    const a = try @import("demo_periph.zig").simulate(testing.allocator, .{ .seed = 99 });
-    defer testing.allocator.free(a.text);
-    const b = try @import("demo_periph.zig").simulate(testing.allocator, .{ .seed = 99 });
-    defer testing.allocator.free(b.text);
-    try testing.expectEqualStrings(a.text, b.text);
+    var opts = clean_fabric;
+    opts.seed = 99;
+    var a = try asm_run.simulate(testing.allocator, &asm_src.periph, opts);
+    defer a.deinit();
+    var b = try asm_run.simulate(testing.allocator, &asm_src.periph, opts);
+    defer b.deinit();
+    try testing.expectEqualStrings(a.console.?, b.console.?);
     try testing.expectEqual(a.cycles, b.cycles);
     // …and a different seed draws different entropy.
-    const c = try @import("demo_periph.zig").simulate(testing.allocator, .{ .seed = 100 });
-    defer testing.allocator.free(c.text);
-    try testing.expect(!std.mem.eql(u8, a.text, c.text));
+    opts.seed = 100;
+    var c = try asm_run.simulate(testing.allocator, &asm_src.periph, opts);
+    defer c.deinit();
+    try testing.expect(!std.mem.eql(u8, a.console.?, c.console.?));
 }
 
 const dev_token_probe_src =

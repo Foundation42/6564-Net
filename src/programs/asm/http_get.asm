@@ -8,11 +8,31 @@
 ; console ack is awaited), ask again. An EMPTY reply means "nothing yet";
 ; a REJECTED recv request means EOF — the ack vocabulary is the framing.
 ;
-; Harness contract:
-;   PTT 0 console  1 net       desc: 0 SQ ($2400), 1 CQ, 2 RX ($2100)
-;   $2518.. hostname           $2608.. request text
-;   near $8A8 = port           $8B0 = open req len   $8B8 = send req len
-;   landing buffers $2200/$2300 (cap 240), staged here
+; The contract, as directives: two pinned capabilities (the SQEs bake
+; their window constants — console at slot 0, net at slot 1), `reply`
+; wiring the net device's own PTT slot 0 back at our RX ring, the rings
+; the code addresses at their pinned bases, and the request constants
+; staged in the near page: port 80, then the open and send lengths —
+; 24 + 11 hostname bytes, 8 + 90 request bytes, each text sitting at
+; that offset inside its cell. The hostname and the GET itself are
+; data at the bottom of this file, at the addresses the code bakes.
+; The RX landing buffers are the code's own business (lines below
+; stage them before RECV); the connection id at near $858 reads back
+; into the report.
+
+        .actor HttpGet(con cap = 0, net cap = 1 reply)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq cap=16
+        .ring 2 rx base=$2100 cap=2 auto_repost
+        .reserve $2200 $600
+        .stage $8A8 80, 35, 98
+        .var conn $858
+
+        .system
+        w = HttpGet(con, net)
+        con = Console()
+        net = Net()
+        .endsystem
 
         .org $1000
         ; two landing buffers (cap-2 AUTO_REPOST ring)
@@ -191,3 +211,25 @@ gr2:    LDA #0
         RTS
 
 fail:   BRK
+
+; ── the deployment's text ────────────────────────────────────────────────
+; The hostname lands 24 bytes into the open request cell ($2500), the
+; GET 8 bytes into the send cell ($2600) — the offsets the staged
+; lengths at $8B0/$8B8 account for. (The demo harness stages these
+; same bytes by hand; here they are simply data.)
+
+        .org $2518
+        .ascii "example.com"
+
+        .org $2608
+        .ascii "GET / HTTP/1.1"
+        .byte 13, 10
+        .ascii "Host: example.com"
+        .byte 13, 10
+        .ascii "User-Agent: sim6564"
+        .byte 13, 10
+        .ascii "Accept: */*"
+        .byte 13, 10
+        .ascii "Connection: close"
+        .byte 13, 10
+        .byte 13, 10

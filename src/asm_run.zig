@@ -108,7 +108,70 @@ fn entrySize(kind: anytype) u16 {
     };
 }
 
+/// N ring nodes on one core, the fuse lit at n0 — the classic harness's
+/// parametric shape as system text. Caller owns the result.
+pub fn ringSystem(alloc: std.mem.Allocator, nodes: usize, laps: u64) ![]u8 {
+    var text = std.ArrayList(u8).init(alloc);
+    errdefer text.deinit();
+    try text.writer().print("n0 = RingNode(n1, {d}) on 0\n", .{laps * @as(u64, @intCast(nodes))});
+    for (1..nodes) |i| {
+        try text.writer().print("n{d} = RingNode(n{d}, 0) on 0\n", .{ i, (i + 1) % nodes });
+    }
+    return text.toOwnedSlice();
+}
+
+/// One sink, N flood senders — the fan-in stress shape as system text.
+pub fn floodSystem(alloc: std.mem.Allocator, senders: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc,
+        \\sink = FanInSink({d})
+        \\senders = FloodSender[{d}](sink, index)
+        \\
+    , .{ senders, senders });
+}
+
+/// source → N transform stages → sink, one core per node.
+pub fn pipelineSystem(alloc: std.mem.Allocator, items: u64, stages: u16) ![]u8 {
+    var text = std.ArrayList(u8).init(alloc);
+    errdefer text.deinit();
+    const w = text.writer();
+    if (stages == 0) {
+        try w.print("source = Source(sink, {d}) on 0\n", .{items});
+        try w.print("sink = Sink(source, {d}, 0) on 1\n", .{items});
+    } else {
+        try w.print("source = Source(s1, {d}) on 0\n", .{items});
+        for (1..@as(usize, stages) + 1) |i| {
+            if (i == stages) {
+                try w.print("s{d} = Stage(sink, ", .{i});
+            } else {
+                try w.print("s{d} = Stage(s{d}, ", .{ i, i + 1 });
+            }
+            if (i == 1) {
+                try w.print("source, {d}) on {d}\n", .{ items, i });
+            } else {
+                try w.print("s{d}, {d}) on {d}\n", .{ i - 1, items, i });
+            }
+        }
+        try w.print("sink = Sink(s{d}, {d}, {d}) on {d}\n", .{
+            stages, items, stages, @as(usize, stages) + 1,
+        });
+    }
+    return text.toOwnedSlice();
+}
+
 pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options) !Outcome {
+    return simulateSystem(alloc, sources, null, opts);
+}
+
+/// Like simulate(), but `override` (joe system-block grammar, braces not
+/// included) replaces the lead source's .system block — how tests and
+/// parametric CLI verbs run one program at many shapes: the contract
+/// stays in the file, the deployment is the caller's data.
+pub fn simulateSystem(
+    alloc: std.mem.Allocator,
+    sources: []const Source,
+    override: ?[]const u8,
+    opts: Options,
+) !Outcome {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
@@ -135,7 +198,7 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
 
     // ── The deployment: the lead source's .system block, read by joe's
     //    planner — one grammar for the whole machine. ──
-    const sys_text = actors.items[0].out.meta.system orelse
+    const sys_text = override orelse actors.items[0].out.meta.system orelse
         return fail("{s}: no .system block to run", .{actors.items[0].src});
     const wrapped = try std.fmt.allocPrint(scratch, "system {{\n{s}}}\n", .{sys_text});
     var diag = joe.Diagnostic{};
@@ -701,6 +764,12 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
 
 pub fn run(alloc: std.mem.Allocator, sources: []const Source, opts: Options) !void {
     var o = try simulate(alloc, sources, opts);
+    defer o.deinit();
+    try joe_run.report(&o, opts, "asm");
+}
+
+pub fn runSystem(alloc: std.mem.Allocator, sources: []const Source, override: ?[]const u8, opts: Options) !void {
+    var o = try simulateSystem(alloc, sources, override, opts);
     defer o.deinit();
     try joe_run.report(&o, opts, "asm");
 }

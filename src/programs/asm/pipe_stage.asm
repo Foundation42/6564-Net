@@ -16,15 +16,33 @@
 ; our clock dies and the machine can quiesce around us, exactly like the
 ; immortal sink.
 ;
-; Harness contract:
-;   PTT 0 → downstream item ring    PTT 1 → black hole (timer)
-;   PTT 2 → upstream ack ring
-;   desc slots: 0 item SQ, 1 CQ, 2 item RX (buf $2200, cookie $2A),
-;               3 ack RX (buf $2240, cookie $4C), 4 ack SQ
-;   RAM: $2600 = K
-;   near: $880 E (next expected seq), $888 hold_full, $890 hold_val,
-;         $898 hold_seq, $8A0 fwd_busy, $8D0 retransmissions (harness reads),
-;         $8B8 phase: 0 working, 1 DONE in flight, 2 lame duck (harness reads)
+; The contract, as directives the loader executes (src/asm_run.zig):
+; downstream items pinned at PTT 0, the black-hole timer at PTT 1,
+; upstream acks at PTT 2 (all three window constants are baked into the
+; SQEs below; the period is the fabric's send_timeout), and the rings
+; pinned where the code stages their entries — item SQ $2400, ack SQ
+; $2440, timer SQ $2480, and the two cap-2 AUTO_REPOST RX rings that
+; make a hop a hop: items land on slot 2 ($2A00), acks on slot 3
+; ($2A40), so a caller's `rx=` names which side of us it wants. K
+; arrives through the k argument at $2600; the landing and transmit
+; buffers are reserved at $2200. Retransmissions ($8D0) and the phase
+; cell ($8B8: 0 working, 1 DONE in flight, 2 lame duck) read back into
+; the report.
+;
+; Near cells: $880 E (next expected seq), $888 hold_full, $890
+; hold_val, $898 hold_seq, $8A0 fwd_busy.
+
+        .actor Stage(down cap = 0 rx=2, up cap = 2 rx=3, k arg @ $2600)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq cap=32
+        .ring 2 rx base=$2A00 cap=2 auto_repost
+        .ring 3 rx base=$2A40 cap=2 auto_repost
+        .ring 4 sq base=$2440 cap=1
+        .ring 5 sq base=$2480 cap=1
+        .timer = 1 period=2500
+        .reserve $2200 $100
+        .var retransmissions $8D0
+        .var phase $8B8
 
         .org $1000
         LDA #0

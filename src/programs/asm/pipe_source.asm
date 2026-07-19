@@ -4,12 +4,42 @@
 ; (spec §6.3). Transport acks are ignored — only the downstream ack counts.
 ; Halts once DONE itself is acked.
 ;
-; Harness contract:
-;   PTT 0 → downstream item ring    PTT 1 → black hole (timer)
-;   desc slots: 0 item SQ, 1 CQ, 3 ack RX (buf $2240, cookie $4C)
-;   RAM: $2600 = K
-;   near: $880 K+1, $888 next_seq, $890 fwd_busy, $898 fwd_seq,
-;         $818 retransmissions (harness reads)
+; The contract, as directives the loader executes (src/asm_run.zig): the
+; downstream item capability pinned at PTT 0 and the black-hole timer at
+; PTT 1 (both window constants are baked into the SQEs below; the period
+; is the fabric's send_timeout), and the rings pinned where the code
+; stages their entries — item SQ at $2400, timer SQ at $2480, the cap-2
+; AUTO_REPOST ack RX at slot 3, storage $2A40. A pipeline hop is
+; targeted on two rings — items on 2, acks on 3 — so every capability
+; here says which with `rx=`: ours aims at the next hop's ring 2, and
+; downstream's `rx=3` aims back at our ack ring. K arrives through the
+; k argument at $2600, the item and ack buffers are reserved at
+; $2280/$2240, and the retransmission count at near $818 reads back
+; into the report.
+;
+; The .system block is the demo's default shape: 16 items through two
+; transform stages, one core per hop. The source is declared first:
+; spawn is reverse declaration order, so sink, s2 and s1 are parked
+; listening before the source moves. Near cells: $880 K+1, $888
+; next_seq, $890 fwd_busy, $898 fwd_seq.
+
+        .actor Source(down cap = 0 rx=2, k arg @ $2600)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq cap=32
+        .ring 3 rx base=$2A40 cap=2 auto_repost
+        .ring 5 sq base=$2480 cap=1
+        .timer = 1 period=2500
+        .reserve $2200 $100
+        .var retransmissions $818
+        .use "pipe_stage.asm"
+        .use "pipe_sink.asm"
+
+        .system
+        source = Source(s1, 16) on 0
+        s1 = Stage(s2, source, 16) on 1
+        s2 = Stage(sink, s1, 16) on 2
+        sink = Sink(s2, 16, 2) on 3
+        .endsystem
 
         .org $1000
         LDA !$2600

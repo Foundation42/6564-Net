@@ -618,8 +618,14 @@ const Assembler = struct {
     fn dirTimer(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
         if (self.meta_timer != null)
             return self.fail(line_no, "duplicate .timer", Error.BadDirective);
+        if (std.ascii.startsWithIgnoreCase(rest, "period=")) {
+            // Bare period: no black-hole capability, just the fabric's
+            // send-timeout horizon the program was measured against.
+            self.meta_timer = .{ .period = try self.evalStr(line_no, rest[7..]) };
+            return;
+        }
         if (rest.len < 2 or (rest[0] != '=' and rest[0] != '@'))
-            return self.fail(line_no, ".timer needs `= slot` or `@ cell`", Error.BadDirective);
+            return self.fail(line_no, ".timer needs `= slot`, `@ cell` or `period=N`", Error.BadDirective);
         var toks = std.mem.tokenizeAny(u8, rest[1..], " \t");
         const val = toks.next() orelse
             return self.fail(line_no, ".timer needs a slot or cell", Error.BadDirective);
