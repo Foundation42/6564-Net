@@ -107,21 +107,23 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
     defer prog.deinit();
     m.load(0, prog.origin, prog.code);
 
-    // Stage the strings and their lengths where http_get.asm expects them.
-    m.load(0, 0x2518, opts.host);
+    // Stage the strings and their lengths where http_get.asm expects them:
+    // host 32 bytes into the open cell, the GET 24 bytes into the send
+    // cell (the echoed-tag framing's request headers, §7.3 addendum).
+    m.load(0, 0x2520, opts.host);
     const req_text = try std.fmt.allocPrint(
         alloc,
         "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: sim6564\r\nAccept: */*\r\nConnection: close\r\n\r\n",
         .{ opts.path, opts.host },
     );
     defer alloc.free(req_text);
-    m.load(0, 0x2608, req_text);
+    m.load(0, 0x2618, req_text);
     var w8: [8]u8 = undefined;
     std.mem.writeInt(u64, &w8, opts.port, .little);
     m.writeNear(0, 0, 0x8A8, &w8);
-    std.mem.writeInt(u64, &w8, 24 + opts.host.len, .little);
+    std.mem.writeInt(u64, &w8, 32 + opts.host.len, .little);
     m.writeNear(0, 0, 0x8B0, &w8);
-    std.mem.writeInt(u64, &w8, 8 + req_text.len, .little);
+    std.mem.writeInt(u64, &w8, 24 + req_text.len, .little);
     m.writeNear(0, 0, 0x8B8, &w8);
 
     try m.spawn(0, 0, 0x1000, 0x3000, 0);

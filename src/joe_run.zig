@@ -39,15 +39,30 @@ const joe = @import("joe.zig");
 /// Builtin device types a `system` block may instantiate — peripherals
 /// are actors made of different silicon (spec §7), so they are named
 /// like actors and wired like actors; only the loader knows they need
-/// no context.
-const device_table = [_]struct { name: []const u8, coord: u16 }{
+/// no context. The whole peripheral row is nameable as of A3.5:
+/// `token` is what a client's capability presents — the RTC answers to
+/// 0, it keeps no secrets — and `answers` marks the devices that reply,
+/// whose own reply window the loader aims back at the asking actor's
+/// RX ring.
+const device_table = [_]struct {
+    name: []const u8,
+    coord: u16,
+    token: u64 = abi_token,
+    answers: bool = false,
+}{
     .{ .name = "Console", .coord = 0xFF00 },
+    .{ .name = "Entropy", .coord = 0xFF01, .answers = true },
+    .{ .name = "Rtc", .coord = 0xFF02, .token = 0, .answers = true },
+    .{ .name = "Block", .coord = 0xFF03, .answers = true },
+    .{ .name = "Net", .coord = 0xFF04, .answers = true },
     // The matmul accelerators (item 6): same contract, different
     // silicon — the polyfill pulls the region through the network
     // window; no client can tell, and that is the point.
     .{ .name = "Matmul", .coord = 0xFF05 },
     .{ .name = "MatmulRemote", .coord = 0xFF06 },
 };
+
+const abi_token = joe.abi.token;
 
 /// Replica-packing limits per core.
 const max_ctx_per_core: u8 = 200;
@@ -166,15 +181,25 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     // ── Pre-pass: group sizes and devices, so placement can budget PTT
     //    and references can look forward. ──
     var group_sizes = std.StringHashMap(usize).init(scratch);
-    var devices = std.ArrayList(struct { name: []const u8, coord: u16 }).init(scratch);
+    var devices = std.ArrayList(struct {
+        name: []const u8,
+        coord: u16,
+        token: u64,
+        answers: bool,
+    }).init(scratch);
     for (pl.instances) |inst| {
-        const coord: ?u16 = for (device_table) |d| {
-            if (std.mem.eql(u8, d.name, inst.actor)) break d.coord;
+        const dent = for (device_table) |d| {
+            if (std.mem.eql(u8, d.name, inst.actor)) break d;
         } else null;
-        if (coord) |c| {
+        if (dent) |d| {
             if (inst.args.len != 0 or inst.replicas != 1)
                 return fail("{s}: a device takes no arguments and no replicas", .{inst.name});
-            try devices.append(.{ .name = inst.name, .coord = c });
+            try devices.append(.{
+                .name = inst.name,
+                .coord = d.coord,
+                .token = d.token,
+                .answers = d.answers,
+            });
         } else {
             try group_sizes.put(inst.name, inst.replicas);
         }
@@ -348,9 +373,15 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
 
     for (devices.items) |*d| {
         switch (d.coord) {
-            0xFF00 => try m.attachDevice(d.coord, joe.abi.token, .{ .console = dev.Console.init(alloc) }),
-            0xFF05 => try m.attachAccel(d.coord, joe.abi.token, .inproc),
-            0xFF06 => try m.attachAccel(d.coord, joe.abi.token, .remote),
+            0xFF00 => try m.attachDevice(d.coord, d.token, .{ .console = dev.Console.init(alloc) }),
+            0xFF01 => try m.attachDevice(d.coord, d.token, .{ .entropy = dev.Entropy.init(opts.seed ^ 0xE47) }),
+            0xFF02 => try m.attachDevice(d.coord, d.token, .{ .rtc = .{} }),
+            // A sector must come home behind the echoed tag: 8 + 48 fits
+            // joe's 64-byte landing buffer, 8 + 64 would not.
+            0xFF03 => try m.attachDevice(d.coord, d.token, .{ .block = try dev.Block.init(alloc, 8, 48) }),
+            0xFF04 => try m.attachDevice(d.coord, d.token, .{ .net = dev.Net.init(alloc) }),
+            0xFF05 => try m.attachAccel(d.coord, d.token, .inproc),
+            0xFF06 => try m.attachAccel(d.coord, d.token, .remote),
             else => unreachable,
         }
     }
@@ -361,6 +392,9 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     @memset(ptt_next, 0);
     const PttKey = struct { core: u16, lo: u64 };
     var ptt_map = std.AutoHashMap(PttKey, u16).init(scratch);
+    // One asker per answering device in v1: a reply window aims at one
+    // RX ring, and pretending otherwise would lose answers silently.
+    var reply_claim = std.AutoHashMap(u16, []const u8).init(scratch);
     const pttFor = struct {
         fn of(
             mach: *machine.Machine,
@@ -368,6 +402,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             nexts: []u16,
             core: u16,
             lo: u64,
+            tok: u64,
         ) !u16 {
             const key = PttKey{ .core = core, .lo = lo };
             if (map.get(key)) |s| return s;
@@ -380,7 +415,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                 .prefix_hi = 0xfd65_6400_0000_0000,
                 .prefix_lo = lo,
                 .rights = .{ .send = true },
-                .token = joe.abi.token,
+                .token = tok,
             });
             return slot;
         }
@@ -407,8 +442,24 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                     } else null) |d| {
                         if (!prm.addr)
                             return fail("{s}: {s} is a device; param {s} must be addr", .{ p.name, rname, prm.name });
-                        const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(d.coord, 0, 0));
+                        const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(d.coord, 0, 0), d.token);
                         std.mem.writeInt(u64, near[prm.off..][0..8], ring.windowAddr(slot, 0), .little);
+                        // A3.3/A3.5: an answering device this actor asks
+                        // gets its own reply window aimed back here —
+                        // the loader wiring driver to device, the same
+                        // act as wiring two actors together.
+                        if (d.answers and c.r.asks_devices) {
+                            const gop = try reply_claim.getOrPut(d.coord);
+                            if (gop.found_existing)
+                                return fail("{s}: {s} already answers {s} (v1: one asker per device)", .{ p.name, rname, gop.value_ptr.* });
+                            gop.value_ptr.* = p.name;
+                            m.setDevicePtt(d.coord, 0, .{
+                                .prefix_hi = 0xfd65_6400_0000_0000,
+                                .prefix_lo = ring.PttEntry.loFrom(p.core, p.ctx, ring.slot_rx),
+                                .rights = .{ .send = true },
+                                .token = joe.abi.token,
+                            });
+                        }
                         continue;
                     }
                     if (groups.get(rname)) |g| {
@@ -427,7 +478,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                             const start = g.first + p.gi * slice;
                             for (0..slice) |j| {
                                 const t = &all.items[start + j];
-                                const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx));
+                                const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx), joe.abi.token);
                                 const at = block + prm.area + j * 8 - machine.ram_base;
                                 std.mem.writeInt(u64, m.cores[p.core].ram[@intCast(at)..][0..8], ring.windowAddr(slot, 0), .little);
                             }
@@ -439,7 +490,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                         if (n % mcount != 0)
                             return fail("{s}: {d} replicas do not divide over {d} members of {s}", .{ p.name, n, mcount, rname });
                         const t = &all.items[g.first + (p.gi * mcount) / n];
-                        const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx));
+                        const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx), joe.abi.token);
                         std.mem.writeInt(u64, near[prm.off..][0..8], ring.windowAddr(slot, 0), .little);
                         continue;
                     }
@@ -448,7 +499,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                     } else return fail("{s}: no instance named {s}", .{ p.name, rname });
                     if (!prm.addr)
                         return fail("{s}: arg {d} names an instance but the param is not addr", .{ p.name, k });
-                    const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx));
+                    const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, ring.slot_rx), joe.abi.token);
                     std.mem.writeInt(u64, near[prm.off..][0..8], ring.windowAddr(slot, 0), .little);
                 },
             }
@@ -456,7 +507,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         if (c.r.self_slot) |soff| {
             // `send self` (Amendment 1): a capability to your own RX ring.
             // Same core, so delivery is on-chip — never rides the mesh.
-            const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(p.core, p.ctx, ring.slot_rx));
+            const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(p.core, p.ctx, ring.slot_rx), joe.abi.token);
             std.mem.writeInt(u64, near[soff..][0..8], ring.windowAddr(slot, 0), .little);
         }
         if (c.r.uses_timer) {

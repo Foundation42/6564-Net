@@ -106,6 +106,11 @@ pub const Layout = struct {
     }
 };
 
+/// The reply window an ask stages (§7.3): PTT slot 0 **in the device's
+/// own space**, which the loader aims back at the asker's RX ring —
+/// wiring a driver to its device is the same act as wiring two actors.
+const device_reply_window: u64 = @as(u64, 0xFF) << 56;
+
 pub const abi = struct {
     pub const timer_desc: u8 = 5;
     pub const land_cap: u64 = 64;
@@ -192,6 +197,25 @@ const Message = struct {
     fields: []Field,
     tag: u16 = 0,
     wire_size: u16 = 0, // padded to 8
+    /// `message Draw -> Rand {…}` (Amendment 3): the reply this request
+    /// asks for. A paired request lowers to the §7.3 ask framing — word0
+    /// = the reply's tag (echoed by the device), word1 = the reply
+    /// window, arguments one per word after — and never to a joe wire
+    /// image, because a device does not speak joe.
+    reply: ?[]const u8 = null,
+    /// `message Write -> _ {…}` — a device request that expects no
+    /// answer (a block write, a net send): same framing, because the row
+    /// has one, and the fabric ack is the whole receipt.
+    tells: bool = false,
+    /// Set on the REPLY message: its fields live one word each from
+    /// offset 8, behind the echoed tag. Everything downstream — the case
+    /// ladder, field loads — reads it like any other message.
+    is_reply: bool = false,
+
+    /// Does this message lower to the §7.3 device framing?
+    fn device(m: *const Message) bool {
+        return m.reply != null or m.tells;
+    }
 };
 
 const BinOp = enum { add, sub, mul, div, band, bor, bxor, shl, shr, eq, ne, lt, le, gt, ge, land };
@@ -400,6 +424,7 @@ const TokKind = enum {
     underscore,
     question,
     assign, // =
+    arrow, // -> : a request and the reply it expects (A3.3)
     plus_eq,
     minus_eq,
     eq_eq,
@@ -460,6 +485,7 @@ const Lexer = struct {
         const two = if (self.pos + 1 < self.src.len) self.src[self.pos .. self.pos + 2] else "";
         const twos = .{
             .{ "+=", TokKind.plus_eq }, .{ "-=", TokKind.minus_eq },
+            .{ "->", TokKind.arrow },
             .{ "==", TokKind.eq_eq },   .{ "!=", TokKind.bang_eq },
             .{ "<=", TokKind.le },      .{ ">=", TokKind.ge },
             .{ "<<", TokKind.shl },     .{ ">>", TokKind.shr },
@@ -620,7 +646,9 @@ const Parser = struct {
         try self.advance();
         while (self.tok.kind != .eof) {
             if (try self.eatKw("message")) {
-                try msgs.append(try self.parseMessage());
+                var reply: ?Message = null;
+                try msgs.append(try self.parseMessage(&reply));
+                if (reply) |r| try msgs.append(r);
             } else if (try self.eatKw("actor")) {
                 try actors.append(try self.parseActor());
             } else if (try self.eatKw("const")) {
@@ -710,8 +738,35 @@ const Parser = struct {
             self.fail("unknown type (v1 speaks u8..u64, addr and []addr)", Error.Unsupported);
     }
 
-    fn parseMessage(self: *Parser) Error!Message {
+    /// `message Name { fields }` and, for the device conversation
+    /// (A3.3), `message Ask [{ fields }] -> Reply { fields }`: two
+    /// messages in one declaration, because a request and the answer it
+    /// expects are one fact. Returns the request; the reply (when there
+    /// is one) comes back through `extra`.
+    fn parseMessage(self: *Parser, extra: *?Message) Error!Message {
         const name = try self.expect(.ident, "message name");
+        const no_fields: []Field = &.{};
+        const fields = if (self.tok.kind == .lbrace) try self.parseFields() else no_fields;
+        if (self.tok.kind != .arrow)
+            return .{ .name = name.text, .fields = fields };
+        try self.advance(); // ->
+        if (self.tok.kind == .underscore) {
+            // `-> _`: a device request that answers to nothing.
+            try self.advance();
+            return .{ .name = name.text, .fields = fields, .tells = true };
+        }
+        const rname = try self.expect(.ident, "reply message name");
+        if (self.tok.kind != .lbrace)
+            return self.fail("a reply names its fields (`-> Reply { … }`)", Error.Syntax);
+        extra.* = .{
+            .name = rname.text,
+            .fields = try self.parseFields(),
+            .is_reply = true,
+        };
+        return .{ .name = name.text, .fields = fields, .reply = rname.text };
+    }
+
+    fn parseFields(self: *Parser) Error![]Field {
         _ = try self.expect(.lbrace, "{");
         var fields = std.ArrayList(Field).init(self.arena);
         while (self.tok.kind != .rbrace) {
@@ -725,7 +780,7 @@ const Parser = struct {
             if (self.tok.kind == .comma) try self.advance();
         }
         try self.advance(); // }
-        return .{ .name = name.text, .fields = try fields.toOwnedSlice() };
+        return fields.toOwnedSlice();
     }
 
     fn parseActor(self: *Parser) Error!Actor {
@@ -1541,6 +1596,9 @@ const Gen = struct {
     in_handler: bool = false,
     uses_timer: bool = false,
     uses_self: bool = false,
+    /// This actor asks a device (A3.3): the loader must wire each
+    /// answering device's reply window back at our RX ring.
+    asks_devices: bool = false,
     timer_period: u64 = 0,
     spawn_count: u16 = 0,
     spawn_seen: u16 = 0,
@@ -3745,6 +3803,69 @@ const Gen = struct {
         } else self.slots.get(sd.target) orelse
             return self.fail(sd.line, "unknown send target", Error.Semantics);
 
+        if (msg.device()) {
+            // The ask path (A3.3 / §7.3): a device request is not a joe
+            // wire image — it is {tag, reply window, arguments}. The tag
+            // we stage is the REPLY's, so the answer comes home wearing
+            // a name this actor's serve loop already knows; a `-> _`
+            // request stages tag 0 and answers to nobody.
+            const rtag: u64 = if (msg.reply) |rname| blk: {
+                const rmsg = self.message(rname) orelse
+                    return self.fail(sd.line, "unknown reply message", Error.Semantics);
+                self.asks_devices = true;
+                break :blk rmsg.tag;
+            } else 0;
+            if (sd.target_idx != null or std.mem.eql(u8, sd.target, "self"))
+                return self.fail(sd.line, "a device request goes to one device", Error.Semantics);
+            try self.w("; {s}: tag, reply window, then arguments (§7.3)", .{msg.name});
+            try self.w("        LDA {s}", .{try self.imm(rtag)});
+            try self.w("        STA !${X}", .{self.layout.staging()});
+            try self.w("        LDA ##${X}", .{device_reply_window});
+            try self.w("        STA !${X}", .{self.layout.staging() + 8});
+            var raw_buf: ?BufInfo = null;
+            var fixed: u16 = 16;
+            for (msg.fields, sd.args) |*f, arg| {
+                if (f.ty == .bytes_) {
+                    // A device takes raw payload — no length byte; the
+                    // SQE's length carries the size, as it always did.
+                    const bname = switch (arg.*) {
+                        .ident => |n| n,
+                        else => return self.fail(sd.line, "a device's bytes argument is a buf", Error.Semantics),
+                    };
+                    const bi = self.bufs.get(bname) orelse
+                        return self.fail(sd.line, "a device's bytes argument is a buf", Error.Semantics);
+                    var wo: u16 = 0;
+                    while (wo < bi.cap) : (wo += 8) {
+                        try self.w("        LDA ${X}", .{bi.data + wo});
+                        try self.w("        STA !${X}", .{self.layout.staging() + f.offset + wo});
+                    }
+                    raw_buf = bi;
+                    continue;
+                }
+                try self.evalArg(arg, f);
+                try self.w("        STA !${X}", .{self.layout.staging() + f.offset});
+                fixed = f.offset + 8;
+            }
+            try self.w("        LDA #1              ; SQE: op = send", .{});
+            try self.w("        STA !${X}", .{self.layout.sqBase()});
+            try self.w("        LDA ${X}", .{tslot});
+            try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
+            try self.w("        LDA ##${X}", .{self.layout.staging()});
+            try self.w("        STA !${X}", .{self.layout.sqBase() + 16});
+            if (raw_buf) |bi| {
+                try self.w("        LDA ${X}", .{bi.len_slot});
+                try self.w("        CLC", .{});
+                try self.w("        ADC ##${X}", .{@as(u64, 1) << 32 | fixed});
+            } else {
+                try self.w("        LDA ##${X}", .{@as(u64, 1) << 32 | fixed});
+            }
+            try self.w("        STA !${X}", .{self.layout.sqBase() + 24});
+            try self.w("        SEND 0", .{});
+            return;
+        }
+        if (msg.is_reply)
+            return self.fail(sd.line, "a reply is what a device sends you, not what you send", Error.Semantics);
+
         if (msg.wire_size <= 8) {
             // TXR path (item 4): the wire word composes in A — the near
             // page holds a partial only between field evaluations, and a
@@ -4716,6 +4837,9 @@ pub const Result = struct {
     /// Set when the actor says `send self` (Amendment 1): the near slot
     /// where the loader stages a capability to the actor's own RX ring.
     self_slot: ?u16,
+    /// Set when the actor asks a device (A3.3): every answering device
+    /// it holds a capability to needs its reply window aimed back here.
+    asks_devices: bool = false,
     /// The actor's byte buffers (A2.1) — harnesses stage into and read
     /// out of the near page through these.
     bufs: []BufOut,
@@ -4823,6 +4947,33 @@ pub fn compile(
     // last: one length byte, then the payload filling the envelope.
     for (prog.messages, 0..) |*m, i| {
         m.tag = @intCast(i + 1);
+        // A3.3's two device layouts. An ASK's arguments go one per word
+        // behind the tag and the reply window (§7.3's framing — a device
+        // does not speak joe, so nothing packs); a REPLY's fields go one
+        // per word behind the echoed tag. Both keep field offsets, so
+        // the case ladder and every field load stay exactly as they are.
+        if (m.device() or m.is_reply) {
+            var doff: u16 = if (m.is_reply) 8 else 16;
+            for (m.fields, 0..) |*f, fi| {
+                if (f.ty == .bytes_) {
+                    if (fi + 1 != m.fields.len) {
+                        if (diag) |d| d.message = "a bytes field goes last (v1)";
+                        return Error.Semantics;
+                    }
+                    f.offset = doff;
+                    doff = abi.land_cap;
+                    continue;
+                }
+                f.offset = doff;
+                doff += 8;
+            }
+            m.wire_size = std.mem.alignForward(u16, @max(doff, 16), 8);
+            if (m.wire_size > abi.land_cap) {
+                if (diag) |d| d.message = "device message larger than a landing buffer";
+                return Error.Semantics;
+            }
+            continue;
+        }
         var off: u16 = 2; // the tag word
         for (m.fields, 0..) |*f, fi| {
             if (f.ty == .bytes_) {
@@ -4940,6 +5091,7 @@ pub fn compile(
         .uses_timer = gen.uses_timer,
         .timer_period = gen.timer_period,
         .self_slot = if (gen.uses_self) gen.off_self else null,
+        .asks_devices = gen.asks_devices,
         .bufs = try bufs_out.toOwnedSlice(),
     };
 }

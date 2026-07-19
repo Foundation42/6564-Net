@@ -74,26 +74,30 @@
         JSR sendcon
 
         ; ── RTC: t0 ──
+        LDA #1
+        STA !$2500          ; request word0: tag 1 (RTC)
         LDA ##$FF00_0000_0000_0000
-        STA !$2500          ; request word0: our reply window
+        STA !$2508          ; request word1: our reply window
         LDA #1
         STA !$2400
         LDA ##$FF00_0200_0000_0000
         STA !$2408          ; target: the RTC, via PTT 2
         LDA ##$2500
         STA !$2410
-        LDA ##$1_0000_0008  ; len 8 | cookie 1
+        LDA ##$1_0000_0010  ; len 16 | cookie 1
         STA !$2418
         JSR req
         JSR getrx
         STA $850            ; t0
 
         ; ── entropy: draw 8 bytes ──
+        LDA #2
+        STA !$2500          ; request word0: tag 2 (entropy)
         LDA #8
-        STA !$2508          ; request word1: count ($2500 still the window)
+        STA !$2510          ; request word2: count ($2508 still the window)
         LDA ##$FF00_0100_0000_0000
         STA !$2408          ; target: the entropy well, via PTT 1
-        LDA ##$1_0000_0010  ; len 16 | cookie 1
+        LDA ##$1_0000_0018  ; len 24 | cookie 1
         STA !$2418
         JSR req
         JSR getrx
@@ -108,32 +112,36 @@
         JSR crlf
 
         ; ── block: write the draw and the timestamp to sector 3 ──
-        LDA ##$301          ; header word0: op 1 (write) | sector 3
-        STA !$2600
+        LDA #3
+        STA !$2600          ; header word0: tag 3 (block write; no reply, still distinct)
         LDA #0
-        STA !$2608
-        LDA $858
+        STA !$2608          ; header word1: window (present, ignored for writes)
+        LDA ##$301          ; header word2: op 1 (write) | sector 3
         STA !$2610
+        LDA $858
+        STA !$2618          ; body from byte 24
         LDA $850
-        STA !$2618
+        STA !$2620
         LDA #1
         STA !$2400
         LDA ##$FF00_0300_0000_0000
         STA !$2408          ; target: the block store, via PTT 3
         LDA ##$2600
         STA !$2410
-        LDA ##$1_0000_0020  ; len 32 | cookie 1
+        LDA ##$1_0000_0028  ; len 40 | cookie 1
         STA !$2418
         JSR req             ; write applies at delivery: the ack IS durability
 
         ; ── block: read sector 3 back and verify ──
-        LDA ##$300          ; header word0: op 0 (read) | sector 3
-        STA !$2640
+        LDA #4
+        STA !$2640          ; header word0: tag 4 (block read)
         LDA ##$FF00_0000_0000_0000
         STA !$2648          ; header word1: reply window
+        LDA ##$300
+        STA !$2650          ; header word2: op 0 (read) | sector 3
         LDA ##$2640
         STA !$2410
-        LDA ##$1_0000_0010  ; len 16 | cookie 1
+        LDA ##$1_0000_0018  ; len 24 | cookie 1
         STA !$2418
         JSR req
         JSR getrx           ; A = sector word 0, $8E0 = where it landed
@@ -160,12 +168,14 @@ bad:    LDA ##s_bad
 
         ; ── RTC: t1, and the bill ──
 fin:    LDA #1
+        STA !$2500          ; word0 back to tag 1 (entropy left its own)
+        LDA #1
         STA !$2400
         LDA ##$FF00_0200_0000_0000
         STA !$2408
         LDA ##$2500
         STA !$2410
-        LDA ##$1_0000_0008
+        LDA ##$1_0000_0010  ; len 16 ($2508 still the window)
         STA !$2418
         JSR req
         JSR getrx
@@ -216,7 +226,8 @@ rqrx:   STX $8B0
         STA $8B8
         BRA rq1
 
-; collect a device reply: A = its first qword, $8E0 = landing buffer
+; collect a device reply: A = its first DATA qword (past the echoed
+; tag), $8E0 = where the data starts (landing buffer + 8)
 getrx:  LDA $8B8
         BNE gr2             ; already stashed by req
 gr1:    LSTN 1
@@ -228,7 +239,9 @@ gr1:    LSTN 1
         STX $8B0
 gr2:    LDA #0
         STA $8B8
+        CLC
         LDA $8B0
+        ADC #8              ; past the echoed tag (§7.3 addendum)
         STA $8E0
         LDA ($8E0)
         RTS

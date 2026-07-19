@@ -2929,6 +2929,29 @@ test "hello: the console device hears the machine's first words" {
     try testing.expectEqual(@as(u64, 0), o.stats.dev_replies);
 }
 
+test "periph.joe: the device conversation, in the language (A3.3)" {
+    // Every answer here arrives as an ordinary `case`, because every ask
+    // carried a tag the device echoed. Same entropy stream as the
+    // assembly errand — the language changed, the machine did not.
+    var o = try @import("joe_run.zig").simulate(testing.allocator, @embedFile("programs/joe/periph.joe"), .{
+        .loss_ppm4k = 0,
+        .dup_ppm4k = 0,
+    });
+    defer o.deinit();
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    const text = o.console.?;
+    try testing.expect(std.mem.startsWith(u8, text, "6564 PERIPHERAL BUS CHECK\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "ENTROPY 33FB3C626C1F610A\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "BLOCK OK\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "CYCLES ") != null);
+    // The write's echoed ack is a real sequencing point: without it the
+    // read races the write and the sector comes back empty.
+    try testing.expectEqual(@as(u64, 3), o.varOf("p", "step").?);
+    const elapsed = o.varOf("p", "elapsed").?;
+    try testing.expect(elapsed > 0 and elapsed < o.cycles);
+    try testing.expectEqual(@as(u64, 0), o.stats.lost);
+}
+
 test "peripheral row: console, entropy, rtc and block all answer" {
     var o = try asm_run.simulate(testing.allocator, &asm_src.periph, clean_fabric);
     defer o.deinit();

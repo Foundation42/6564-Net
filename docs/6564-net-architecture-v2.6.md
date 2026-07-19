@@ -556,17 +556,19 @@ A device that answers — a clock, an entropy well, a block store — answers th
 
 Device replies are **fire-and-forget silicon**: a device does not retry, hold pending state, or wait for acknowledgment. A lost reply costs the requester another ask — so device protocols are idempotent request/retry, the same discipline every actor already lives by (§10). A reply may also race its own request-ack home across the fabric; drivers that wait on the ack must be prepared to see the answer first.
 
+**The echoed tag (Amendment 3 addendum).** Every asking device's request begins with a **caller-tag word**: silicon never interprets it and echoes it verbatim as the reply's first word. This is the accelerator contract's reserved word (§7.6), generalized to the whole row — the machine shipped the convention twice before it was named. The reply wears the tag you gave it, so a serve loop can match a device's answer exactly as it matches any message; an untagged raw answer no longer exists on the row. Uniform ask framing: word0 = tag, word1 = reply window, device arguments from word2; uniform reply framing: the echoed tag, then data from +8. Devices that never answer — the console is a raw sink, payload-is-text — carry no tag word: a sink has nothing to echo. Devices that *push* unasked (a pad, a display's vblank) are the same convention minus the request: their contracts name their tags.
+
 ### 7.4 The v1 Device Set
 
 Defined for the reference simulator; the set is open, the conventions above are not.
 
 | Device | Row coordinate (convention) | Contract |
 |---|---|---|
-| `console` | `$FF00` | Payload bytes are text, appended to the world. No reply: the delivery ack is the receipt, and `SEND` is `PRINT`. |
-| `entropy` | `$FF01` | Request {reply window, count}; replies with `count` seeded-deterministic random bytes. Same seed, same universe — still. |
-| `rtc` | `$FF02` | Request {reply window}; replies with the fabric cycle at which the request arrived. §6.3 gives software intervals; the RTC gives it timestamps. |
-| `block` | `$FF03` | Request {op \| sector, reply window, data…}. A write applies at delivery — the fabric ack **is** the write ack. A read sends the sector to the reply window. Both idempotent by construction. |
-| `net` | `$FF04` | The raw byte pipe to real TCP — open {reply window, port, host} → connection id; send bytes (the ack is the write ack); recv {reply window, max} → 0..max bytes, where an EMPTY reply means "ask again" and a REJECTED request means EOF: the ack vocabulary is the framing. No protocol opinion — that lives in §7.5. |
+| `console` | `$FF00` | Payload bytes are text, appended to the world. No reply, no tag: the delivery ack is the receipt, and `SEND` is `PRINT`. |
+| `entropy` | `$FF01` | Request {tag, reply window, count}; replies {tag, `count` seeded-deterministic random bytes}. Same seed, same universe — still. |
+| `rtc` | `$FF02` | Request {tag, reply window}; replies {tag, the fabric cycle at which the request arrived}. §6.3 gives software intervals; the RTC gives it timestamps. |
+| `block` | `$FF03` | Request {tag, reply window, op \| sector, data…}. A write applies at delivery — the fabric ack **is** the write ack. A read sends {tag, the sector} to the reply window. Both idempotent by construction. |
+| `net` | `$FF04` | The raw byte pipe to real TCP — open {tag, reply window, op, port, host} → {tag, connection id}; send bytes (the ack is the write ack); recv {tag, reply window, op, max} → {tag, 0..max bytes}, where a TAG-ONLY reply means "ask again" and a REJECTED request means EOF: the ack vocabulary is the framing. No protocol opinion — that lives in §7.5. |
 | `matmul` | `$FF05` (in-proc), `$FF06` (remote polyfill) | The first accelerator actor (§7.6): request {reserved word, region slot, token, M\|K\|N, three in-region offsets}; C ⟵ A·B inside the granted region; completion via the `$6772` convention. Declares `deterministic`: k ascending, IEEE RNE — the two implementations agree to the bit. |
 
 An off-die network bridge is the row's natural fifth citizen: a NIC is just another device. As of v2.4 the plane beneath it is architectural (§6.5) — multi-die topologies arrived as an extension, not a redesign — and as of v2.5 the `net` device is the pipe off the board entirely.

@@ -18,6 +18,16 @@
 //! fabric: they can be lost, so driver protocols are idempotent
 //! request/retry — the same discipline every actor already lives by.
 //!
+//! The echoed tag (§7.3 addendum, Amendment 3): every asking device's
+//! request begins with a CALLER-TAG word the silicon never interprets
+//! and echoes verbatim as the reply's first word — the accelerator
+//! contract's reserved word, generalized. The reply wears the tag you
+//! gave it, so a serve loop can match it like any message. Uniform
+//! framing for Entropy/Rtc/Block/Net: word0 = tag, word1 = reply
+//! window, args from word2; reply = echoed tag, then data from +8.
+//! The Console is a raw sink — payload is text, no header, no reply —
+//! and stays one.
+//!
 //! This module is pure device policy: payload in, (status, optional reply)
 //! out. machine.zig owns routing, capability checks, and the event queue.
 
@@ -52,11 +62,19 @@ fn word(payload: []const u8, i: usize) u64 {
     return std.mem.readInt(u64, payload[i * 8 ..][0..8], .little);
 }
 
-/// Requests that expect a reply lead with the reply window address.
+/// Requests that expect a reply: word0 = caller tag, word1 = the reply
+/// window address (in the device's PTT space).
 fn replyWindow(payload: []const u8) ?u64 {
-    if (payload.len < 8) return null;
-    const w = word(payload, 0);
+    if (payload.len < 16) return null;
+    const w = word(payload, 1);
     return if (ring.isWindow(w)) w else null;
+}
+
+/// Start a reply with the request's echoed tag word (§7.3 addendum).
+fn tagged(window: u64, payload: []const u8) Reply {
+    var r = Reply{ .window = window };
+    r.data.appendSlice(payload[0..8]) catch unreachable;
+    return r;
 }
 
 // ── Console: the teletype ────────────────────────────────────────────────
@@ -85,10 +103,11 @@ pub const Console = struct {
 
 // ── Entropy: seeded randomness as a service ──────────────────────────────
 //
-// Request: word0 = reply window, word1 = byte count (clamped to 64).
-// Reply: that many bytes from the device's own seeded stream — a separate
-// PRNG from the mesh's, so attaching the device never perturbs fault
-// injection. Deterministic like everything else: same seed, same entropy.
+// Request: word0 = tag, word1 = reply window, word2 = byte count
+// (clamped to 64). Reply: the echoed tag, then that many bytes from the
+// device's own seeded stream — a separate PRNG from the mesh's, so
+// attaching the device never perturbs fault injection. Deterministic
+// like everything else: same seed, same entropy.
 
 pub const Entropy = struct {
     prng: std.Random.DefaultPrng,
@@ -100,42 +119,44 @@ pub const Entropy = struct {
     fn handle(self: *Entropy, payload: []const u8) Result {
         const window = replyWindow(payload) orelse
             return .{ .status = .reject_no_buffer };
-        if (payload.len < 16) return .{ .status = .reject_no_buffer };
-        const count = @min(@max(word(payload, 1), 1), 64);
-        var r = Reply{ .window = window };
-        r.data.resize(@intCast(count)) catch unreachable;
-        self.prng.random().bytes(r.data.slice());
+        if (payload.len < 24) return .{ .status = .reject_no_buffer };
+        const count = @min(@max(word(payload, 2), 1), 64);
+        var r = tagged(window, payload);
+        r.data.resize(@intCast(8 + count)) catch unreachable;
+        self.prng.random().bytes(r.data.slice()[8..]);
         return .{ .reply = r };
     }
 };
 
 // ── RTC: what time is it on the fabric? ──────────────────────────────────
 //
-// Request: word0 = reply window. Reply: 8 bytes, the cycle at which the
-// request reached the device. A device's clock is fabric time — the black
-// hole gives software intervals (§6.3); the RTC gives it timestamps.
+// Request: word0 = tag, word1 = reply window. Reply: the echoed tag,
+// then 8 bytes — the cycle at which the request reached the device. A
+// device's clock is fabric time: the black hole gives software intervals
+// (§6.3); the RTC gives it timestamps.
 
 pub const Rtc = struct {
     fn handle(_: *Rtc, due: u64, payload: []const u8) Result {
         const window = replyWindow(payload) orelse
             return .{ .status = .reject_no_buffer };
-        var r = Reply{ .window = window };
-        r.data.resize(8) catch unreachable;
-        std.mem.writeInt(u64, r.data.slice()[0..8], due, .little);
+        var r = tagged(window, payload);
+        r.data.resize(16) catch unreachable;
+        std.mem.writeInt(u64, r.data.slice()[8..16], due, .little);
         return .{ .reply = r };
     }
 };
 
 // ── Block: sectors over the fabric ───────────────────────────────────────
 //
-// Request header (16 bytes):
-//   word0 = op (0 read, 1 write) | sector << 8
-//   word1 = reply window (reads; ignored for writes)
+// Request header (24 bytes):
+//   word0 = tag   word1 = reply window (reads; present, ignored, for
+//   writes — one framing per device)   word2 = op (0 read, 1 write)
+//   | sector << 8
 // Write: the bytes after the header land in the sector, applied at
 // delivery — the fabric ack IS the write ack; there is nothing more to
-// wait for. Read: the whole sector goes to the reply window (post a
-// landing buffer at least a sector deep, or take `truncated` honestly).
-// Both are idempotent by construction: lose a reply, just ask again.
+// wait for. Read: the echoed tag, then the whole sector, to the reply
+// window (post a landing buffer at least tag + sector deep, or take
+// `truncated` honestly). Both idempotent: lose a reply, just ask again.
 
 pub const Block = struct {
     alloc: std.mem.Allocator,
@@ -156,23 +177,32 @@ pub const Block = struct {
     }
 
     fn handle(self: *Block, payload: []const u8) Result {
-        if (payload.len < 16) return .{ .status = .reject_no_buffer };
-        const op = word(payload, 0) & 0xFF;
-        const sec = self.sector(word(payload, 0) >> 8) orelse
+        if (payload.len < 24) return .{ .status = .reject_no_buffer };
+        const op = word(payload, 2) & 0xFF;
+        const sec = self.sector(word(payload, 2) >> 8) orelse
             return .{ .status = .reject_no_buffer };
         switch (op) {
             0 => {
-                const window = replyWindow(payload[8..]) orelse
+                const window = replyWindow(payload) orelse
                     return .{ .status = .reject_no_buffer };
-                var r = Reply{ .window = window };
+                var r = tagged(window, payload);
                 r.data.appendSlice(sec) catch unreachable;
                 return .{ .reply = r };
             },
             1 => {
-                const body = payload[16..];
+                const body = payload[24..];
                 const n = @min(body.len, sec.len);
                 @memcpy(sec[0..n], body[0..n]);
-                return .{ .status = if (n < body.len) .truncated else .ok };
+                if (n < body.len) return .{ .status = .truncated };
+                // The reply window IS the request for a reply: leave a
+                // return address on a write and the device echoes your
+                // tag when the sector is yours — a sequencing point for
+                // drivers that cannot see transport verdicts. Leave none
+                // (the window word zero) and the fabric ack is the whole
+                // receipt, as it always was.
+                if (replyWindow(payload)) |window|
+                    return .{ .reply = tagged(window, payload) };
+                return .{};
             },
             else => return .{ .status = .reject_no_buffer },
         }
@@ -185,14 +215,14 @@ pub const Block = struct {
 // protocol opinion — HTTP, WebSockets, TLS are PROTOCOL ACTORS layered
 // above (§7.5), in silicon or in 6564 code, and clients can't tell.
 //
-// Requests (word0 = op | conn << 8):
-//   op 0 open:  word1 = reply window, word2 = port, bytes[24..] = host.
-//               Reply: 8 bytes, the connection id. Failure rejects.
-//   op 1 send:  bytes[8..] go down the pipe. The ack is the write ack.
-//   op 2 recv:  word1 = reply window, word2 = max bytes (≤ 240 sane).
-//               Reply: 0..max bytes; EMPTY means "nothing yet, ask
-//               again" — and a REJECTED request means EOF/closed: no
-//               in-band framing, the ack vocabulary already suffices.
+// Requests (word0 = tag, word1 = reply window, word2 = op | conn << 8):
+//   op 0 open:  word3 = port, bytes[32..] = host.
+//               Reply: tag, then 8 bytes — the connection id.
+//   op 1 send:  bytes[24..] go down the pipe. The ack is the write ack.
+//   op 2 recv:  word3 = max bytes (≤ 240 sane).
+//               Reply: tag, then 0..max bytes; TAG-ONLY (8 bytes) means
+//               "nothing yet, ask again" — and a REJECTED request means
+//               EOF/closed: the ack vocabulary still suffices.
 //   op 3 close: done. Ack ok.
 //
 // This is the one device that touches wall-clock reality: DNS, connect
@@ -219,38 +249,42 @@ pub const Net = struct {
     }
 
     fn handle(self: *Net, payload: []const u8) Result {
-        if (payload.len < 8) return .{ .status = .reject_no_buffer };
-        const op = word(payload, 0) & 0xFF;
-        const conn_id = (word(payload, 0) >> 8) & 0xFF;
+        if (payload.len < 24) return .{ .status = .reject_no_buffer };
+        const op = word(payload, 2) & 0xFF;
+        const conn_id = (word(payload, 2) >> 8) & 0xFF;
         switch (op) {
             0 => { // open
-                if (payload.len < 25) return .{ .status = .reject_no_buffer };
-                const window = replyWindow(payload[8..]) orelse
+                if (payload.len < 33) return .{ .status = .reject_no_buffer };
+                const window = replyWindow(payload) orelse
                     return .{ .status = .reject_no_buffer };
-                const port: u16 = @truncate(word(payload, 2));
+                const port: u16 = @truncate(word(payload, 3));
                 const slot = self.free() orelse
                     return .{ .status = .reject_no_buffer };
-                const host = payload[24..];
+                const host = payload[32..];
                 const stream = std.net.tcpConnectToHost(self.alloc, host, port) catch
                     return .{ .status = .reject_no_buffer };
                 self.conns[slot] = stream;
-                var r = Reply{ .window = window };
-                r.data.resize(8) catch unreachable;
-                std.mem.writeInt(u64, r.data.slice()[0..8], slot, .little);
+                var r = tagged(window, payload);
+                r.data.resize(16) catch unreachable;
+                std.mem.writeInt(u64, r.data.slice()[8..16], slot, .little);
                 return .{ .reply = r };
             },
             1 => { // send
                 const c = if (conn_id < self.conns.len) self.conns[conn_id] else null;
                 const stream = c orelse return .{ .status = .reject_no_buffer };
-                stream.writeAll(payload[8..]) catch
+                stream.writeAll(payload[24..]) catch
                     return .{ .status = .reject_no_buffer };
+                // A return address asks for an echo when the bytes are
+                // down the pipe (see Block's write).
+                if (replyWindow(payload)) |window|
+                    return .{ .reply = tagged(window, payload) };
                 return .{};
             },
             2 => { // recv
-                if (payload.len < 24) return .{ .status = .reject_no_buffer };
-                const window = replyWindow(payload[8..]) orelse
+                if (payload.len < 32) return .{ .status = .reject_no_buffer };
+                const window = replyWindow(payload) orelse
                     return .{ .status = .reject_no_buffer };
-                const max = @min(@max(word(payload, 2), 1), 240);
+                const max = @min(@max(word(payload, 3), 1), 240);
                 const c = if (conn_id < self.conns.len) self.conns[conn_id] else null;
                 const stream = c orelse return .{ .status = .reject_no_buffer };
                 var fds = [_]std.posix.pollfd{.{
@@ -259,13 +293,13 @@ pub const Net = struct {
                     .revents = 0,
                 }};
                 const ready = std.posix.poll(&fds, self.poll_ms) catch 0;
-                var r = Reply{ .window = window };
-                if (ready == 0) return .{ .reply = r }; // nothing yet: empty
-                r.data.resize(@intCast(max)) catch unreachable;
-                const n = stream.read(r.data.slice()) catch
+                var r = tagged(window, payload);
+                if (ready == 0) return .{ .reply = r }; // nothing yet: tag only
+                r.data.resize(@intCast(8 + max)) catch unreachable;
+                const n = stream.read(r.data.slice()[8..]) catch
                     return .{ .status = .reject_no_buffer };
                 if (n == 0) return .{ .status = .reject_no_buffer }; // EOF
-                r.data.resize(n) catch unreachable;
+                r.data.resize(8 + n) catch unreachable;
                 return .{ .reply = r };
             },
             3 => { // close
@@ -323,50 +357,61 @@ test "console accumulates text" {
     try std.testing.expectEqualStrings("HELLO WORLD", d.console.out.items);
 }
 
-test "entropy is deterministic from seed and clamps count" {
+test "entropy is deterministic from seed, clamps count, echoes the tag" {
     var a = Device{ .entropy = Entropy.init(42) };
     var b = Device{ .entropy = Entropy.init(42) };
-    var req: [16]u8 = undefined;
-    std.mem.writeInt(u64, req[0..8], ring.windowAddr(3, 0), .little);
-    std.mem.writeInt(u64, req[8..16], 8, .little);
+    var req: [24]u8 = undefined;
+    std.mem.writeInt(u64, req[0..8], 0xBEEF_0042, .little);
+    std.mem.writeInt(u64, req[8..16], ring.windowAddr(3, 0), .little);
+    std.mem.writeInt(u64, req[16..24], 8, .little);
     const ra = a.handle(0, &req).reply.?;
     const rb = b.handle(0, &req).reply.?;
     try std.testing.expectEqualSlices(u8, ra.data.slice(), rb.data.slice());
-    try std.testing.expectEqual(@as(usize, 8), ra.data.len);
-    std.mem.writeInt(u64, req[8..16], 4096, .little);
-    try std.testing.expectEqual(@as(usize, 64), a.handle(0, &req).reply.?.data.len);
+    try std.testing.expectEqual(@as(usize, 16), ra.data.len);
+    // the reply wears the tag you gave it (§7.3 addendum)
+    try std.testing.expectEqual(
+        @as(u64, 0xBEEF_0042),
+        std.mem.readInt(u64, ra.data.slice()[0..8], .little),
+    );
+    std.mem.writeInt(u64, req[16..24], 4096, .little);
+    try std.testing.expectEqual(@as(usize, 8 + 64), a.handle(0, &req).reply.?.data.len);
 }
 
-test "rtc replies with fabric time" {
+test "rtc replies with fabric time behind the echoed tag" {
     var d = Device{ .rtc = .{} };
-    var req: [8]u8 = undefined;
-    std.mem.writeInt(u64, req[0..8], ring.windowAddr(1, 0), .little);
+    var req: [16]u8 = undefined;
+    std.mem.writeInt(u64, req[0..8], 77, .little);
+    std.mem.writeInt(u64, req[8..16], ring.windowAddr(1, 0), .little);
     const r = d.handle(6564, &req).reply.?;
+    try std.testing.expectEqual(@as(u64, 77), std.mem.readInt(u64, r.data.slice()[0..8], .little));
     try std.testing.expectEqual(
         @as(u64, 6564),
-        std.mem.readInt(u64, r.data.slice()[0..8], .little),
+        std.mem.readInt(u64, r.data.slice()[8..16], .little),
     );
 }
 
 test "block round-trips a sector and rejects the void" {
     var d = Device{ .block = try Block.init(std.testing.allocator, 4, 64) };
     defer d.deinit();
-    var wr: [24]u8 = undefined;
-    std.mem.writeInt(u64, wr[0..8], 1 | (2 << 8), .little); // write sector 2
+    var wr: [32]u8 = undefined;
+    std.mem.writeInt(u64, wr[0..8], 0, .little); // tag (writes: present, unused)
     std.mem.writeInt(u64, wr[8..16], 0, .little);
-    std.mem.writeInt(u64, wr[16..24], 0x6564_6564_6564_6564, .little);
+    std.mem.writeInt(u64, wr[16..24], 1 | (2 << 8), .little); // write sector 2
+    std.mem.writeInt(u64, wr[24..32], 0x6564_6564_6564_6564, .little);
     try std.testing.expectEqual(ring.Status.ok, d.handle(0, &wr).status);
 
-    var rd: [16]u8 = undefined;
-    std.mem.writeInt(u64, rd[0..8], 0 | (2 << 8), .little); // read sector 2
+    var rd: [24]u8 = undefined;
+    std.mem.writeInt(u64, rd[0..8], 9, .little); // tag
     std.mem.writeInt(u64, rd[8..16], ring.windowAddr(0, 0), .little);
+    std.mem.writeInt(u64, rd[16..24], 0 | (2 << 8), .little); // read sector 2
     const r = d.handle(0, &rd).reply.?;
-    try std.testing.expectEqual(@as(usize, 64), r.data.len);
+    try std.testing.expectEqual(@as(usize, 8 + 64), r.data.len);
+    try std.testing.expectEqual(@as(u64, 9), std.mem.readInt(u64, r.data.slice()[0..8], .little));
     try std.testing.expectEqual(
         @as(u64, 0x6564_6564_6564_6564),
-        std.mem.readInt(u64, r.data.slice()[0..8], .little),
+        std.mem.readInt(u64, r.data.slice()[8..16], .little),
     );
 
-    std.mem.writeInt(u64, rd[0..8], 0 | (9 << 8), .little); // no sector 9
+    std.mem.writeInt(u64, rd[16..24], 0 | (9 << 8), .little); // no sector 9
     try std.testing.expectEqual(ring.Status.reject_no_buffer, d.handle(0, &rd).status);
 }

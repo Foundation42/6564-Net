@@ -1,0 +1,100 @@
+// periph.joe — one actor walks the peripheral row, in joe.
+//
+// This program exists because it could not: v1 had no way to hear a
+// device. An entropy draw is eight raw bytes and a clock tick is one —
+// neither carries a tag, so neither could land in a `serve` loop.
+// Amendment 3's answer is the convention the machine already shipped
+// twice (the accelerator's reserved word, the display's PresentDone):
+// an ask carries a caller tag, and the device echoes it. You name the
+// reply where you name the request, and the answer comes home wearing
+// a name this actor already knows.
+//
+//     message Now -> Time { t u64 }        `case Time(x)` — an ordinary case
+//
+// The errand: timestamp off the RTC, draw eight random bytes and print
+// them in hex, write draw + timestamp to a disk sector, read it back
+// and verify, then print the cycle bill by the machine's own RTC
+// arithmetic. Requests are sequential — one in flight — because the
+// reply is the ack, and the step counter says which answer we're
+// waiting for. Devices are named in the system block like any peer.
+
+const digits = "0123456789ABCDEF"
+
+message Now -> Time { t u64 }
+message Draw { count u64 } -> Rand { v u64 }
+message Write { op u64, w0 u64, w1 u64 } -> Written { }
+message Read { op u64 } -> Sector { v0 u64, v1 u64 }
+
+actor Periph(tty addr, well addr, clock addr, disk addr) {
+    var line buf [72]u8
+    var step u64 = 0
+    var t0 u64 = 0
+    var draw u64 = 0
+    var elapsed u64 = 0
+    // Hex is peeled, not indexed: shift counts are constants on this
+    // machine (counted shifts, v2.5 §8), so the value rotates under a
+    // fixed window — periph.asm's hexq, one level up.
+    var hx u64 = 0
+
+    send tty, "6564 PERIPHERAL BUS CHECK\n"
+    send clock, Now{}                 // step 0: what time is it?
+
+    serve {
+        case Time(x):
+            if step == 0 {
+                t0 = x.t
+                step = 1
+                send well, Draw{8}
+            } else {
+                elapsed = x.t - t0
+                clear line
+                append line, "CYCLES "
+                hx = elapsed
+                for i in 0..16 {
+                    append line, byte(digits[(hx >> 60) & 15])
+                    hx = hx << 4
+                }
+                append line, "\n"
+                send tty, line
+                halt ok
+            }
+
+        case Rand(r):
+            draw = r.v
+            clear line
+            append line, "ENTROPY "
+            hx = draw
+            for i in 0..16 {
+                append line, byte(digits[(hx >> 60) & 15])
+                hx = hx << 4
+            }
+            append line, "\n"
+            send tty, line
+            // A write applies at delivery — but a driver that cannot see
+            // transport verdicts still needs to know the sector is its
+            // own before reading it back. Leaving a return address asks
+            // the device to say so: `Written` is that sequencing point.
+            send disk, Write{769, draw, t0}     // op 1 | sector 3 << 8
+
+        case Written(_):
+            step = 2
+            send disk, Read{768}                // op 0 | sector 3 << 8
+
+        case Sector(s):
+            if s.v0 == draw && s.v1 == t0 {
+                send tty, "BLOCK OK\n"
+            } else {
+                send tty, "BLOCK BAD\n"
+            }
+            step = 3
+            send clock, Now{}         // step 3: the bill
+    }
+}
+
+system {
+    p = Periph(tty, well, clock, disk) on 0
+    tty = Console()
+    well = Entropy()
+    clock = Rtc()
+    disk = Block()
+}
