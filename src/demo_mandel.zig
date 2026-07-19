@@ -3,7 +3,7 @@
 //! (prefix $42), one console line per row — and because every FP
 //! result is bit-exact by spec, the whole picture is a determinism
 //! test: the harness asserts rows character-for-character against an
-//! independent computation. Program: programs/mandel.asm.
+//! independent computation. Program: programs/asm/mandel.asm.
 
 const std = @import("std");
 const ring = @import("ring.zig");
@@ -11,7 +11,7 @@ const dev = @import("dev.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const mandel_src = @embedFile("programs/mandel.asm");
+const mandel_src = @embedFile("programs/asm/mandel.asm");
 
 pub const console_coord: u16 = 0xFF00;
 

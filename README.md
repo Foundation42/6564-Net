@@ -18,7 +18,7 @@ zig build run           # ping-pong actors across a 25%-lossy fabric
 ./zig-out/bin/sim6564 hello               # the machine says hello
 ```
 
-The 6564 programs themselves live in `src/programs/*.asm`.
+The 6564 programs themselves live in `src/programs/asm/*.asm`.
 
 **pingpong** runs two actors on two simulated cores joined by a fabric that
 loses, delays, reorders and duplicates datagrams (deterministically, from the
@@ -79,7 +79,7 @@ CYCLES 00000000000039A7
 Erlang's soul, occam's discipline. `pingpong.joe` — an actor, a
 `serve` loop, a fabric timer, and not one line of ack handling,
 because joe has no syntax for transport acks — compiles to 6564
-assembly (`sim6564 joec src/programs/pingpong.joe Pinger` to read it)
+assembly (`sim6564 joec src/programs/joe/pingpong.joe Pinger` to read it)
 and completes its rounds at 73% packet loss, sequence-checked, at
 +10% code and +1% wall clock against the hand-written ping.asm.
 Deployment is data: a `system` block in the source names instances
@@ -87,7 +87,7 @@ and their wiring — `ws = Worker[1000](ls)` declares a thousand
 replicas, aligned to their lieutenants by the loader — and placement,
 PTT capabilities, parameter staging and timers are all loader work:
 any `.joe` file runs without a harness. The capstone is
-`src/programs/forkjoin.joe`: a 1,009-actor fork-join tree, every hop
+`src/programs/joe/forkjoin.joe`: a 1,009-actor fork-join tree, every hop
 acked through the tree because joe cannot see transport verdicts,
 joining to the exact sum at 25% packet loss. The bank-collapse
 experiment ran through this corpus and closed: registers are one
@@ -95,7 +95,7 @@ shared set, volatile across parks, and the compiler's burst-liveness
 codegen took Armstrong's ring from 110 to **55 cycles a pass — under
 the hand-written 60** — while the whole corpus runs cycle-identical
 with every register *poisoned* at every park (`sim6564 joe
-src/programs/ring.joe 0x6564 1024 scorch`). A context is a near page,
+src/programs/joe/ring.joe 0x6564 1024 scorch`). A context is a near page,
 a run-queue entry and a control block; nothing else survives, and
 nothing compiled ever needed more. Amendment 1
 (`docs/joe-v1-ammendment-1.md`) made the language smaller and the

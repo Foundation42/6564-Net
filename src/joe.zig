@@ -4749,7 +4749,7 @@ pub fn compile(
 const testing = std.testing;
 
 test "joe: pingpong compiles and assembles" {
-    const src = @embedFile("programs/pingpong.joe");
+    const src = @embedFile("programs/joe/pingpong.joe");
     const asm6564 = @import("asm.zig");
     inline for (.{ "Pinger", "Ponger" }) |name| {
         var diag = Diagnostic{};
@@ -4891,7 +4891,7 @@ test "joe A1.3: bounded without a watchdog is gratuitous too" {
 }
 
 test "joe: the system block parses into a plan" {
-    const src = @embedFile("programs/pingpong.joe");
+    const src = @embedFile("programs/joe/pingpong.joe");
     var p = try plan(testing.allocator, src, null);
     defer p.deinit();
     try testing.expectEqual(@as(usize, 2), p.instances.len);

@@ -25,24 +25,24 @@ const Row = struct {
 
 const sources = struct {
     const pingpong = [_][]const u8{
-        @embedFile("programs/ping.asm"),
-        @embedFile("programs/pong.asm"),
+        @embedFile("programs/asm/ping.asm"),
+        @embedFile("programs/asm/pong.asm"),
     };
     const supervise = [_][]const u8{
-        @embedFile("programs/supervisor.asm"),
-        @embedFile("programs/worker.asm"),
+        @embedFile("programs/asm/supervisor.asm"),
+        @embedFile("programs/asm/worker.asm"),
     };
     const pipeline = [_][]const u8{
-        @embedFile("programs/pipe_source.asm"),
-        @embedFile("programs/pipe_stage.asm"),
-        @embedFile("programs/pipe_sink.asm"),
+        @embedFile("programs/asm/pipe_source.asm"),
+        @embedFile("programs/asm/pipe_stage.asm"),
+        @embedFile("programs/asm/pipe_sink.asm"),
     };
     const scatter = [_][]const u8{
-        @embedFile("programs/scatter_coord.asm"),
-        @embedFile("programs/scatter_worker.asm"),
+        @embedFile("programs/asm/scatter_coord.asm"),
+        @embedFile("programs/asm/scatter_worker.asm"),
     };
     const ring = [_][]const u8{
-        @embedFile("programs/ring_node.asm"),
+        @embedFile("programs/asm/ring_node.asm"),
     };
 };
 

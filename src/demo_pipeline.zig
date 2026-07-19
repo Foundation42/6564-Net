@@ -8,16 +8,16 @@
 //! poison-pill DONE item; the sink is immortal so two-generals can't wedge
 //! the last hop.
 //!
-//! Programs: programs/pipe_source.asm, pipe_stage.asm, pipe_sink.asm.
+//! Programs: programs/asm/pipe_source.asm, pipe_stage.asm, pipe_sink.asm.
 
 const std = @import("std");
 const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const source_src = @embedFile("programs/pipe_source.asm");
-const stage_src = @embedFile("programs/pipe_stage.asm");
-const sink_src = @embedFile("programs/pipe_sink.asm");
+const source_src = @embedFile("programs/asm/pipe_source.asm");
+const stage_src = @embedFile("programs/asm/pipe_stage.asm");
+const sink_src = @embedFile("programs/asm/pipe_sink.asm");
 
 pub const Options = struct {
     seed: u64 = 0x6564,

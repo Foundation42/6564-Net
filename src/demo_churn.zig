@@ -1,4 +1,4 @@
-//! The cache-footprint experiment (programs/mem_churn.asm): D dies, each
+//! The cache-footprint experiment (programs/asm/mem_churn.asm): D dies, each
 //! visiting every line of a multi-MB stripe in LFSR order — a shuffle
 //! the host's prefetchers cannot predict (a linear stride measured
 //! nothing; see the ledger). No messaging — this workload exists to
@@ -17,7 +17,7 @@ const machine = @import("machine.zig");
 const cluster = @import("cluster.zig");
 const asm6564 = @import("asm.zig");
 
-const churn_src = @embedFile("programs/mem_churn.asm");
+const churn_src = @embedFile("programs/asm/mem_churn.asm");
 
 const stripe_base: u64 = 0x10000;
 

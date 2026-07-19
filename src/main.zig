@@ -11,43 +11,43 @@ const usage_text =
     \\  sim6564 [pingpong] [seed] [loss_ppm4k] [rounds] [trace]
     \\      Two actors bounce a value across a lossy, duplicating, reordering
     \\      fabric; ping runs an end-to-end reliable protocol built from CQ
-    \\      feedback and fabric-as-clock timers (programs/ping.asm, pong.asm).
+    \\      feedback and fabric-as-clock timers (programs/asm/ping.asm, pong.asm).
     \\      Defaults: seed 0x6564, loss 1024/4096 (25%), 8 rounds.
     \\
     \\  sim6564 supervise [trace]
     \\      A one-for-one supervision tree: exit links report crashes AND
     \\      watchdog-caught hangs to the supervisor's CQ; SPWN restarts from
-    \\      per-child budgets (programs/supervisor.asm, worker.asm).
+    \\      per-child budgets (programs/asm/supervisor.asm, worker.asm).
     \\
     \\  sim6564 pipeline [seed] [loss_ppm4k] [items] [stages] [trace]
     \\      Dataflow across stages+2 cores: per-hop stop-and-wait on app acks,
     \\      ack-on-ownership so hops overlap, backpressure by silence, and a
-    \\      poison-pill shutdown (programs/pipe_source.asm, pipe_stage.asm,
+    \\      poison-pill shutdown (programs/asm/pipe_source.asm, pipe_stage.asm,
     \\      pipe_sink.asm). Defaults: seed 0x6564, loss 1024, 16 items, 2 stages.
     \\
     \\  sim6564 scatter [seed] [loss_ppm4k] [workers] [trace]
     \\      Fan a task out to up to 8 workers, gather squared results through
     \\      one cap-8 RX ring; the result is the ack, stragglers are re-asked
-    \\      on timer ticks (programs/scatter_coord.asm, scatter_worker.asm).
+    \\      on timer ticks (programs/asm/scatter_coord.asm, scatter_worker.asm).
     \\
     \\  sim6564 ring [nodes] [laps] [trace]
     \\      Joe Armstrong's challenge: N processes in a ring, a message
     \\      around M times — N·M passes, timed in cycles per pass. All N
-    \\      processes are banked contexts on one core (programs/ring_node.asm).
+    \\      processes are banked contexts on one core (programs/asm/ring_node.asm).
     \\
     \\  sim6564 bigbrother [senders] [loss_ppm4k] [trace]
     \\      The fan-in stress test: up to 10,000 actors flood one target
-    \\      (programs/flood_sender.asm, fanin_sink.asm). Default 10000, loss 0.
+    \\      (programs/asm/flood_sender.asm, fanin_sink.asm). Default 10000, loss 0.
     \\
     \\  sim6564 forkjoin [lieutenants] [workers] [trace]
     \\      The fork-join matrix: 1 → LxW workers → LxW relays → 1 aggregator
-    \\      (programs/fj_root.asm, fj_lieutenant.asm, fj_pass.asm,
+    \\      (programs/asm/fj_root.asm, fj_lieutenant.asm, fj_pass.asm,
     \\      fanin_sink.asm). Default 8x125 = 1000.
     \\
     \\  sim6564 hello [seed] [trace]
     \\      The machine's first words: one actor prints through the console
     \\      device on the peripheral row (§7) — SEND is the only I/O
-    \\      instruction there is (programs/hello.asm).
+    \\      instruction there is (programs/asm/hello.asm).
     \\
     \\  sim6564 joe [file.joe] [seed] [loss_ppm4k] [trace] [scorch]
     \\      Compile and run any .joe file that carries a `system` block —
@@ -63,19 +63,19 @@ const usage_text =
     \\      The Mandelbrot set in IEEE 754 doubles — Tier 0 scalar FP on
     \\      the extended page (prefix $42), one console line per row,
     \\      every row asserted bit-exact against an independent oracle
-    \\      (programs/mandel.asm).
+    \\      (programs/asm/mandel.asm).
     \\
     \\  sim6564 periph [seed] [trace]
     \\      Walk the whole peripheral row: console, entropy well, RTC and
     \\      block store. The actor timestamps itself, draws random bytes,
     \\      round-trips them through a disk sector and prints its own cycle
-    \\      bill (programs/periph.asm).
+    \\      bill (programs/asm/periph.asm).
     \\
     \\  sim6564 dies [dies] [nodes_per_die] [laps] [busy_laps] [seq] [trace]
     \\      Armstrong's ring across whole dies joined by the IO plane —
     \\      one host thread per die, bit-identical to the sequential run.
     \\      Remoteness is one route byte in a PTT entry; the program can't
-    \\      tell (programs/ring_node.asm, unmodified). Default 4x50x10.
+    \\      tell (programs/asm/ring_node.asm, unmodified). Default 4x50x10.
     \\      busy_laps > 0 adds a local ring per die so every host thread
     \\      has work (the lone global token is Amdahl's law incarnate).
     \\      On asymmetric hosts (Zen X3D), add spread | vcache | freq to
@@ -98,7 +98,7 @@ const usage_text =
     \\  sim6564 churn [dies] [stripe_mb] [sweeps] [spread|vcache|freq] [seq]
     \\      The cache-footprint experiment: each die read-modify-writes a
     \\      multi-MB stripe in prefetcher-proof LFSR order
-    \\      (programs/mem_churn.asm) so thread placement on an X3D host
+    \\      (programs/asm/mem_churn.asm) so thread placement on an X3D host
     \\      has something to disagree about. stripe_mb rounds down to
     \\      {2,8,16,64}. Default 8x8MB x12 = 64 MB live working set.
     \\
@@ -168,7 +168,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, first, "joe")) {
         var opts = sim.joe_run.Options{};
-        var source: []const u8 = @embedFile("programs/pingpong.joe");
+        var source: []const u8 = @embedFile("programs/joe/pingpong.joe");
         var owned: ?[]u8 = null;
         defer if (owned) |s| alloc.free(s);
         if (args.next()) |s| {

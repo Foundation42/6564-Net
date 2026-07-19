@@ -6,15 +6,15 @@
 //! head-of-line block by design: a saturated ring drops and reject-completes,
 //! and unlucky senders retry on their own clocks.
 //!
-//! Programs: programs/flood_sender.asm, programs/fanin_sink.asm.
+//! Programs: programs/asm/flood_sender.asm, programs/asm/fanin_sink.asm.
 
 const std = @import("std");
 const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const sender_src = @embedFile("programs/flood_sender.asm");
-const sink_src = @embedFile("programs/fanin_sink.asm");
+const sender_src = @embedFile("programs/asm/flood_sender.asm");
+const sink_src = @embedFile("programs/asm/fanin_sink.asm");
 
 const per_core = 200;
 

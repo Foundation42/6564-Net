@@ -3,7 +3,7 @@
 //! random bytes, round-trips them through a disk sector, and prints the
 //! cycle bill. Every step is a SEND through a capability and a completion
 //! in the CQ; there is no other kind of I/O to fall back on.
-//! Program: programs/periph.asm.
+//! Program: programs/asm/periph.asm.
 
 const std = @import("std");
 const ring = @import("ring.zig");
@@ -11,7 +11,7 @@ const dev = @import("dev.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const periph_src = @embedFile("programs/periph.asm");
+const periph_src = @embedFile("programs/asm/periph.asm");
 
 pub const console_coord: u16 = 0xFF00;
 pub const entropy_coord: u16 = 0xFF01;

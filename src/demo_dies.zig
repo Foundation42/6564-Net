@@ -1,5 +1,5 @@
 //! Armstrong's ring across dies (spec §6.5): the same unmodified
-//! programs/ring_node.asm that set the 66-cycle benchmark, now spanning
+//! programs/asm/ring_node.asm that set the 66-cycle benchmark, now spanning
 //! D whole machines joined by the IO plane — one die per host core when
 //! `parallel` is on. Node i's PTT slot points at node i+1 exactly as
 //! before; the only difference is one byte in the last node's PTT entry:
@@ -16,7 +16,7 @@ const machine = @import("machine.zig");
 const cluster = @import("cluster.zig");
 const asm6564 = @import("asm.zig");
 
-const node_src = @embedFile("programs/ring_node.asm");
+const node_src = @embedFile("programs/asm/ring_node.asm");
 
 pub const Options = struct {
     dies: u16 = 4, // 2..16

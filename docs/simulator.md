@@ -15,7 +15,7 @@ what building it taught us. Zig 0.14.1.
 | `src/machine.zig` | Contexts, cores, memory decode, the interpreter, the hardware scheduler, the discrete-event loop. |
 | `src/asm.zig` | Two-pass assembler driven by the same ISA table. |
 | `src/integration_tests.zig` | Assembled programs run end-to-end, §6 semantics exercised. |
-| `src/programs/*.asm` | The actual 6564 programs: ping/pong, supervisor/worker, pipe_source/stage/sink. |
+| `src/programs/asm/*.asm` | The actual 6564 programs: ping/pong, supervisor/worker, pipe_source/stage/sink. |
 | `src/demo_*.zig` | Demo harnesses (wiring, staging, reporting); also driven by the test suite. |
 | `src/main.zig` | CLI dispatcher over the demos. |
 
@@ -278,8 +278,8 @@ clamped to 64), **rtc** (replies with the request's arrival cycle),
 **block** (init-time sector count/size, size 8..512; write applies at
 delivery so the fabric ack is the write ack).
 
-Demos: `sim6564 hello` (programs/hello.asm — one send, one teletype) and
-`sim6564 periph` (programs/periph.asm — walks all four devices,
+Demos: `sim6564 hello` (programs/asm/hello.asm — one send, one teletype) and
+`sim6564 periph` (programs/asm/periph.asm — walks all four devices,
 timestamps its errand off the RTC, hex-prints an entropy draw glyph by
 glyph through a one-byte char SQE, verifies a sector round-trip, prints
 its own cycle bill).
@@ -358,7 +358,7 @@ peer blocks on read — Ctrl-C, not corruption.
 
 `sim6564 churn` is the experiment that makes the X3D asymmetry speak:
 each die read-modify-writes a multi-MB stripe in maximal-period LFSR
-order (programs/mem_churn.asm). The order matters — a linear +64 stride
+order (programs/asm/mem_churn.asm). The order matters — a linear +64 stride
 measured *nothing* at 64 MB live because the host prefetcher hid all
 capacity effects; defeat the prefetcher first, then measure the cache.
 Result: parity at 16 MB live, **1.40x for the V-cache CCD at 64 MB**
@@ -378,7 +378,7 @@ again", a rejected recv request means EOF — the ack vocabulary
 suffices. Determinism scope (spec §7.4): the outside world does not
 replay; machines without a Net attached are unaffected.
 
-`programs/http_get.asm` + `sim6564 web [host] [port] [path]`: HTTP/1.1
+`programs/asm/http_get.asm` + `sim6564 web [host] [port] [path]`: HTTP/1.1
 entirely in 6564 code, chunks forwarded straight from the landing
 buffer to the console (AUTO_REPOST's deferred grant covers the console
 ack wait). Tests run it hermetically against a local TCP server thread.

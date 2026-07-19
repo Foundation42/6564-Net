@@ -760,7 +760,7 @@ Five pattern-collapse mechanisms were prototyped against frozen baseline measure
 
 ### The Capstone (v2.5)
 
-`sim6564 web` — `programs/http_get.asm`, a 6502-descendant assembly program, speaks HTTP/1.1 through the `net` device and fetches `http://example.com/` from the actual internet: 869 bytes of Cloudflare-served HTML on the teletype, 784 instructions, clean halt. The protocol lives entirely in 6564 code (§7.5's polyfill layer at its simplest); the device knows only bytes. Test coverage is hermetic — the suite runs the same program against a local TCP server. One driver lesson joined the record: a shared staged SQE is mutable state — set every field you depend on, every submission (a stale target field once sent a recv request to the teletype, which printed it, politely, forever).
+`sim6564 web` — `programs/asm/http_get.asm`, a 6502-descendant assembly program, speaks HTTP/1.1 through the `net` device and fetches `http://example.com/` from the actual internet: 869 bytes of Cloudflare-served HTML on the teletype, 784 instructions, clean halt. The protocol lives entirely in 6564 code (§7.5's polyfill layer at its simplest); the device knows only bytes. Test coverage is hermetic — the suite runs the same program against a local TCP server. One driver lesson joined the record: a shared staged SQE is mutable state — set every field you depend on, every submission (a stale target field once sent a recv request to the teletype, which printed it, politely, forever).
 
 ### The joe Campaign (v2.6)
 

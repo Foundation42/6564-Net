@@ -9,7 +9,7 @@
 //! restart budget; work accumulates in RAM across incarnations. Budgets run
 //! out; the unreliable are abandoned, honestly.
 //!
-//! Programs: programs/supervisor.asm, programs/worker.asm (one program, N
+//! Programs: programs/asm/supervisor.asm, programs/asm/worker.asm (one program, N
 //! workers — shared read-only code, distinct config blocks).
 
 const std = @import("std");
@@ -17,8 +17,8 @@ const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const supervisor_src = @embedFile("programs/supervisor.asm");
-const worker_src = @embedFile("programs/worker.asm");
+const supervisor_src = @embedFile("programs/asm/supervisor.asm");
+const worker_src = @embedFile("programs/asm/worker.asm");
 
 pub const Options = struct {
     trace: bool = false,

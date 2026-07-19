@@ -791,7 +791,7 @@ test "Tier 0 FP: FP32 narrows on store, widens on load — rounding is visible o
 
 test "joe: the loader runs pingpong.joe from its system block, sequence-checked" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/pingpong.joe");
+    const src = @embedFile("programs/joe/pingpong.joe");
     // The same gauntlet the hand-written protocol runs: 25% loss with
     // duplication, and then deep loss. joe cannot say "transport ack" —
     // the end-to-end protocol the compiler emits must carry it anyway.
@@ -806,7 +806,7 @@ test "joe: the loader runs pingpong.joe from its system block, sequence-checked"
 
 test "joe: the loader is deterministic, seed for seed" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/pingpong.joe");
+    const src = @embedFile("programs/joe/pingpong.joe");
     var a = try joe_run.simulate(testing.allocator, src, .{ .seed = 0xBEEF });
     defer a.deinit();
     var b = try joe_run.simulate(testing.allocator, src, .{ .seed = 0xBEEF });
@@ -821,7 +821,7 @@ test "joe: two instances share a core in separate blocks — placement is data" 
     // Same program, both actors forced onto core 0 as two contexts:
     // the loader gives each its own $1000 block, so nothing collides
     // and the protocol still completes.
-    const base = @embedFile("programs/pingpong.joe");
+    const base = @embedFile("programs/joe/pingpong.joe");
     const src = try std.mem.concat(testing.allocator, u8, &.{
         base[0 .. std.mem.indexOf(u8, base, "system {").?],
         \\system {
@@ -841,7 +841,7 @@ test "joe: two instances share a core in separate blocks — placement is data" 
 
 test "joe: the ring turns — 8 instances from one system block, token comes home" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/ring.joe");
+    const src = @embedFile("programs/joe/ring.joe");
     var o = try joe_run.simulate(testing.allocator, src, .{});
     defer o.deinit();
     try testing.expectEqual(machine.CtxState.halted, o.instance("n0").?.state);
@@ -1052,7 +1052,7 @@ test "A2.7: the machine's int encoder reproduces the corpus vectors" {
 
 test "A2.4: keys.joe — dispatch on structured keys is memcmp, scorched too" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/keys.joe");
+    const src = @embedFile("programs/joe/keys.joe");
     for ([_]bool{ false, true }) |burnt| {
         var o = try joe_run.simulate(testing.allocator, src, .{
             .loss_ppm4k = 0,
@@ -1322,7 +1322,7 @@ test "tier 1: a 256-element dot product, bit-exact against the host mirror" {
 
 test "A1.4: vecmath.joe — SIMD is a data type with operators, bit-exact" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/vecmath.joe");
+    const src = @embedFile("programs/joe/vecmath.joe");
     var o = try joe_run.simulate(testing.allocator, src, .{});
     defer o.deinit();
     try testing.expectEqual(machine.CtxState.halted, o.instance("calc").?.state);
@@ -1593,7 +1593,7 @@ test "item 7: the MAC re-trial — the store's twelve comparators, one routine" 
     // scorch, naturally, since MAC linkage is stack state inside a
     // burst and nothing survives the parks.
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/store.joe");
+    const src = @embedFile("programs/joe/store.joe");
     var bytes: [2]usize = undefined;
     var cycles: [2]u64 = undefined;
     var calls: [2]u64 = undefined;
@@ -1624,7 +1624,7 @@ test "item 7: the MAC re-trial — the store's twelve comparators, one routine" 
 
 test "item 6b: matmul.joe — grant, type-state, rebind; both silicons, same bits" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/matmul.joe");
+    const src = @embedFile("programs/joe/matmul.joe");
     // the same program against the remote polyfill: one name changes
     var remote_src_buf: [8192]u8 = undefined;
     const remote_src = blk: {
@@ -1691,7 +1691,7 @@ test "A2.5: store.joe — the substrate's shape, polyfilled by an ordinary actor
     // canonical struple keys, served entirely from joe — byte equality,
     // copy, overwrite, delete, honest misses. Scorched and not.
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/store.joe");
+    const src = @embedFile("programs/joe/store.joe");
     for ([_]bool{ false, true }) |burnt| {
         var o = try joe_run.simulate(testing.allocator, src, .{
             .loss_ppm4k = 0,
@@ -1782,7 +1782,7 @@ test "contended LSTN: the idle-core hot path keeps its privilege" {
     // crunch's self-send loop shares its core with nobody runnable, so
     // the rule must not tax it: cycle-identical with the rule on or off.
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/crunch.joe");
+    const src = @embedFile("programs/joe/crunch.joe");
     var on = try joe_run.simulate(testing.allocator, src, .{});
     defer on.deinit();
     var off = try joe_run.simulate(testing.allocator, src, .{ .contended_lstn = false });
@@ -1799,13 +1799,13 @@ test "item 4: the joe corpus is scorch-invariant — nothing trusts the banked f
     // near page + run-queue entry + control block, nothing else.
     const joe_run = @import("joe_run.zig");
     const sources = [_][]const u8{
-        @embedFile("programs/pingpong.joe"),
-        @embedFile("programs/ring.joe"),
-        @embedFile("programs/crunch.joe"),
-        @embedFile("programs/supervise.joe"),
-        @embedFile("programs/scatter.joe"),
-        @embedFile("programs/pipeline.joe"),
-        @embedFile("programs/hello.joe"),
+        @embedFile("programs/joe/pingpong.joe"),
+        @embedFile("programs/joe/ring.joe"),
+        @embedFile("programs/joe/crunch.joe"),
+        @embedFile("programs/joe/supervise.joe"),
+        @embedFile("programs/joe/scatter.joe"),
+        @embedFile("programs/joe/pipeline.joe"),
+        @embedFile("programs/joe/hello.joe"),
     };
     for (sources) |src| {
         var plain = try joe_run.simulate(testing.allocator, src, .{});
@@ -1833,17 +1833,17 @@ test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
     // static near-page temporaries instead of the stack, so there is
     // not one push in the whole corpus — init included.
     const corpus = [_]struct { src: []const u8, actors: []const []const u8 }{
-        .{ .src = @embedFile("programs/pingpong.joe"), .actors = &.{ "Pinger", "Ponger" } },
-        .{ .src = @embedFile("programs/ring.joe"), .actors = &.{ "Head", "Node" } },
-        .{ .src = @embedFile("programs/crunch.joe"), .actors = &.{ "Cruncher", "Sink" } },
-        .{ .src = @embedFile("programs/supervise.joe"), .actors = &.{ "Boss", "Griefer", "Sleeper" } },
-        .{ .src = @embedFile("programs/forkjoin.joe"), .actors = &.{ "Root", "Lieutenant", "Worker" } },
-        .{ .src = @embedFile("programs/pipeline.joe"), .actors = &.{ "Source", "Stage", "Sink" } },
-        .{ .src = @embedFile("programs/hello.joe"), .actors = &.{"Greeter"} },
-        .{ .src = @embedFile("programs/keys.joe"), .actors = &.{ "Asker", "Router" } },
-        .{ .src = @embedFile("programs/store.joe"), .actors = &.{ "Store", "Client" } },
-        .{ .src = @embedFile("programs/vecmath.joe"), .actors = &.{"Calc"} },
-        .{ .src = @embedFile("programs/matmul.joe"), .actors = &.{"Splat"} },
+        .{ .src = @embedFile("programs/joe/pingpong.joe"), .actors = &.{ "Pinger", "Ponger" } },
+        .{ .src = @embedFile("programs/joe/ring.joe"), .actors = &.{ "Head", "Node" } },
+        .{ .src = @embedFile("programs/joe/crunch.joe"), .actors = &.{ "Cruncher", "Sink" } },
+        .{ .src = @embedFile("programs/joe/supervise.joe"), .actors = &.{ "Boss", "Griefer", "Sleeper" } },
+        .{ .src = @embedFile("programs/joe/forkjoin.joe"), .actors = &.{ "Root", "Lieutenant", "Worker" } },
+        .{ .src = @embedFile("programs/joe/pipeline.joe"), .actors = &.{ "Source", "Stage", "Sink" } },
+        .{ .src = @embedFile("programs/joe/hello.joe"), .actors = &.{"Greeter"} },
+        .{ .src = @embedFile("programs/joe/keys.joe"), .actors = &.{ "Asker", "Router" } },
+        .{ .src = @embedFile("programs/joe/store.joe"), .actors = &.{ "Store", "Client" } },
+        .{ .src = @embedFile("programs/joe/vecmath.joe"), .actors = &.{"Calc"} },
+        .{ .src = @embedFile("programs/joe/matmul.joe"), .actors = &.{"Splat"} },
     };
     for (corpus) |entry| {
         for (entry.actors) |name| {
@@ -1858,7 +1858,7 @@ test "item 4: compiled joe is stack-free — even SP owes the parks nothing" {
 
 test "joe: supervision — spawn, respawn, hung, abandoned, all from the system block" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/supervise.joe");
+    const src = @embedFile("programs/joe/supervise.joe");
     var o = try joe_run.simulate(testing.allocator, src, .{});
     defer o.deinit();
     // The Boss observed exactly the policy it declared: the Griefer
@@ -1883,7 +1883,7 @@ test "joe: supervision — spawn, respawn, hung, abandoned, all from the system 
 
 test "joe A1.1: crunch — unbounded work is a self-send loop, one park per slice" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/crunch.joe");
+    const src = @embedFile("programs/joe/crunch.joe");
     var o = try joe_run.simulate(testing.allocator, src, .{});
     defer o.deinit();
     // Sum 1..1000 in slices of 50: twenty parks, one exact total.
@@ -1900,7 +1900,7 @@ test "joe A1.1: crunch — unbounded work is a self-send loop, one park per slic
 
 test "joe: scatter — the result is the ack; re-asks converge through loss" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/scatter.joe");
+    const src = @embedFile("programs/joe/scatter.joe");
     var o = try joe_run.simulate(testing.allocator, src, .{});
     defer o.deinit();
     try testing.expectEqual(machine.CtxState.halted, o.instance("coord").?.state);
@@ -1914,7 +1914,7 @@ test "joe: scatter — the result is the ack; re-asks converge through loss" {
 
 test "joe: pipeline — backpressure by silence, termination as a phase" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/pipeline.joe");
+    const src = @embedFile("programs/joe/pipeline.joe");
     // 25% loss AND deep loss: every item arrives checksum-verified, the
     // pill drains the line, and every stage lame-ducks into quiescence.
     for ([_]u16{ 1024, 2500 }) |loss| {
@@ -1931,7 +1931,7 @@ test "joe: pipeline — backpressure by silence, termination as a phase" {
 
 test "joe: hello — the console is just another name in the system block" {
     const joe_run = @import("joe_run.zig");
-    const src = @embedFile("programs/hello.joe");
+    const src = @embedFile("programs/joe/hello.joe");
     var o = try joe_run.simulate(testing.allocator, src, .{
         .loss_ppm4k = 0,
         .dup_ppm4k = 0,
@@ -1944,7 +1944,7 @@ test "joe: hello — the console is just another name in the system block" {
 test "joe: fork-join — replication, groups, for; the tree is the reliability" {
     const joe_run = @import("joe_run.zig");
     // The shipped forkjoin.joe runs 8x125 (sim6564 joe src/programs/
-    // forkjoin.joe); the suite runs the same shape at 2x20 so Debug
+    // joe/forkjoin.joe); the suite runs the same shape at 2x20 so Debug
     // stays quick. Every hop acks through the tree — workers retry
     // Results until acked, lieutenants retry Done, the root lame-ducks
     // instead of halting so no straggler is ever stranded.

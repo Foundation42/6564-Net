@@ -12,7 +12,7 @@ const dev = @import("dev.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const http_src = @embedFile("programs/http_get.asm");
+const http_src = @embedFile("programs/asm/http_get.asm");
 
 pub const console_coord: u16 = 0xFF00;
 pub const net_coord: u16 = 0xFF04;

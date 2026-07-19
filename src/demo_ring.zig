@@ -7,14 +7,14 @@
 //! The measurement this benchmark exists for: cycles per message pass,
 //! actor to actor, scheduler included.
 //!
-//! Program: programs/ring_node.asm (one program, N nodes).
+//! Program: programs/asm/ring_node.asm (one program, N nodes).
 
 const std = @import("std");
 const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const node_src = @embedFile("programs/ring_node.asm");
+const node_src = @embedFile("programs/asm/ring_node.asm");
 
 pub const Options = struct {
     nodes: u16 = 64, // 2..200

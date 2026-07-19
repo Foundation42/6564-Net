@@ -21,10 +21,10 @@ const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const root_src = @embedFile("programs/fj_root.asm");
-const lieutenant_src = @embedFile("programs/fj_lieutenant.asm");
-const pass_src = @embedFile("programs/fj_pass.asm");
-const sink_src = @embedFile("programs/fanin_sink.asm");
+const root_src = @embedFile("programs/asm/fj_root.asm");
+const lieutenant_src = @embedFile("programs/asm/fj_lieutenant.asm");
+const pass_src = @embedFile("programs/asm/fj_pass.asm");
+const sink_src = @embedFile("programs/asm/fanin_sink.asm");
 
 pub const Options = struct {
     lieutenants: u16 = 8, // 1..16

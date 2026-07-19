@@ -17,7 +17,7 @@ const cluster = @import("cluster.zig");
 const bridge = @import("bridge.zig");
 const asm6564 = @import("asm.zig");
 
-const node_src = @embedFile("programs/ring_node.asm");
+const node_src = @embedFile("programs/asm/ring_node.asm");
 
 pub const connector_base: u16 = 256;
 

@@ -8,15 +8,15 @@
 //! New coverage: fan-in through a capacity-8 RX ring with eight posted
 //! landing buffers, each carrying its own address as its completion cookie.
 //!
-//! Programs: programs/scatter_coord.asm, programs/scatter_worker.asm.
+//! Programs: programs/asm/scatter_coord.asm, programs/asm/scatter_worker.asm.
 
 const std = @import("std");
 const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const coord_src = @embedFile("programs/scatter_coord.asm");
-const worker_src = @embedFile("programs/scatter_worker.asm");
+const coord_src = @embedFile("programs/asm/scatter_coord.asm");
+const worker_src = @embedFile("programs/asm/scatter_worker.asm");
 
 pub const Options = struct {
     seed: u64 = 0x6564,

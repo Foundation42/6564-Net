@@ -1,7 +1,7 @@
 //! Hello demo: one actor, one capability, one teletype on the fabric.
 //! The smallest possible proof of §7 — the machine's first words reach
 //! the world through the same SEND every actor already speaks.
-//! Program: programs/hello.asm.
+//! Program: programs/asm/hello.asm.
 
 const std = @import("std");
 const ring = @import("ring.zig");
@@ -9,7 +9,7 @@ const dev = @import("dev.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const hello_src = @embedFile("programs/hello.asm");
+const hello_src = @embedFile("programs/asm/hello.asm");
 
 pub const console_coord: u16 = 0xFF00;
 

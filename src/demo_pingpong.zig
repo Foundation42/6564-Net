@@ -1,5 +1,5 @@
 //! Ping-pong demo: two actors bounce a value across a hostile fabric.
-//! Programs live in programs/ping.asm and programs/pong.asm.
+//! Programs live in programs/asm/ping.asm and programs/asm/pong.asm.
 
 const std = @import("std");
 const isa = @import("isa.zig");
@@ -7,8 +7,8 @@ const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 
-const ping_src = @embedFile("programs/ping.asm");
-const pong_src = @embedFile("programs/pong.asm");
+const ping_src = @embedFile("programs/asm/ping.asm");
+const pong_src = @embedFile("programs/asm/pong.asm");
 
 pub const Options = struct {
     seed: u64 = 0x6564,
