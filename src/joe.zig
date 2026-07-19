@@ -111,6 +111,9 @@ pub const Layout = struct {
 /// wiring a driver to its device is the same act as wiring two actors.
 const device_reply_window: u64 = @as(u64, 0xFF) << 56;
 
+/// Bytes an outbound message image may occupy: staging() to land0().
+const staging_room: u16 = 0x80;
+
 pub const abi = struct {
     pub const timer_desc: u8 = 5;
     pub const land_cap: u64 = 64;
@@ -229,6 +232,8 @@ const Expr = union(enum) {
     /// `key.count()` — walk a buf's elements with the total skip (A2.2);
     /// data-dependent by nature, so A1.3's rules apply in full.
     count: []const u8,
+    /// `bind.field.len` — the byte count of a device reply's raw payload.
+    paylen: struct { base: []const u8, name: []const u8 },
     /// A float literal, as its f64 bits.
     float: u64,
     /// `[1.0, 2.0, …]` — a vector literal, eight f64 lanes (zero-padded).
@@ -282,6 +287,9 @@ const Stmt = union(enum) {
     /// `send tty, b` — a buf's current bytes, verbatim, length at send
     /// time (Amendment 3). Raw is for devices; actors take messages.
     send_buf: struct { target: []const u8, buf: []const u8, line: usize },
+    /// `send tty, ch.data` — forward a device reply's raw payload from
+    /// the landing buffer; the fabric's own count is its length.
+    send_field: struct { target: []const u8, bind: []const u8, field: []const u8, line: usize },
     /// `clear b` / `append b, …` — the raw dialect (Amendment 3):
     /// `pack` speaks struple to actors, `append` speaks raw to devices.
     clear_: struct { buf: []const u8, line: usize },
@@ -307,7 +315,7 @@ const Stmt = union(enum) {
     },
 };
 
-const AppendSrc = union(enum) { str: []const u8, byte: *Expr };
+const AppendSrc = union(enum) { str: []const u8, byte: *Expr, name: []const u8 };
 
 const ExitCause = enum { crash, hung, abandoned };
 
@@ -1007,28 +1015,29 @@ const Parser = struct {
             if (self.tok.kind == .string) {
                 if (target_idx != null)
                     return self.fail("a string send goes to one device", Error.Semantics);
-                // decode escapes into the arena
-                var text = std.ArrayList(u8).init(self.arena);
-                var j: usize = 0;
-                const raw = self.tok.text;
-                while (j < raw.len) : (j += 1) {
-                    if (raw[j] == '\\' and j + 1 < raw.len) {
-                        j += 1;
-                        try text.append(switch (raw[j]) {
-                            'n' => '\n',
-                            't' => '\t',
-                            else => raw[j],
-                        });
-                    } else try text.append(raw[j]);
-                }
+                const text = try self.decodeStr(self.tok.text);
                 try self.advance();
                 return .{ .send_str = .{
                     .target = target.text,
-                    .text = try text.toOwnedSlice(),
+                    .text = text,
                     .line = line,
                 } };
             }
             const msg = try self.expect(.ident, "message name");
+            if (self.tok.kind == .dot) {
+                // `send tty, ch.data` — a device reply's raw payload,
+                // forwarded straight from the landing buffer.
+                try self.advance();
+                const fname = try self.expect(.ident, "field name");
+                if (target_idx != null)
+                    return self.fail("a raw send goes to one device", Error.Semantics);
+                return .{ .send_field = .{
+                    .target = target.text,
+                    .bind = msg.text,
+                    .field = fname.text,
+                    .line = line,
+                } };
+            }
             if (self.tok.kind != .lbrace) {
                 // `send tty, b` — a buf, raw (Amendment 3).
                 if (target_idx != null)
@@ -1167,7 +1176,13 @@ const Parser = struct {
                 _ = try self.expect(.rparen, ")");
                 return .{ .append_ = .{ .buf = bname.text, .src = .{ .byte = e }, .line = line } };
             }
-            return self.fail("append takes a string literal or byte(expr) (v1)", Error.Unsupported);
+            if (self.tok.kind == .ident) {
+                // A const's bytes, whole — the literal it names.
+                const cname = self.tok.text;
+                try self.advance();
+                return .{ .append_ = .{ .buf = bname.text, .src = .{ .name = cname }, .line = line } };
+            }
+            return self.fail("append takes a literal, a const or byte(expr) (v1)", Error.Unsupported);
         }
         if (self.isKw("while"))
             return self.fail(
@@ -1248,6 +1263,8 @@ const Parser = struct {
                 try text.append(switch (raw[j]) {
                     'n' => '\n',
                     't' => '\t',
+                    'r' => '\r',
+                    '0' => 0,
                     else => raw[j],
                 });
             } else try text.append(raw[j]);
@@ -1442,6 +1459,16 @@ const Parser = struct {
                         }
                         return self.fail("v1 methods: `.count()`, `.reduce(op)`, `.permute([…])`", Error.Unsupported);
                     }
+                    if (self.tok.kind == .dot) {
+                        // `ch.data.len` — how many bytes a device reply's
+                        // payload actually carried (A3.3): the fabric
+                        // counted them, so nothing in-band has to.
+                        try self.advance();
+                        const m = try self.expect(.ident, "`len`");
+                        if (!std.mem.eql(u8, m.text, "len"))
+                            return self.fail("a payload has `.len` (v1)", Error.Unsupported);
+                        return self.mkExpr(.{ .paylen = .{ .base = name, .name = f.text } });
+                    }
                     return self.mkExpr(.{ .field = .{ .base = name, .name = f.text } });
                 }
                 if (self.tok.kind == .lbracket) {
@@ -1554,6 +1581,7 @@ const BoundedRec = struct { line: usize, n: u64, body_cost: u64, body_dyn: bool 
 /// slot and the data slab.
 const BufInfo = struct { len_slot: u16, data: u16, cap: u16 };
 
+
 /// A registered region inside the generator: its descriptor slot, RAM
 /// area, and the compile-time grant state.
 const RegionInfo = struct {
@@ -1626,6 +1654,13 @@ const Gen = struct {
     /// first use, so an unreferenced const costs an actor nothing.
     const_labels: std.StringHashMap(usize),
     off_w0: u16 = 0,
+    /// How many bytes this delivery actually carried (completion word0's
+    /// count field). A device's raw payload has no length byte — the
+    /// fabric already counted it, so the count IS the framing (A3.3).
+    off_dcount: u16 = 0,
+    /// Set when a handler forwards a device reply's raw bytes: the serve
+    /// loop then keeps the count for every delivery.
+    needs_dcount: bool = false,
     off_ptr: u16 = 0,
     off_t: u16 = 0,
     off_acc: u16 = 0,
@@ -1765,7 +1800,8 @@ const Gen = struct {
         self.off_masks = off + 120; // 8 slots (index k*8, k = 1..7)
         self.off_vlit = off + 184; // 64 B
         self.off_mc = off + 248; // 3 slots: arg, rem, X stash
-        self.spawn_base = off + 272;
+        self.off_dcount = off + 272; // this delivery's byte count (A3.3)
+        self.spawn_base = off + 280;
         for (self.actor.handlers) |h| {
             if (h == .after) {
                 self.uses_timer = true;
@@ -1829,6 +1865,14 @@ const Gen = struct {
         self.next_slot = aoff;
         if (abi.array_off + area > abi.block_size - abi.data_off - 0x400)
             return self.fail(0, "arrays overflow the instance block", Error.Semantics);
+        // Can any answer this system speaks carry a raw payload? Then
+        // every delivery keeps its count (A3.3) — four instructions in
+        // the dispatcher, and only for actors in device conversations.
+        for (self.prog.messages) |*m| {
+            if (!m.is_reply) continue;
+            if (m.fields.len > 0 and m.fields[m.fields.len - 1].ty == .bytes_)
+                self.needs_dcount = true;
+        }
         if (self.layout.mac) {
             self.mac_candidates = self.countBufEq();
             if (self.mac_candidates >= 2) try self.prescanMacShapes();
@@ -2122,7 +2166,7 @@ const Gen = struct {
             .vlit, .permute => return .vec_,
             .reduce => return .f64_,
             .cast => |c| return if (c.to_f64) .f64_ else .u64_,
-            .count, .grantref => return .u64_,
+            .count, .grantref, .paylen => return .u64_,
             .index => |ix| {
                 if (self.arrays.get(ix.base)) |arr| {
                     if (arr.f64) return .f64_;
@@ -2380,6 +2424,24 @@ const Gen = struct {
                 try self.w("        ASL #3", .{});
                 try self.w("        TAY", .{});
                 try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
+            },
+            .paylen => |px| {
+                const bind = self.bind orelse
+                    return self.fail(0, "a payload length needs a case binding", Error.Semantics);
+                if (!std.mem.eql(u8, bind, px.base))
+                    return self.fail(0, "field base is not the case binding", Error.Semantics);
+                const bmsg = self.bind_msg.?;
+                if (!bmsg.is_reply)
+                    return self.fail(0, "`.len` is a device reply's payload count (A3.3)", Error.Semantics);
+                const fld = for (bmsg.fields) |*fl| {
+                    if (std.mem.eql(u8, fl.name, px.name)) break fl;
+                } else return self.fail(0, "no such field in the reply", Error.Semantics);
+                if (fld.ty != .bytes_)
+                    return self.fail(0, "`.len` measures a bytes payload", Error.Semantics);
+                self.needs_dcount = true;
+                try self.w("        LDA ${X}", .{self.off_dcount});
+                try self.w("        SEC", .{});
+                try self.w("        SBC #{d}", .{fld.offset});
             },
             .count => |bname| {
                 const bi = self.bufs.get(bname) orelse
@@ -2935,7 +2997,18 @@ const Gen = struct {
             .append_ => |ap| {
                 const bi = self.bufs.get(ap.buf) orelse
                     return self.fail(ap.line, "`append` fills a buf", Error.Semantics);
-                switch (ap.src) {
+                var src = ap.src;
+                if (src == .name) {
+                    // A const appends as the literal it names.
+                    for (self.prog.consts) |c| {
+                        if (std.mem.eql(u8, c.name, src.name)) {
+                            src = .{ .str = c.text };
+                            break;
+                        }
+                    } else return self.fail(ap.line, "append takes a literal, a const or byte(expr)", Error.Semantics);
+                }
+                switch (src) {
+                    .name => unreachable,
                     .str => |txt| {
                         if (txt.len == 0) return;
                         if (txt.len > bi.cap)
@@ -2967,6 +3040,53 @@ const Gen = struct {
                         try self.w("        INC ${X}", .{bi.len_slot});
                     },
                 }
+            },
+            .send_field => |sf| {
+                const tslot = self.slots.get(sf.target) orelse
+                    return self.fail(sf.line, "unknown send target", Error.Semantics);
+                const bind = self.bind orelse
+                    return self.fail(sf.line, "forwarding a payload needs a case binding", Error.Semantics);
+                if (!std.mem.eql(u8, bind, sf.bind))
+                    return self.fail(sf.line, "field base is not the case binding", Error.Semantics);
+                const bmsg = self.bind_msg.?;
+                if (!bmsg.is_reply)
+                    return self.fail(sf.line, "raw forwarding is for a device reply's payload (A3.3)", Error.Semantics);
+                const fld = for (bmsg.fields) |*fl| {
+                    if (std.mem.eql(u8, fl.name, sf.field)) break fl;
+                } else return self.fail(sf.line, "no such field in the reply", Error.Semantics);
+                if (fld.ty != .bytes_)
+                    return self.fail(sf.line, "only a bytes field forwards raw", Error.Semantics);
+                // Copy the payload out of the landing buffer first: it is
+                // AUTO_REPOST space, so hardware may refill it the moment
+                // this handler parks — pointing an SQE at it hands the
+                // fabric a buffer the fabric owns. (Chunks went missing
+                // exactly this way; the copy is 7 word moves, priced.)
+                try self.w("; forward {s}.{s}: stage it, then send — never point at a re-granted buffer", .{ sf.bind, sf.field });
+                try self.w("        LDA ${X}", .{self.off_ptr});
+                try self.w("        CLC", .{});
+                try self.w("        ADC #{d}", .{fld.offset});
+                try self.w("        STA ${X}", .{self.off_fp});
+                try self.w("        LDA ##${X}", .{self.layout.staging()});
+                try self.w("        STA ${X}", .{self.off_t});
+                var wo: u16 = 0;
+                while (fld.offset + wo < abi.land_cap) : (wo += 8) {
+                    try self.w("        LDY #{d}", .{wo});
+                    try self.w("        LDA (${X}),Y", .{self.off_fp});
+                    try self.w("        STA (${X}),Y", .{self.off_t});
+                }
+                try self.w("        LDA #1              ; SQE: op = send", .{});
+                try self.w("        STA !${X}", .{self.layout.sqBase()});
+                try self.w("        LDA ${X}", .{tslot});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
+                try self.w("        LDA ##${X}", .{self.layout.staging()});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 16});
+                // length = what the fabric counted, less the header
+                try self.w("        LDA ${X}", .{self.off_dcount});
+                try self.w("        SEC", .{});
+                try self.w("        SBC #{d}", .{fld.offset});
+                try self.w("        ORA ##${X}", .{@as(u64, 1) << 32});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 24});
+                try self.w("        SEND 0", .{});
             },
             .send_buf => |sb| {
                 const tslot = self.slots.get(sb.target) orelse
@@ -3834,6 +3954,11 @@ const Gen = struct {
                     };
                     const bi = self.bufs.get(bname) orelse
                         return self.fail(sd.line, "a device's bytes argument is a buf", Error.Semantics);
+                    // The staged image must fit its room, or it would
+                    // scribble on the landing entries next door — the
+                    // overlap lesson, charged at compile time.
+                    if (f.offset + bi.cap > staging_room)
+                        return self.fail(sd.line, "this request overflows the staging area — shrink the buf", Error.Semantics);
                     var wo: u16 = 0;
                     while (wo < bi.cap) : (wo += 8) {
                         try self.w("        LDA ${X}", .{bi.data + wo});
@@ -4183,7 +4308,7 @@ const Gen = struct {
         // in one compare — acks, exits, timers and empty pops all fail it.
         // word0 rides in Y (registers are free within a burst); the near
         // page is touched only for what the handlers actually need.
-        const has_other = self.uses_timer or self.spawn_count > 0;
+        const has_other = self.uses_timer or self.spawn_count > 0 or self.needs_dcount;
         const l_other = if (has_other) self.label() else self.serve_label;
         try self.w("; serve: LSTN, pop, fused deliver test — acks fail one compare", .{});
         try self.w("L{d}:   LSTN 1", .{self.serve_label});
@@ -4200,6 +4325,14 @@ const Gen = struct {
         try self.w("        CMP #{d}", .{@intFromEnum(ring.Tag.deliver)});
         try self.w("        BNE L{d}", .{l_other});
         try self.w("        STX ${X}", .{self.off_ptr});
+        if (self.needs_dcount) {
+            // The fabric counted the bytes; keep the count for whoever
+            // forwards a device's raw payload.
+            try self.w("        TYA", .{});
+            try self.w("        LSR #32", .{});
+            try self.w("        AND ##$FFFF_FFFF", .{});
+            try self.w("        STA ${X}", .{self.off_dcount});
+        }
         try self.emitRegionDispatcher();
         try self.emitCaseLadder(self.actor.handlers, self.serve_label);
 

@@ -1,0 +1,80 @@
+// http.joe — the web capstone, in joe.
+//
+// §7.5's rule is that silicon is an optimization, never an interface: a
+// device contract is valid only if an ordinary actor could implement
+// it, so HTTP is not a device — it is a program. http_get.asm proved
+// that in assembly; this proves the language can say it too, and says
+// it in about a page.
+//
+// The whole protocol is four asks and a pump. `open` gives a connection
+// id, the GET goes down as raw bytes, and `recv` is asked over and over:
+// an answer with bytes is a chunk to print, an answer with none means
+// "nothing yet, ask again" — the tag-only reply of §7.3 — and a REJECTED
+// request means EOF. No in-band framing anywhere; the ack vocabulary
+// already suffices, exactly as the device contract says.
+//
+// What joe cannot see, it does not pretend to: there is no transport
+// verdict here, so the pump is driven entirely by answers. The `after`
+// timer is the one hand on the shoulder — if a recv answer is lost, the
+// tick asks again.
+
+const req = "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: sim6564\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+
+message Open { op u64, port u64, host bytes } -> Conn { id u64 }
+message Get { op u64, body bytes } -> Sent { }
+message Recv { op u64, max u64 } -> Chunk { data bytes }
+message Bye { op u64 } -> _
+
+actor Client(tty addr, net addr) {
+    var host buf [24]u8
+    var body buf [96]u8
+    var conn u64 = 0
+    var chunks u64 = 0
+    var bytes u64 = 0
+    var quiet u64 = 0
+
+    append host, "example.com"
+    append body, req
+    send net, Open{0, 80, host}          // op 0: open
+
+    serve {
+        case Conn(c):
+            conn = c.id
+            send net, Get{1 + (c.id << 8), body}    // op 1 | conn << 8: send
+
+        case Sent(_):
+            send net, Recv{2 + (conn << 8), 48}     // op 2 | conn << 8: recv
+
+        after 6000:
+            // The answer is the only clock. joe cannot hear a transport
+            // verdict, so it cannot hear the device's EOF either — what
+            // it CAN hear is silence, and silence is enough: ask again a
+            // few times, then close and go. (An idle timeout is what
+            // every real client does with a connection that stops
+            // talking; here it is the only thing to do, honestly.)
+            quiet += 1
+            if quiet > 6 {
+                send net, Bye{3 + (conn << 8)}
+                halt ok
+            }
+            send net, Recv{2 + (conn << 8), 48}
+
+        case Chunk(ch):
+            // An answer with bytes is a chunk; a tag-only answer means
+            // "nothing yet". The fabric counted the bytes, so `.len`
+            // says which without a byte of in-band framing.
+            if ch.data.len > 0 {
+                chunks += 1
+                bytes += ch.data.len
+                quiet = 0
+                send tty, ch.data
+            }
+            send net, Recv{2 + (conn << 8), 48}
+    }
+}
+
+system {
+    c = Client(tty, net) on 0
+    tty = Console()
+    net = Net()
+}
