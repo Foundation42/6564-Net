@@ -13,10 +13,29 @@
 ; and a reply may race its own send-ack on the fabric — so the ack wait
 ; stashes any delivery record it pops ($8B0/$8B8) for getrx to collect.
 ;
-; Harness contract:
-;   PTT 0 console  1 entropy  2 rtc  3 block (64-byte sectors)
-;   desc slots: 0 SQ ($2400), 1 CQ, 2 RX ($2100), 5 char SQ ($2480)
-;   reply window in every device's PTT: slot 0 → our RX ring
+; The contract, as directives: four pinned capabilities (the request
+; SQEs bake their targets, and the RTC answers to token 0 — it keeps no
+; secrets), `reply` wiring each answering device's own PTT slot 0 back
+; at our RX ring, and the rings the code addresses at their pinned
+; bases. The RX landing entries are the code's own business (lines
+; below stage them before RECV); the elapsed count at near $890 is the
+; machine's own RTC arithmetic, read back into the report.
+
+        .actor Periph(con cap = 0, ent cap = 1 reply, rtc cap = 2 reply, blk cap = 3 reply)
+        .ring 0 sq base=$2400 cap=1
+        .ring 5 sq base=$2480 cap=1
+        .ring 1 cq cap=16
+        .ring 2 rx base=$2100 cap=2 auto_repost
+        .reserve $2200 $400
+        .var elapsed $890
+
+        .system
+        p = Periph(con, ent, rtc, blk)
+        con = Console()
+        ent = Entropy()
+        rtc = Rtc()
+        blk = Block()
+        .endsystem
 
         .org $1000
         ; two landing buffers (cap-2 AUTO_REPOST ring; cookie = buffer)

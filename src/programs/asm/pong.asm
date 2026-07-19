@@ -7,8 +7,19 @@
 ; need no distinction here anymore. The completion cookie is the landing
 ; buffer's address.
 ;
-; Harness contract: PTT 0 → peer's RX ring; desc slots 0 SQ / 1 CQ / 2 RX
-; (cap 2, AUTO_REPOST); $2500 outgoing echo buffer, $820 served counter.
+; The contract, as directives: the capability back to ping pinned at
+; PTT 0 (the SQE below bakes the window constant) and the demo's three
+; rings — SQ, CQ, and the cap-2 AUTO_REPOST RX whose landing entries the
+; code stages itself at $2100. $2500 is the outgoing echo buffer; the
+; served counter at near $820 is the readback. Ping is the lead source:
+; the deployment's .system block lives there.
+
+        .actor Pong(peer cap = 0)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq base=$2000 cap=16
+        .ring 2 rx base=$2100 cap=2 auto_repost
+        .reserve $2200 $400
+        .var served $820
 
         .org $1000
         ; stage both RX landing entries (cookie = buffer address)

@@ -6,11 +6,35 @@
 ; unroutable prefix (PTT slot 1, the black hole) is a guaranteed timeout
 ; completion, send_timeout cycles later. The fabric is the clock (spec §6.3).
 ;
-; Harness contract:
-;   PTT 0 → peer's RX ring        PTT 1 → black hole (timer)
-;   desc slots: 0 SQ, 1 CQ, 2 RX (rings wired by harness)
-;   $2600 rounds (staged by harness)   $2280 final value (we report)
-;   $2500 message buffer               $2200 landing buffer
+; The contract, as directives the loader executes (src/asm_run.zig): the
+; peer capability pinned at PTT 0 and the black-hole timer at PTT 1 (both
+; window constants are baked into the SQEs below, and the timer's period
+; is the fabric's send_timeout), the demo's four rings — SQ, CQ, the
+; timer SQ at slot 5, and the cap-2 AUTO_REPOST RX whose landing entries
+; the code stages itself at $2100 — the round count staged at $2600, and
+; the final value at $2280 plus the retransmission count at near $818 for
+; the outcome report. $2500 is the message buffer, $2200/$2240 the
+; landing buffers.
+;
+; The .system block is the demo's deployment: ping on core 0, pong on
+; core 1, eight rounds. Ping is declared first because spawn is reverse
+; declaration order — pong must be parked listening before ping moves.
+
+        .actor Ping(peer cap = 0, rounds arg @ $2600)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq base=$2000 cap=16
+        .ring 5 sq base=$2480 cap=1
+        .ring 2 rx base=$2100 cap=2 auto_repost
+        .timer = 1 period=2500
+        .reserve $2200 $400
+        .var final $2280
+        .var retransmissions $818
+        .use "pong.asm"
+
+        .system
+        p = Ping(q, 8) on 0
+        q = Pong(p) on 1
+        .endsystem
 
         .org $1000
         LDA !$2600          ; rounds

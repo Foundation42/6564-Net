@@ -36,6 +36,8 @@
 //!                        pointer; period becomes the fabric timeout.
 //!   .stage $B00 1, 2, 3  qwords the loader writes before spawn (near
 //!                        page below $1000, core RAM at and above it).
+//!   .reserve $2200 $400  RAM the program owns (buffers, request cells):
+//!                        the loader allocates nothing on top of it.
 //!   .var name $850       a named readback cell for the outcome report.
 //!   .use "pong.asm"      another actor's source joins the system.
 //!   .system … .endsystem the deployment, in joe's system-block grammar —
@@ -98,6 +100,10 @@ pub const MetaParam = struct {
     /// `cap[]` / `arg[]`: a group reference staged as an 8-byte-stride array.
     group: bool = false,
     where: ParamWhere,
+    /// Trailing `reply`: this capability's target sends data back — the
+    /// loader stages the target's own capability aimed at our RX ring
+    /// (a device's reply window, staged like wiring any two actors).
+    reply: bool = false,
 };
 
 /// One `.ring` descriptor for the loader to stage.
@@ -116,6 +122,9 @@ pub const MetaRing = struct {
 };
 
 pub const MetaStage = struct { addr: u64, values: []u64 };
+/// `.reserve addr len` — RAM the program owns (buffers, request cells):
+/// the loader must not allocate ring storage or stacks over it.
+pub const MetaReserve = struct { addr: u64, len: u64 };
 pub const MetaVar = struct { name: []const u8, addr: u64 };
 pub const MetaTimer = struct { slot: ?u16 = null, cell: ?u64 = null, period: u64 };
 
@@ -127,6 +136,7 @@ pub const Meta = struct {
     params: []MetaParam = &.{},
     rings: []MetaRing = &.{},
     stages: []MetaStage = &.{},
+    reserves: []MetaReserve = &.{},
     vars: []MetaVar = &.{},
     timer: ?MetaTimer = null,
     uses: [][]const u8 = &.{},
@@ -161,6 +171,7 @@ fn freeMeta(alloc: std.mem.Allocator, meta: *Meta) void {
     alloc.free(meta.rings);
     for (meta.stages) |s| alloc.free(s.values);
     alloc.free(meta.stages);
+    alloc.free(meta.reserves);
     for (meta.vars) |v| alloc.free(v.name);
     alloc.free(meta.vars);
     for (meta.uses) |u| alloc.free(u);
@@ -232,6 +243,7 @@ const Assembler = struct {
     meta_params: std.ArrayListUnmanaged(MetaParam) = .{},
     meta_rings: std.ArrayListUnmanaged(MetaRing) = .{},
     meta_stages: std.ArrayListUnmanaged(MetaStage) = .{},
+    meta_reserves: std.ArrayListUnmanaged(MetaReserve) = .{},
     meta_vars: std.ArrayListUnmanaged(MetaVar) = .{},
     meta_timer: ?MetaTimer = null,
     meta_uses: std.ArrayListUnmanaged([]const u8) = .{},
@@ -259,6 +271,7 @@ const Assembler = struct {
         self.meta_rings.deinit(self.alloc);
         for (self.meta_stages.items) |s| self.alloc.free(s.values);
         self.meta_stages.deinit(self.alloc);
+        self.meta_reserves.deinit(self.alloc);
         for (self.meta_vars.items) |v| self.alloc.free(v.name);
         self.meta_vars.deinit(self.alloc);
         for (self.meta_uses.items) |u| self.alloc.free(u);
@@ -309,6 +322,7 @@ const Assembler = struct {
             .params = try self.meta_params.toOwnedSlice(self.alloc),
             .rings = try self.meta_rings.toOwnedSlice(self.alloc),
             .stages = try self.meta_stages.toOwnedSlice(self.alloc),
+            .reserves = try self.meta_reserves.toOwnedSlice(self.alloc),
             .vars = try self.meta_vars.toOwnedSlice(self.alloc),
             .timer = self.meta_timer,
             .uses = try self.meta_uses.toOwnedSlice(self.alloc),
@@ -391,6 +405,7 @@ const Assembler = struct {
         if (std.ascii.eqlIgnoreCase(name, ".ring")) return self.dirRing(line_no, rest);
         if (std.ascii.eqlIgnoreCase(name, ".timer")) return self.dirTimer(line_no, rest);
         if (std.ascii.eqlIgnoreCase(name, ".stage")) return self.dirStage(line_no, rest);
+        if (std.ascii.eqlIgnoreCase(name, ".reserve")) return self.dirReserve(line_no, rest);
         if (std.ascii.eqlIgnoreCase(name, ".var")) return self.dirVar(line_no, rest);
         if (std.ascii.eqlIgnoreCase(name, ".use")) return self.dirUse(line_no, rest);
         if (std.ascii.eqlIgnoreCase(name, ".system")) {
@@ -485,7 +500,17 @@ const Assembler = struct {
             if (spec.len < 2 or (spec[0] != '@' and spec[0] != '='))
                 return self.fail(line_no, "param needs `@ where` or `= slot`", Error.BadDirective);
             const sep = spec[0];
-            const val = std.mem.trim(u8, spec[1..], " \t");
+            var val = std.mem.trim(u8, spec[1..], " \t");
+            var reply = false;
+            if (std.mem.endsWith(u8, val, "reply")) {
+                const stem = std.mem.trimRight(u8, val[0 .. val.len - 5], " \t");
+                if (stem.len < val.len - 5) {
+                    if (kind != .cap)
+                        return self.fail(line_no, "only a cap takes `reply`", Error.BadDirective);
+                    reply = true;
+                    val = stem;
+                }
+            }
             const where: ParamWhere = if (sep == '=') blk: {
                 if (kind != .cap or group)
                     return self.fail(line_no, "only a scalar cap pins a PTT slot", Error.BadDirective);
@@ -502,6 +527,7 @@ const Assembler = struct {
                 .kind = kind,
                 .group = group,
                 .where = where,
+                .reply = reply,
             });
         }
     }
@@ -591,6 +617,20 @@ const Assembler = struct {
         try self.meta_stages.append(self.alloc, .{
             .addr = addr,
             .values = try values.toOwnedSlice(self.alloc),
+        });
+    }
+
+    fn dirReserve(self: *Assembler, line_no: usize, rest: []const u8) Error!void {
+        var toks = std.mem.tokenizeAny(u8, rest, " \t");
+        const addr_tok = toks.next() orelse
+            return self.fail(line_no, ".reserve needs `addr len`", Error.BadDirective);
+        const len_tok = toks.next() orelse
+            return self.fail(line_no, ".reserve needs a length", Error.BadDirective);
+        if (toks.next() != null)
+            return self.fail(line_no, ".reserve takes exactly `addr len`", Error.BadDirective);
+        try self.meta_reserves.append(self.alloc, .{
+            .addr = try self.evalStr(line_no, addr_tok),
+            .len = try self.evalStr(line_no, len_tok),
         });
     }
 

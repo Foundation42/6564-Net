@@ -11,12 +11,25 @@
 ; z ← z² + c over a 64×22 grid, x ∈ [-2, 0.5], y ∈ [-1.1, 1.1],
 ; escape at |z|² ≥ 4, 16 iterations max, one palette char per count.
 ;
-; Harness contract:
-;   PTT 0 → console ($FF00)   desc: 0 SQ ($2400), 1 CQ   line buf $2600
+; The harness contract, as directives the loader executes (src/asm_run.zig):
+; a console capability (the SQE below routes by address, so a grant is all
+; we need), the SQ the code stages at $2400, and a CQ for the receipts.
+; The line buffer at $2600 is program data, not a ring: reserved so the
+; loader allocates nothing on top of it.
 ;
 ; Near page: $800 cx   $808 cy   $810 zx   $818 zy   $820 zx²  $828 zy²
 ;            $830 n    $838 bufptr $840 rows $848 tmp
 ;            $850 dx   $858 dy   $860 4.0  $870.. palette (17 chars)
+
+        .actor Mandel(console cap)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq cap=16
+        .reserve $2600 72
+
+        .system
+        m = Mandel(console)
+        console = Console()
+        .endsystem
 
         .org $1000
         ; constants into the near page — variables lived in zero page

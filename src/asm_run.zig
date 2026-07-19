@@ -44,14 +44,17 @@ const max_ctx_per_core: u8 = 200;
 const stack_bytes: u64 = 256;
 
 /// The peripheral row (spec §7), by the names a system block may use.
-const device_table = [_]struct { name: []const u8, coord: u16 }{
-    .{ .name = "Console", .coord = 0xFF00 },
-    .{ .name = "Entropy", .coord = 0xFF01 },
-    .{ .name = "Rtc", .coord = 0xFF02 },
-    .{ .name = "Block", .coord = 0xFF03 },
-    .{ .name = "Net", .coord = 0xFF04 },
-    .{ .name = "Matmul", .coord = 0xFF05 },
-    .{ .name = "MatmulRemote", .coord = 0xFF06 },
+/// The token is the capability token a client's PTT entry carries — the
+/// RTC answers to token 0 (it keeps no secrets), everything else to the
+/// machine's.
+const device_table = [_]struct { name: []const u8, coord: u16, token: u64 }{
+    .{ .name = "Console", .coord = 0xFF00, .token = token },
+    .{ .name = "Entropy", .coord = 0xFF01, .token = token },
+    .{ .name = "Rtc", .coord = 0xFF02, .token = 0 },
+    .{ .name = "Block", .coord = 0xFF03, .token = token },
+    .{ .name = "Net", .coord = 0xFF04, .token = token },
+    .{ .name = "Matmul", .coord = 0xFF05, .token = token },
+    .{ .name = "MatmulRemote", .coord = 0xFF06, .token = token },
 };
 
 fn fail(comptime fmt: []const u8, args: anytype) error{Deploy} {
@@ -147,20 +150,20 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
         return fail("the .system block declares nothing to run", .{});
 
     // ── Sort instances into devices and placements. ──
-    var devices = std.ArrayList(struct { name: []const u8, coord: u16 }).init(scratch);
+    var devices = std.ArrayList(struct { name: []const u8, coord: u16, token: u64 }).init(scratch);
     var all = std.ArrayList(Placed).init(scratch);
     var groups = std.StringHashMap(Group).init(scratch);
     var ctx_count = std.AutoHashMap(u16, u8).init(scratch);
     var core_owner = std.AutoHashMap(u16, usize).init(scratch);
     var next_core: u16 = 0;
     for (pl.instances, 0..) |*inst, decl_i| {
-        const coord: ?u16 = for (device_table) |d| {
-            if (std.mem.eql(u8, d.name, inst.actor)) break d.coord;
+        const dentry = for (device_table) |d| {
+            if (std.mem.eql(u8, d.name, inst.actor)) break d;
         } else null;
-        if (coord) |c| {
+        if (dentry) |d| {
             if (inst.args.len != 0 or inst.replicas != 1)
                 return fail("{s}: a device takes no arguments and no replicas", .{inst.name});
-            try devices.append(.{ .name = inst.name, .coord = c });
+            try devices.append(.{ .name = inst.name, .coord = d.coord, .token = d.token });
             continue;
         }
         const ai = for (actors.items, 0..) |a, i| {
@@ -244,6 +247,10 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
         for (meta.stages) |s| {
             if (s.addr >= machine.ram_base)
                 reserve(bump, p.core, s.addr, 8 * @as(u64, s.values.len));
+        }
+        for (meta.reserves) |r| {
+            if (r.addr >= machine.ram_base)
+                reserve(bump, p.core, r.addr, r.len);
         }
         for (meta.params) |prm| {
             if (prm.where == .cell and prm.where.cell >= machine.ram_base)
@@ -347,6 +354,7 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
             nexts: []u16,
             core: u16,
             lo: u64,
+            tok: u64,
         ) !u16 {
             const key = PttKey{ .core = core, .lo = lo };
             if (map.get(key)) |s| return s;
@@ -358,7 +366,7 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                 .prefix_hi = 0xfd65_6400_0000_0000,
                 .prefix_lo = lo,
                 .rights = .{ .send = true },
-                .token = token,
+                .token = tok,
             });
             try map.put(key, slot);
             return slot;
@@ -387,6 +395,9 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
     }.f;
 
     // ── Stage, instance by instance. ──
+    // A replying device is claimed by one instance: its reply window can
+    // only aim at one RX ring.
+    var reply_claim = std.AutoHashMap(u16, []const u8).init(scratch);
     for (all.items) |*p| {
         const a = &actors.items[p.ai];
         const meta = &a.out.meta;
@@ -436,12 +447,12 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                         else => return fail("{s}: param {s} wants a capability, got a number", .{ p.name, prm.name }),
                     };
                     // A device?
-                    const dcoord: ?u16 = for (devices.items) |*d| {
-                        if (std.mem.eql(u8, d.name, rname)) break d.coord;
+                    const ddev = for (devices.items) |*d| {
+                        if (std.mem.eql(u8, d.name, rname)) break d;
                     } else null;
                     if (prm.group) {
                         // cap[]: every member of a group, 8-byte stride.
-                        if (dcoord != null)
+                        if (ddev != null)
                             return fail("{s}: {s} is a device, not a group", .{ p.name, rname });
                         if (p.gn > 1)
                             return fail("{s}: only a singleton takes a cap[] group", .{p.name});
@@ -452,13 +463,14 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                             const t = &all.items[g.first + j];
                             const rx = rxSlotOf(&actors.items[t.ai].out.meta) orelse
                                 return fail("{s}: {s} declares no rx ring", .{ p.name, t.name });
-                            const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, rx));
+                            const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, rx), token);
                             writeCell(&m, p, cell0 + 8 * @as(u64, @intCast(j)), ring.windowAddr(slot, 0));
                         }
                         continue;
                     }
-                    const lo = if (dcoord) |c|
-                        ring.PttEntry.loFrom(c, 0, 0)
+                    const cap_token: u64 = if (ddev) |d| d.token else token;
+                    const lo = if (ddev) |d|
+                        ring.PttEntry.loFrom(d.coord, 0, 0)
                     else blk: {
                         const t = for (all.items) |*t2| {
                             if (t2.gn == 1 and std.mem.eql(u8, t2.name, rname)) break t2;
@@ -469,20 +481,39 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                     };
                     switch (prm.where) {
                         // Grant only: the code builds addresses itself.
-                        .none => _ = try pttFor(&m, &ptt_map, ptt_next, p.core, lo),
+                        .none => _ = try pttFor(&m, &ptt_map, ptt_next, p.core, lo, cap_token),
                         .slot => |s| m.setPtt(p.core, s, .{
                             .prefix_hi = 0xfd65_6400_0000_0000,
                             .prefix_lo = lo,
                             .rights = .{ .send = true },
-                            .token = token,
+                            .token = cap_token,
                         }),
                         .cell => |cell| {
-                            const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, lo);
+                            const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, lo, cap_token);
                             if (cell >= machine.ram_base and p.gn > 1)
                                 return fail("{s}: replicas cannot share a RAM capability cell", .{p.name});
                             writeCell(&m, p, cell, ring.windowAddr(slot, 0));
                         },
                         .reg_a => unreachable,
+                    }
+                    if (prm.reply) {
+                        // The reply window: the device's own capability
+                        // aimed back at our RX ring — the loader wiring
+                        // driver to device, same act as wiring two actors.
+                        const d = ddev orelse
+                            return fail("{s}: `reply` wires a device; {s} replies through its own caps", .{ p.name, rname });
+                        const my_rx = rxSlotOf(meta) orelse
+                            return fail("{s}: takes a reply but declares no rx ring", .{p.name});
+                        const gop = try reply_claim.getOrPut(d.coord);
+                        if (gop.found_existing)
+                            return fail("{s}: device {s} already replies to {s}", .{ p.name, rname, gop.value_ptr.* });
+                        gop.value_ptr.* = p.name;
+                        m.setDevicePtt(d.coord, 0, .{
+                            .prefix_hi = 0xfd65_6400_0000_0000,
+                            .prefix_lo = ring.PttEntry.loFrom(p.core, p.ctx, my_rx),
+                            .rights = .{ .send = true },
+                            .token = token,
+                        });
                     }
                 },
                 .arg => {
