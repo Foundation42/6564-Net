@@ -32,6 +32,12 @@ const classics = struct {
         .{ .name = "fanin_sink.asm", .text = @embedFile("programs/asm/fanin_sink.asm") },
         .{ .name = "flood_sender.asm", .text = @embedFile("programs/asm/flood_sender.asm") },
     };
+    const forkjoin = [_]sim.asm_run.Source{
+        .{ .name = "fj_root.asm", .text = @embedFile("programs/asm/fj_root.asm") },
+        .{ .name = "fj_lieutenant.asm", .text = @embedFile("programs/asm/fj_lieutenant.asm") },
+        .{ .name = "fj_pass.asm", .text = @embedFile("programs/asm/fj_pass.asm") },
+        .{ .name = "fanin_sink.asm", .text = @embedFile("programs/asm/fanin_sink.asm") },
+    };
     const hello = [_]sim.asm_run.Source{
         .{ .name = "hello.asm", .text = @embedFile("programs/asm/hello.asm") },
     };
@@ -80,10 +86,11 @@ const usage_text =
     \\      The fan-in stress test: up to 10,000 actors flood one target
     \\      (programs/asm/flood_sender.asm, fanin_sink.asm). Default 10000, loss 0.
     \\
-    \\  sim6564 forkjoin [lieutenants] [workers] [trace]
-    \\      The fork-join matrix: 1 → LxW workers → LxW relays → 1 aggregator
+    \\  sim6564 forkjoin [trace]
+    \\      The fork-join matrix: 1 → 8x125 workers → relays → 1 aggregator,
+    \\      the canonical 1,000-actor tree from its own .system block
     \\      (programs/asm/fj_root.asm, fj_lieutenant.asm, fj_pass.asm,
-    \\      fanin_sink.asm). Default 8x125 = 1000.
+    \\      fanin_sink.asm). Other shapes: edit the system block.
     \\
     \\  sim6564 hello [seed] [trace]
     \\      The machine's first words: one actor prints through the console
@@ -416,11 +423,16 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, first, "forkjoin")) {
-        var opts = sim.demo_forkjoin.Options{};
-        if (args.next()) |s| opts.lieutenants = @min(16, parseOr(u16, s, "lieutenants"));
-        if (args.next()) |s| opts.workers = @min(125, parseOr(u16, s, "workers"));
+        var opts = clean_fabric;
         if (args.next()) |s| opts.trace = std.mem.eql(u8, s, "trace");
-        return sim.demo_forkjoin.run(alloc, opts);
+        var o = try sim.asm_run.simulate(alloc, &classics.forkjoin, opts);
+        defer o.deinit();
+        try sim.joe_run.report(&o, opts, "asm");
+        try std.io.getStdOut().writer().print(
+            "  fork-join: {d} joined, checksum {d} — {d}-cycle makespan\n",
+            .{ o.varOf("agg", "count") orelse 0, o.varOf("agg", "checksum") orelse 0, o.cycles },
+        );
+        return;
     }
 
     if (std.mem.eql(u8, first, "ring")) {

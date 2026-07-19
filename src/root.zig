@@ -18,7 +18,6 @@ pub const joe = @import("joe.zig");
 pub const joe_run = @import("joe_run.zig");
 pub const asm_run = @import("asm_run.zig");
 pub const struple = @import("struple.zig");
-pub const demo_forkjoin = @import("demo_forkjoin.zig");
 pub const measure = @import("measure.zig");
 
 test {

@@ -1156,3 +1156,47 @@ frontier beyond the spec: store hardware behind store.joe's proven
 contract, rocci-bird's device row (display/pad/APU, PresentDone as
 the frame clock), sized bytes fields, buf arrays, VSEL-and-masks,
 and D1's key-as-location — each waiting on the table, honestly.
+
+## The harness retirement — contract directives and the generic .asm runner (2026-07-19)
+
+The Sunday tidy-up that became a campaign: every hand-written program's
+"Harness contract" comment was already a deployment spec written for
+humans, and fourteen demo_*.zig files were humans executing it. Now the
+contract is directives (`.actor`/`.ring`/`.timer`/`.stage`/`.reserve`/
+`.var`/`.use`/`.system` — src/asm.zig, metadata only, not one emitted
+byte changes), the `.system` block is joe's own grammar read by joe's
+own planner, and one loader (src/asm_run.zig) executes it:
+`sim6564 run <file.asm|file.joe>`. Ten harnesses retired (~2,400
+lines); dies/net/churn/web stay as infrastructure. Canon moved into
+integration tests against generic-runner Outcomes, verified program by
+program BEFORE its harness died:
+
+| program | verdict vs its harness |
+|---|---|
+| ping/pong | **bit-identical** — 11,022 cy, final 8, retrans 3; also at 0xBEEF/2048 |
+| scatter | **bit-identical** — 10,623 cy, Σ(i+3)²=492; both seeds |
+| supervise | **bit-identical** — 4,043 cy, 12/20/12/9 items, 5 restarts, brk + watchdog |
+| pipeline | **bit-identical at 3 shapes** — 66,703 / 83,076 / 29,376 cy, fabric stats equal |
+| ring | **cycle-identical** — 50,044 cy at 8×100; 60.0/pass marginal; 60/pass at 200×1000 |
+| bigbrother | **55 cy/message exactly** at 1k and 10k; 550,000 cy total, checksums exact |
+| forkjoin | **exact canon** — 1000/1000, checksum 501,500, 55,000-cycle makespan, 2,010 instances |
+| mandel | all 22 rows **character-for-character**, same instruction count |
+| periph | transcript-identical, elapsed 14,759 by the machine's own RTC |
+| hello, http_get | output-identical; web instruction-exact per paired run (the old 784 was stale — example.com changed) |
+
+Vocabulary lessons, each priced by a failure or a conversion: `.reserve`
+(three independent loader-over-scratch collisions), `reply` + per-device
+tokens (periph; the RTC answers to token 0), `rx=N` (a pipeline stage is
+targeted on two rings), `sup @ cell watchdog=N` (supervision staged as
+data), cap[] group alignment incl. singleton-as-shared-1-group
+(forkjoin's one actor, two partner kinds), `.timer period=N` (a measured
+horizon without a phantom black hole), and the send-timeout epilogue
+(2000, the horizon the corpus was measured against). Two programs
+changed code — flood_sender and fj_pass now stage their own SQEs from
+their near-page descriptors, because pre-staged SQEs are inexpressible
+for replicas and self-staging is what joe's compiled init already does;
+their absorption/makespan clocks are unchanged and exact. One honest
+regression of scope: scatter's parametric worker count fixed at the
+contract's 8 (the staged fan-out chain is deployment, and deployment
+now lives in the file). README's forkjoin makespan corrected 61k → the
+measured 55,000. Guide: docs/asm-guide.md.

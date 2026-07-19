@@ -16,9 +16,22 @@ zig build run           # ping-pong actors across a 25%-lossy fabric
 ./zig-out/bin/sim6564 0xBEEF 3000 12      # 73% packet loss; still finishes
 ./zig-out/bin/sim6564 supervise           # supervision tree demo
 ./zig-out/bin/sim6564 hello               # the machine says hello
+./zig-out/bin/sim6564 run src/programs/asm/ring_node.asm   # any program runs itself
+./zig-out/bin/sim6564 run src/programs/joe/ring.joe        # either language
 ```
 
-The 6564 programs themselves live in `src/programs/asm/*.asm`.
+The 6564 programs live in `src/programs/asm/*.asm` and
+`src/programs/joe/*.joe` — and every one **carries its own deployment**.
+A .joe file has its `system` block; a .asm file has the same thing as
+assembler directives: its old "Harness contract" comment made
+machine-readable (`.actor`, `.ring`, `.timer`, `.var`, a `.system`
+block in joe's own grammar) and executed by one generic loader
+(`src/asm_run.zig`). The fourteen per-program demo_*.zig harnesses that
+once wired rings and PTT slots by hand are gone; the classic verbs
+below are sugar over the same loader, and every conversion was verified
+against its harness before the harness died — most of them
+**bit-identical**, cycles and fabric stats alike. How to write one:
+[docs/asm-guide.md](docs/asm-guide.md).
 
 **pingpong** runs two actors on two simulated cores joined by a fabric that
 loses, delays, reorders and duplicates datagrams (deterministically, from the
@@ -33,7 +46,7 @@ ack on *ownership* so hops overlap, backpressure is the absence of an ack,
 and shutdown is a poison-pill item with lame-duck draining — every item
 arrives checksum-verified at any loss rate below total.
 
-**scatter** fans a task out to up to 8 workers (`sim6564 scatter`), which
+**scatter** fans a task out to 8 workers (`sim6564 scatter`), which
 square it by shift-add multiply and reply; results converge on one
 capacity-8 RX ring. The result is the ack: stragglers are simply re-asked
 on timer ticks, and idempotent workers make duplicates harmless.
@@ -49,7 +62,8 @@ bigbrother`): 55 cycles per absorbed message, every voice heard exactly
 once, zero completion records lost — saturation is backpressure, not
 corruption. **forkjoin** forks one message to 1,000 workers through a
 LINK-chain-plus-hierarchy tree, relays it, and joins it back to one
-aggregator in a 61,000-cycle makespan (`sim6564 forkjoin`).
+aggregator in a 55,000-cycle makespan (`sim6564 forkjoin`) — run
+entirely from the tree's own `.system` block, 2,010 declared instances.
 
 **supervise** runs a one-for-one supervision tree on one core: exit links
 post a dead worker's obituary to the supervisor's completion queue as an
@@ -145,7 +159,8 @@ wall clock never enters the machine — TCP is just a slow backplane.
 **web** is the capstone: `http_get.asm` — 6502-descendant assembly —
 speaks HTTP/1.1 through the `net` device (a raw byte pipe, spec §7.4)
 and prints a real web page on its teletype (`sim6564 web` fetches
-example.com; 784 instructions, clean halt). The protocol lives in 6564
+example.com; a few hundred instructions and a clean halt, the exact
+count set by the outside world's chunking). The protocol lives in 6564
 code: spec §7.5's rule is that silicon is an optimization, never an
 interface — any device contract must be implementable by an ordinary
 actor, so HTTP/WebSocket/TLS engines can ship as gates or as polyfill

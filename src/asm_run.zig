@@ -545,8 +545,15 @@ pub fn simulateSystem(
                         // smaller one is shared.
                         if (ddev != null)
                             return fail("{s}: {s} is a device, not a group", .{ p.name, rname });
-                        const g = groups.get(rname) orelse
-                            return fail("{s}: no group named {s}", .{ p.name, rname });
+                        const g = groups.get(rname) orelse for (all.items, 0..) |*t2, ti| {
+                            // A singleton referent is a shared one-member
+                            // group — the "smaller groups are shared"
+                            // rule extended to n = 1, so one actor can
+                            // partner a group in one role and a
+                            // singleton in another.
+                            if (t2.gn == 1 and std.mem.eql(u8, t2.name, rname))
+                                break Group{ .first = ti, .count = 1 };
+                        } else return fail("{s}: no group or instance named {s}", .{ p.name, rname });
                         const cell0 = prm.where.cell;
                         if (p.gn > 1 and cell0 >= machine.ram_base)
                             return fail("{s}: replicas keep cap[] cells in the near page", .{p.name});

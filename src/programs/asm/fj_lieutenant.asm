@@ -3,12 +3,28 @@
 ; fan is fire-and-forget: W back-to-back doorbells, rewriting the staged
 ; entry's target through a near-page pointer between each, then halt.
 ;
-; Harness contract:
-;   desc slots: 0 SQ (SQE: op txr, value 0), 1 CQ (deep — the fan's
-;   transport acks land here after we're gone), 2 RX (one message)
-;   near $848 = pointer to our SQE's target word
-;   near $900+8k = window pointer to worker k (k = 1..W)
-;   near $868 = 8·(W+1), the fan loop bound
+; The contract, as directives: the 125 worker windows land at $908..$CE8
+; by cap[] — a singleton takes its whole member group. Because the
+; lieutenant is declared (and so staged) before its workers wire their
+; own capabilities, the loader's slots for the workers start at 0, and
+; the staged fan SQE's initial target below is worker one's window,
+; slot 0. It hardly matters: the serve loop rewrites the target through
+; the $848 pointer before every doorbell. The SQ is pinned at $6000 so
+; that pointer and the staged entry can be spelled here; the fan loop
+; bound 8·(W+1) = 1008 arrives at $868 as an instance argument — the
+; shape lives in the .system block, not in this code. The deep CQ
+; absorbs 125 transport acks after we are gone; the one-message RX is
+; granted by the loader, cookie = buffer, though only the arrival
+; matters to us, never the payload.
+
+        .actor Lieutenant(workers cap[] @ $908, bound arg @ $868)
+        .ring 0 sq base=$6000 cap=1
+        .ring 1 cq cap=256
+        .ring 2 rx cap=1 post=1 size=8 grant
+        ; the retargetable on-die fan entry (op txr, value 0), and the
+        ; near pointer to its target word
+        .stage $6000 2, $FF00_0000_0000_0000, 0, 0
+        .stage $848 $6008
 
         .org $1000
 serve:  LSTN 1

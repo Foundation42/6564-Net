@@ -13,16 +13,20 @@ what building it taught us. Zig 0.14.1.
 | `src/ring.zig` | Pure layouts: ring descriptors, SQ/RX/CQ entry formats, PTT entries, window pointers. No machine state. |
 | `src/mesh.zig` | Fault-injection policy: latency, jitter, loss, duplication — all from one seeded PRNG. |
 | `src/machine.zig` | Contexts, cores, memory decode, the interpreter, the hardware scheduler, the discrete-event loop. |
-| `src/asm.zig` | Two-pass assembler driven by the same ISA table. |
-| `src/integration_tests.zig` | Assembled programs run end-to-end, §6 semantics exercised. |
-| `src/programs/asm/*.asm` | The actual 6564 programs: ping/pong, supervisor/worker, pipe_source/stage/sink. |
-| `src/demo_*.zig` | Demo harnesses (wiring, staging, reporting); also driven by the test suite. |
-| `src/main.zig` | CLI dispatcher over the demos. |
+| `src/asm.zig` | Two-pass assembler driven by the same ISA table — plus the contract directives (`.actor`/`.ring`/`.timer`/`.stage`/`.reserve`/`.var`/`.use`/`.system`): pure metadata, not one emitted byte changes. |
+| `src/asm_run.zig` | The generic .asm loader: executes a program's contract the way fourteen demo harnesses once did by hand. The `.system` block is joe's grammar, read by joe's planner. |
+| `src/joe_run.zig` | The joe loader; also owns the shared Outcome/report both runners use. |
+| `src/integration_tests.zig` | Assembled programs run end-to-end, §6 semantics exercised; the retired harnesses' canon numbers assert here against generic-runner Outcomes. |
+| `src/programs/asm/*.asm` | The actual 6564 programs, each carrying its deployment (see docs/asm-guide.md). |
+| `src/programs/joe/*.joe` | The joe corpus, same property by construction. |
+| `src/demo_*.zig` | The four that remain are infrastructure, not harnesses: `dies` (threads), `net` (TCP), `churn` (placement measurement), `web` (a real socket under test control). |
+| `src/main.zig` | CLI dispatcher; the classic verbs are sugar over `asm_run` with synthesized system text. |
 
-`zig build test` runs everything. Demos:
-`sim6564 [pingpong] [seed] [loss_ppm4k] [rounds] [trace]`,
-`sim6564 supervise [trace]`, and
-`sim6564 pipeline [seed] [loss_ppm4k] [items] [stages] [trace]`.
+`zig build test` runs everything. Any program runs itself:
+`sim6564 run <file.asm|file.joe> [seed] [loss_ppm4k] [trace] [scorch]`;
+the classic verbs (`pingpong`, `supervise`, `pipeline`, `scatter`,
+`ring`, `bigbrother`, `hello`, `mandel`, `periph`) keep their argv
+shapes. Writing a program: [asm-guide.md](asm-guide.md).
 
 ## Concrete decisions (spec-compatible, but v0.1 chose)
 
@@ -602,6 +606,53 @@ Implementation notes:
   already prevents co-residency unless overridden; serve-loop
   fairness (YLD between bursts?) is an open design question for the
   v2.6 conversation.
+
+## The harness retirement: contract directives and the generic .asm runner
+
+joe proved that deployment is data; the tidy-up proved the hand-written
+corpus had known it all along. Every .asm carried a "Harness contract"
+comment — near offsets, ring shapes, PTT slots, spawn arguments — and a
+demo_*.zig existed to execute that comment by hand. The contract is now
+machine-readable (`.actor`/`.ring`/`.timer`/`.stage`/`.reserve`/`.var`/
+`.use`/`.system` directives; src/asm.zig), the `.system` block is joe's
+grammar parsed by joe's planner — one deployment dialect for the whole
+machine — and src/asm_run.zig executes it: placement, capability wiring
+(pinned slots where code baked window constants, allocated-and-staged
+pointers where it didn't), ring and landing-entry staging, params into
+near or A, reverse-declaration spawn order, `.var` readback into the
+same report joe systems get. `sim6564 run <file>` dispatches on
+extension. Directives emit no bytes: demo_dies still assembles
+ring_node.asm raw.
+
+The discipline was: convert, verify against the living harness at
+identical seed and shape, and only then let the harness die. Seven
+conversions came out **bit-identical** (cycles and fabric stats:
+pingpong, scatter, supervise, pipeline at three shapes), the ring
+cycle-identical with its 60.0/pass marginal, bigbrother at exactly 55
+cycles per absorbed message, forkjoin at exact canon (1000 joined,
+checksum 501,500, 55,000-cycle makespan, 2,010 declared instances),
+mandel character-for-character against the host oracle. Ten harnesses
+(~2,400 lines) retired into integration-test assertions over generic
+Outcomes; parametric shapes became synthesized system text
+(ringSystem/floodSystem/pipelineSystem), which is also how the classic
+CLI verbs work now. Two programs earned code changes: flood_sender and
+fj_pass stage their own SQEs by reading the loader-chosen SQ base from
+descriptor word0 in their near page — pre-staged SQEs are inexpressible
+for replicas, and self-staging is exactly what joe's compiled init
+does. Their measured clocks did not move.
+
+What the vocabulary learned, each word priced by a failure: `.reserve`
+(the loader cannot know which RAM the code owns unless the contract
+says so — three independent collisions proved it), `reply` and
+per-device tokens (a device that answers needs its own capability aimed
+back; the RTC keeps no secrets and answers to token 0), `rx=N` (an
+actor targeted on two rings — a pipeline stage — needs callers to name
+one), `sup @ cell watchdog=N` (a child's spawn block, exit link and
+leash are the supervisor's contract, staged as data), cap[] group
+alignment with singletons as shared one-member groups (one actor,
+group partner in one role, singleton in the other), and `.timer
+period=N` (a measured timeout horizon without a phantom black hole).
+Writing a program against all of this: [asm-guide.md](asm-guide.md).
 
 ## Stats and tracing
 

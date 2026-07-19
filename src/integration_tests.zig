@@ -487,6 +487,12 @@ const asm_src = struct {
         .{ .name = "pipe_stage.asm", .text = @embedFile("programs/asm/pipe_stage.asm") },
         .{ .name = "pipe_sink.asm", .text = @embedFile("programs/asm/pipe_sink.asm") },
     };
+    const forkjoin = [_]asm_run.Source{
+        .{ .name = "fj_root.asm", .text = @embedFile("programs/asm/fj_root.asm") },
+        .{ .name = "fj_lieutenant.asm", .text = @embedFile("programs/asm/fj_lieutenant.asm") },
+        .{ .name = "fj_pass.asm", .text = @embedFile("programs/asm/fj_pass.asm") },
+        .{ .name = "fanin_sink.asm", .text = @embedFile("programs/asm/fanin_sink.asm") },
+    };
     const hello = [_]asm_run.Source{
         .{ .name = "hello.asm", .text = @embedFile("programs/asm/hello.asm") },
     };
@@ -2882,13 +2888,12 @@ test "big brother: sub-saturation flood delivers first time" {
 }
 
 test "fork-join matrix at full scale: 8x125, forked, relayed, joined" {
-    const o = try @import("demo_forkjoin.zig").simulate(testing.allocator, .{
-        .lieutenants = 8,
-        .workers = 125,
-    });
+    var o = try asm_run.simulate(testing.allocator, &asm_src.forkjoin, clean_fabric);
+    defer o.deinit();
     try testing.expectEqual(machine.StopReason.all_halted, o.reason);
-    try testing.expectEqual(@as(u64, 1000), o.received);
-    try testing.expectEqual(o.expected_sum, o.sum);
+    try testing.expectEqual(@as(u64, 1000), o.varOf("agg", "count").?);
+    // Σ (g+1) for g = 1..1000: every worker's number, relayed once.
+    try testing.expectEqual(@as(u64, 501500), o.varOf("agg", "checksum").?);
     try testing.expectEqual(@as(u64, 7), o.stats.chain_fires);
     try testing.expectEqual(@as(u64, 0), o.stats.cq_overflows);
 }
