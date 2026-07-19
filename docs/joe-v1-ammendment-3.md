@@ -28,8 +28,16 @@ flap_held = flap
 
 **A `let` lives for the rest of its burst and not one cycle longer.**
 Every use must occur before the next park (`LSTN`, `YLD`, the serve
-loop's end). A use that crosses a park is a compile error that names
-the park:
+loop's end).
+
+*As implemented:* a `let` is scoped to its **block**, and in v1 every
+park sits at a block boundary — a serve handler ends at one, `LSTN` is
+the loop's top. So crossing a park is not diagnosed, it is
+**unrepresentable**: the name is out of scope on the far side, and the
+error you get is the ordinary "unknown name". That is the better
+outcome (no rule to enforce, none to forget), and it holds only while
+the "every park is a block boundary" premise does. The day a construct
+parks mid-block, the promised message earns its keep:
 
 ```
 flap does not survive the park at line 12 — a `var` does.
@@ -176,6 +184,18 @@ like any two actors. The RTC answers to token 0; it keeps no secrets.
   declared message or invisible transport business.
 - **`append` cannot build struple** and `pack` cannot build raw bytes.
   Two dialects, one boundary, no dialect drift.
+
+  **How the boundary is actually held (v1, honestly): the argument
+  picks the dialect; targets are just targets.** A capability is an
+  `addr`, and `addr` has no device flavour — so `send x, b` sends raw
+  bytes and `send x, Msg{…}` sends a framed message, whatever `x`
+  turns out to be. Nothing type-level stops `send tty, Write{…}`; the
+  console would politely print the request's bytes. This is a real
+  limit, not a claim: joe knows *what* it is sending, never *whom* it
+  is sending to. Growing a device flavour on `addr` (so the compiler
+  could reject a framed message to a raw sink, and an ask to a peer)
+  is the natural next increment — and it is Amendment 4 material,
+  because it is the same typing question as capability transfer.
 - **A `let` cannot cross a park.** If it must, it was a `var` all
   along, and the error message says so.
 
@@ -184,15 +204,24 @@ like any two actors. The RTC answers to token 0; it keeps no secrets.
 ```
 decl      := … | "const" IDENT "=" STRING
            | "struct" IDENT "{" field ("," field)* "}"
-message   := "message" IDENT fields? ( "->" IDENT fields )?
+message   := "message" IDENT fields? ( "->" ( IDENT fields | "_" ) )?
 stmt      := … | "let" IDENT "=" expr
            | "clear" IDENT
            | "append" IDENT "," append_src
            | "send" IDENT "," IDENT            // raw buf send
+           | "send" IDENT "," IDENT "." IDENT  // forward a reply payload
 append_src:= STRING | "byte" "(" expr ")" | IDENT | IDENT "." IDENT
 expr      := … | postfix "[" expr "]"          // byte index
            | IDENT "." IDENT                   // record field
+           | IDENT "." IDENT "." "len"         // reply payload length
 ```
+
+**`-> _` is ratified** (it shipped, and http.joe's `Bye` uses it): a
+device request that expects no answer, framed like every other request
+on the row because the row has one framing, not two. It stages tag 0 —
+and a zero tag with a zero window is precisely "I left no return
+address", the §7.3 rule seen from the sending end. Without it a `close`
+would have to invent a reply nobody reads.
 
 ## A3.8 Lowering table — additions
 
@@ -260,7 +289,11 @@ rule the machine handed back:
 - **A3.1's park rule proved simpler than drafted.** Every park in v1
   sits at a block boundary, so block-scoped lets can never cross one;
   the liveness check is one comment away for the day a construct parks
-  mid-block.
+  mid-block. (A3.1's text now says what shipped, so the promised error
+  message does not dangle.)
+- **`-> _` ratified** into A3.7's grammar, and A3.6 now states the
+  dialect line the compiler actually holds: the argument picks the
+  dialect, because `addr` has no device flavour yet.
 
 Programs, all suite-guarded: **mandel.joe** (22 rows character-for-
 character with mandel.asm and the host oracle — a third implementation

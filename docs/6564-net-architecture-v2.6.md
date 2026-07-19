@@ -87,7 +87,11 @@
 > (thirteenth conformant implementation, proven on this machine under
 > scorch), the architected grant-completion tag, the `pack_overflow`
 > fault code (reserved), and a fault-code table that now ends
-> `watchdog, bad_macro, wdex_ceiling`.
+> `watchdog, bad_macro, wdex_ceiling, cq_overflow` — the last of those
+> promoted from open question 6 in v2.6 (§4.2): a lost delivery or
+> obituary kills the context that could not hold it, so the exit link
+> fires; a lost transport verdict still drops and counts, because the
+> peer will say it again.
 
 > **Changes from v2.4** *(carried forward)*. New **§7.5 — Protocol Stacks: Silicon Is an
 > Optimization** — the polyfill principle becomes normative: a device
@@ -333,6 +337,13 @@ offset  field       width  meaning
 The **source-ring field** names the descriptor slot the record pertains to — the RX ring for deliveries, the SQ for submissions (0 for ring-less register sends). The cookie's low half is software's `cookie_lo`; hardware stamps the high half with the entry's **staging location and the context's incarnation**, so completion records are self-identifying and a `SPWN`-restarted actor cannot misattribute a dead life's completions.
 
 Status codes distinguish success, truncation, remote reject (capability failure), no-buffer reject, timeout, and chain cancellation (§4.3). **There is no other channel for I/O status.** No sticky error flags, no exceptions from network conditions — the CQ is the single source of truth, and software consumes it at its leisure.
+
+**CQ capacity is a software contract, and breaking it is fatal — selectively (v2.6).** "Every operation posts a record" holds only if the queue has room; sizing it is software's job, exactly like laying out ring storage so stripes do not overlap (§6.2). What happens when software gets it wrong depends on **what the lost record was**, and the distinction is not stylistic:
+
+- A **transport verdict** — an ack, a reject, a timeout — is *re-derivable by construction*. The peer retransmits, the timer fires again, and an entire class of correct protocols (every actor compiled from a language with no syntax for transport verdicts) never reads them at all. An overflowed verdict is **dropped and counted**, as in v0.1.
+- A **delivery** or an **exit notification** exists nowhere else. A dropped delivery is a message that was accepted and then forgotten — its sender saw an ack, its receiver waits forever. A dropped obituary is a death with no mourner. Overflowing either **faults the context that owns the queue** (`cq_overflow`), so its exit link fires and a supervisor answers for it.
+
+This is the same move §5.2 made for starvation and §5.4 for the compute-hang: the machine has no silent-forever failures left, only supervisable ones. The narrower rule was not designed at the desk — the flat version killed a 1,009-actor fork-join tree whose lieutenants routinely overflow their CQs with their own rejects, and the tree's protocol was right to ignore them.
 
 ### 4.3 Autonomous Descriptor Behavior
 
@@ -830,7 +841,7 @@ Recorded honestly, for future revisions. Two of v2's questions are resolved; the
 3. **Privilege model** — how minimal can the privileged layer be if PTT entries, exit links, and watchdog budgets are the only privileged state? A two-level model (capability kernel / actors) still looks sufficient.
 4. **Timer parameters (§6.3)** — is `send_timeout` per-send, per-PTT-entry, or global? Should an architecturally reserved black-hole PTT slot exist so timer code is portable?
 5. **SQ drain-rate modeling** — v0.1's RBC drains submission queues instantly, so "`SEND` parks on full SQ" is defined but unexercised. Chain fires (§4.3) give the RBC its first architecturally visible non-instant work, and are the natural seam for a drain-rate model.
-6. **CQ overflow** — v0.1 drops and counts overflowed completions. Dropping a completion record weakens the "CQ always receives a record" guarantee under pathological sizing; an io_uring-style overflow side-channel may be warranted, or the guarantee should be restated as conditional on adequate CQ capacity.
+6. ~~**CQ overflow**~~ — **Resolved in v2.6 (§4.2): the guarantee is conditional on capacity, and the failure is supervisable.** Verdicts drop and count (re-derivable); deliveries and exits fault the owning context so the exit link fires. An io_uring-style side-channel remains available as a future refinement for software that would rather see the loss than die of it — but nothing is silent any more, which was the actual defect.
 7. **Peripheral discovery** — v2.3 binds device capabilities statically at load time, like everything else the loader wires. Whether enumeration ("what lives on this row?") is an architectural protocol or purely a software convention is undefined.
 8. ~~**Off-die bridges and multi-die time**~~ — **Resolved in v2.4 (§6.5): the route selector and the IO plane.** The conservative synchronization contract (window = plane minimum latency) is normative-by-consequence and validated: the reference simulator runs one die per host thread, bit-identical to sequential at any thread count. Remaining sub-question: route selectors are per-PTT-entry and loader-assigned; whether route discovery/topology description deserves architectural surface belongs with question 7's discovery story.
 9. **Capability transfer (`.from`)** — a reply target is a capability
