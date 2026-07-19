@@ -836,6 +836,15 @@ pub const Machine = struct {
 
     // ── Datagram path ────────────────────────────────────────────────────
 
+    /// What a submission claims its payload is (A4 movement 1): the low
+    /// two bits of the SQE's reserved hint word. A register send (TXR)
+    /// makes no use of it — it is a message by construction — and an
+    /// unclaimed 0 is legacy code, which the check waves through.
+    fn claimOf(sqe: ring.SqEntry) ring.Dialect {
+        if (sqe.op == .txr) return .msg;
+        return @enumFromInt(@as(u2, @truncate(sqe.hint)));
+    }
+
     fn sendDatagram(
         self: *Machine,
         src_core: u16,
@@ -843,12 +852,22 @@ pub const Machine = struct {
         offset: u64,
         payload: []const u8,
         reply: mesh.ReplyPath,
+        /// What the submission CLAIMS its payload is (A4 movement 1).
+        /// `any` means the sender made no claim — legacy code, and the
+        /// only way past the check.
+        claim: ring.Dialect,
     ) !void {
         const ptt = &self.cores[src_core].ptt;
         // An out-of-range or empty PTT slot is the same failure: no
         // capability to send there (§6.4). Reported via the CQ, as always.
         const entry = if (ptt_index < ptt.len) ptt[ptt_index] else ring.PttEntry{};
-        if (!entry.rights.send) {
+        // The dialect check rides the capability path, one compare after
+        // the rights test: what the payload claims to be must equal what
+        // the endpoint IS. A msg image aimed at an asking device would
+        // have the device read a tag word as a reply window — that is
+        // the hazard, and equality is what makes it unrepresentable.
+        const dialect_ok = entry.dialect == .any or claim == .any or entry.dialect == claim;
+        if (!entry.rights.send or !dialect_ok) {
             // No capability: the RBC rejects at the PTT. Routed through the
             // normal completion path (an immediate ack event) so the OWNED
             // clear, the release fence, and chain cancellation all behave
@@ -1241,7 +1260,7 @@ pub const Machine = struct {
             .cookie = cookie,
             .sqe_addr = addr,
             .src_slot = src_slot,
-        });
+        }, claimOf(sqe));
         return true;
     }
 
@@ -1599,7 +1618,7 @@ pub const Machine = struct {
                     .cq_slot = ring.slot_cq,
                     .tag = .txr,
                     .cookie = ea,
-                });
+                }, .msg); // a register datagram is a message by construction
             },
             .send => {
                 // Doorbell: software staged an SqEntry at the SQ tail slot.
@@ -1643,7 +1662,7 @@ pub const Machine = struct {
                     .cookie = cookie,
                     .sqe_addr = sqe_addr,
                     .src_slot = desc_slot,
-                });
+                }, claimOf(sqe));
             },
             .recv => {
                 // Doorbell: software staged an RxEntry at the RX tail slot.
@@ -2004,7 +2023,7 @@ pub const Machine = struct {
                 .cq_slot = ring.slot_cq,
                 .tag = .txr,
                 .cookie = ea,
-            });
+            }, .msg); // store-through-window is TXR: a message
             return;
         }
         try write64(core, ctx, ea, value);

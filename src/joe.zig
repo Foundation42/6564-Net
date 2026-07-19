@@ -114,6 +114,32 @@ const device_reply_window: u64 = @as(u64, 0xFF) << 56;
 /// Bytes an outbound message image may occupy: staging() to land0().
 const staging_room: u16 = 0x80;
 
+/// The device names a system block may instantiate, and what each one
+/// IS. The loader holds the authoritative copy (src/joe_run.zig); this
+/// is the compiler's early knowledge of the same wiring.
+const device_dialects = [_]struct { name: []const u8, dialect: ring.Dialect }{
+    .{ .name = "Console", .dialect = .raw },
+    .{ .name = "Entropy", .dialect = .ask },
+    .{ .name = "Rtc", .dialect = .ask },
+    .{ .name = "Block", .dialect = .ask },
+    .{ .name = "Net", .dialect = .ask },
+    .{ .name = "Matmul", .dialect = .msg },
+    .{ .name = "MatmulRemote", .dialect = .msg },
+};
+
+/// An instance name → what that endpoint is. Devices carry their own
+/// dialect; every other instance is an actor, and actors take messages.
+fn dialectOfInstance(prog: *const Program, name: []const u8) ring.Dialect {
+    for (prog.system) |*inst| {
+        if (!std.mem.eql(u8, inst.name, name)) continue;
+        for (device_dialects) |d| {
+            if (std.mem.eql(u8, d.name, inst.actor)) return d.dialect;
+        }
+        return .msg;
+    }
+    return .any;
+}
+
 pub const abi = struct {
     pub const timer_desc: u8 = 5;
     pub const land_cap: u64 = 64;
@@ -1805,6 +1831,42 @@ const Gen = struct {
         return null;
     }
 
+    /// What the endpoint behind a parameter IS (A4 movement 1), inferred
+    /// from the system block — where the wiring already lives, so the
+    /// language needs no new syntax. A device name resolves to its
+    /// dialect; anything else is an actor, and actors take messages.
+    /// `any` means the compiler cannot tell (the actor is uninstantiated,
+    /// or instantiated inconsistently), and an unknown endpoint is
+    /// checked by the RBC at run time instead — the compiler's check is
+    /// the EARLY copy of the machine's, never the only one.
+    fn targetDialect(self: *Gen, pname: []const u8) ring.Dialect {
+        const pidx = for (self.actor.params, 0..) |p, i| {
+            if (std.mem.eql(u8, p.name, pname)) break i;
+        } else return .any;
+        var seen: ring.Dialect = .any;
+        for (self.prog.system) |*inst| {
+            if (!std.mem.eql(u8, inst.actor, self.actor.name)) continue;
+            if (pidx >= inst.args.len) continue;
+            const arg = inst.args[pidx];
+            if (arg != .ref) continue;
+            const d = dialectOfInstance(self.prog, arg.ref);
+            if (seen != .any and seen != d) return .any; // wired both ways
+            seen = d;
+        }
+        return seen;
+    }
+
+    /// A raw send needs a raw sink: bytes at an actor would arrive as a
+    /// message with a nonsense tag, and bytes at an asking device would
+    /// have its word1 read as a reply window.
+    fn requireRaw(self: *Gen, target: []const u8, line: usize) Error!void {
+        const have = self.targetDialect(target);
+        if (have == .any or have == .raw) return;
+        if (have == .ask)
+            return self.fail(line, "this endpoint is an asking device: raw bytes have nowhere to land (A4)", Error.Semantics);
+        return self.fail(line, "this endpoint is an actor: it takes messages, not raw bytes (A4)", Error.Semantics);
+    }
+
     /// Emit an immediate operand: `#n` when it survives imm8 sign-extension
     /// intact, `##$X` otherwise.
     fn imm(self: *Gen, v: u64) Error![]const u8 {
@@ -3110,6 +3172,7 @@ const Gen = struct {
                 }
             },
             .send_field => |sf| {
+                try self.requireRaw(sf.target, sf.line);
                 const tslot = self.slots.get(sf.target) orelse
                     return self.fail(sf.line, "unknown send target", Error.Semantics);
                 const bind = self.bind orelse
@@ -3142,7 +3205,7 @@ const Gen = struct {
                     try self.w("        LDA (${X}),Y", .{self.off_fp});
                     try self.w("        STA (${X}),Y", .{self.off_t});
                 }
-                try self.w("        LDA #1              ; SQE: op = send", .{});
+                try self.w("        LDA ##$1_0000_0001  ; SQE: op = send, claim raw (A4)", .{});
                 try self.w("        STA !${X}", .{self.layout.sqBase()});
                 try self.w("        LDA ${X}", .{tslot});
                 try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
@@ -3157,11 +3220,12 @@ const Gen = struct {
                 try self.w("        SEND 0", .{});
             },
             .send_buf => |sb| {
+                try self.requireRaw(sb.target, sb.line);
                 const tslot = self.slots.get(sb.target) orelse
                     return self.fail(sb.line, "unknown send target", Error.Semantics);
                 const bi = self.bufs.get(sb.buf) orelse
                     return self.fail(sb.line, "a raw send takes a buf", Error.Semantics);
-                try self.w("        LDA #1              ; SQE: op = send", .{});
+                try self.w("        LDA ##$1_0000_0001  ; SQE: op = send, claim raw (A4)", .{});
                 try self.w("        STA !${X}", .{self.layout.sqBase()});
                 try self.w("        LDA ${X}", .{tslot});
                 try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
@@ -3323,11 +3387,12 @@ const Gen = struct {
             },
             .send => |sd| try self.send(sd),
             .send_str => |ss| {
+                try self.requireRaw(ss.target, ss.line);
                 const tslot = self.slots.get(ss.target) orelse
                     return self.fail(ss.line, "unknown send target", Error.Semantics);
                 const lbl = self.label();
                 try self.strings.append(.{ .label = lbl, .text = ss.text });
-                try self.w("        LDA #1              ; SQE: op = send", .{});
+                try self.w("        LDA ##$1_0000_0001  ; SQE: op = send, claim raw (A4)", .{});
                 try self.w("        STA !${X}", .{self.layout.sqBase()});
                 try self.w("        LDA ${X}", .{tslot});
                 try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
@@ -4026,6 +4091,19 @@ const Gen = struct {
         } else self.slots.get(sd.target) orelse
             return self.fail(sd.line, "unknown send target", Error.Semantics);
 
+        // A4 movement 1, the compiler's early copy of the RBC's check:
+        // what this payload claims must equal what the endpoint IS.
+        if (sd.target_idx == null and !std.mem.eql(u8, sd.target, "self")) {
+            const want: ring.Dialect = if (msg.device()) .ask else .msg;
+            const have = self.targetDialect(sd.target);
+            if (have != .any and have != want) {
+                if (have == .raw)
+                    return self.fail(sd.line, "this endpoint takes raw bytes, not a message — `send it, buf` (A4)", Error.Semantics);
+                if (have == .ask)
+                    return self.fail(sd.line, "this endpoint is an asking device: declare the request with `-> Reply` (A4)", Error.Semantics);
+                return self.fail(sd.line, "this endpoint takes a message, not a device request (A4)", Error.Semantics);
+            }
+        }
         if (msg.device()) {
             // The ask path (A3.3 / §7.3): a device request is not a joe
             // wire image — it is {tag, reply window, arguments}. The tag
@@ -4074,7 +4152,7 @@ const Gen = struct {
                 try self.w("        STA !${X}", .{self.layout.staging() + f.offset});
                 fixed = f.offset + 8;
             }
-            try self.w("        LDA #1              ; SQE: op = send", .{});
+            try self.w("        LDA ##$3_0000_0001  ; SQE: op = send, claim ask (A4)", .{});
             try self.w("        STA !${X}", .{self.layout.sqBase()});
             try self.w("        LDA ${X}", .{tslot});
             try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
@@ -4222,7 +4300,7 @@ const Gen = struct {
                 else => return self.fail(sd.line, "a bytes argument is a buf or a bound bytes field (v1)", Error.Semantics),
             }
         }
-        try self.w("        LDA #1              ; SQE: op = send", .{});
+        try self.w("        LDA ##$2_0000_0001  ; SQE: op = send, claim msg (A4)", .{});
         try self.w("        STA !${X}", .{self.layout.sqBase()});
         try self.w("        LDA ${X}", .{tslot});
         try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
@@ -5565,6 +5643,58 @@ test "joe A3.4: a record holds scalars, not heaps" {
         \\actor P() { var b Bad }
     , "P", .{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message, "a shape, not a heap") != null);
+}
+
+test "joe A4.1: a framed message at a raw sink is a compile error" {
+    // The politely-printed bug. Before A4 this compiled, and the console
+    // dutifully printed the request's bytes.
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator,
+        \\message Write { op u64 }
+        \\actor A(tty addr) {
+        \\    send tty, Write{1}
+        \\}
+        \\system {
+        \\    a = A(tty)
+        \\    tty = Console()
+        \\}
+    , "A", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "takes raw bytes") != null);
+}
+
+test "joe A4.1: raw bytes at an actor, and an undeclared ask, are compile errors" {
+    var diag = Diagnostic{};
+    // Bytes at an actor: they would arrive as a message with a nonsense tag.
+    try testing.expectError(Error.Semantics, compile(testing.allocator,
+        \\message Go { }
+        \\actor A(peer addr) {
+        \\    var b buf [16]u8
+        \\    append b, "hi"
+        \\    send peer, b
+        \\}
+        \\actor B() { serve { case Go(_): halt ok } }
+        \\system {
+        \\    a = A(b)
+        \\    b = B()
+        \\}
+    , "A", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "takes messages, not raw bytes") != null);
+
+    // A plain message at an asking device: word1 would be read as a
+    // reply window in the DEVICE's PTT space — the §7.3 hazard, made
+    // unrepresentable.
+    var diag2 = Diagnostic{};
+    try testing.expectError(Error.Semantics, compile(testing.allocator,
+        \\message Draw { count u64 }
+        \\actor A(well addr) {
+        \\    send well, Draw{8}
+        \\}
+        \\system {
+        \\    a = A(well)
+        \\    well = Entropy()
+        \\}
+    , "A", .{}, &diag2));
+    try testing.expect(std.mem.indexOf(u8, diag2.message, "asking device") != null);
 }
 
 test "joe: the system block parses into a plan" {

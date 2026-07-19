@@ -500,6 +500,83 @@ test "cq overflow: a lost delivery kills the context; a lost verdict does not" {
     }
 }
 
+test "A4 movement 1: the RBC rejects a lying dialect claim, compiler or no compiler" {
+    // The thesis test. A hand-written program stamps a MSG claim into an
+    // SQE aimed at a RAW endpoint — the bypass a static check cannot see.
+    // The right lives in the capability, so the machine rejects it at the
+    // PTT, in the same breath it checks the token, and no bytes move.
+    const src =
+        \\        .org $1000
+        \\        LDA ##$2_0000_0001  ; op = send | hint claim = msg (2)
+        \\        STA !$2400
+        \\        LDA ##$FF00_0000_0000_0000
+        \\        STA !$2408
+        \\        LDA ##$2500
+        \\        STA !$2410
+        \\        LDA ##$1_0000_0008
+        \\        STA !$2418
+        \\        SEND 0
+        \\wait:   LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wait
+        \\        STA $860            ; the verdict, for the test to read
+        \\        HLT
+    ;
+    for ([_]ring.Dialect{ .raw, .msg }) |endpoint| {
+        var m = try Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 1,
+            .ram_size = 0x8000,
+        });
+        defer m.deinit();
+        try m.attachDevice(0xFF00, 0, .{ .console = @import("dev.zig").Console.init(testing.allocator) });
+        m.setPtt(0, 0, .{
+            .prefix_hi = 0xfd65_6400_0000_0000,
+            .prefix_lo = ring.PttEntry.loFrom(0xFF00, 0, 0),
+            .rights = .{ .send = true },
+            .dialect = endpoint,
+            .token = 0,
+        });
+        m.setRing(0, 0, ring.slot_sq, .{
+            .base = 0x2400,
+            .cap_log2 = 0,
+            .entry_size = ring.sq_entry_size,
+            .watermark = 0,
+            .companion_cq = ring.slot_cq,
+            .head = 0,
+            .tail = 0,
+            .token = 0,
+        });
+        m.setRing(0, 0, ring.slot_cq, .{
+            .base = 0x2000,
+            .cap_log2 = 4,
+            .entry_size = ring.cq_entry_size,
+            .watermark = 0,
+            .companion_cq = ring.slot_cq,
+            .head = 0,
+            .tail = 0,
+            .token = 0,
+        });
+        var out = try asm6564.assemble(testing.allocator, src, null);
+        defer out.deinit();
+        m.load(0, out.origin, out.code);
+        try m.spawn(0, 0, 0x1000, 0x3000, 0);
+        _ = try m.run();
+        const verdict = std.mem.readInt(u64, m.cores[0].contexts[0].near[0x860..][0..8], .little);
+        const status: ring.Status = @enumFromInt(@as(u8, @truncate(verdict >> 8)));
+        if (endpoint == .raw) {
+            // The claim says msg, the endpoint IS raw: rejected, and the
+            // console never heard a byte.
+            try testing.expectEqual(ring.Status.reject_capability, status);
+            try testing.expectEqual(@as(usize, 0), m.device(0xFF00).?.console.out.items.len);
+        } else {
+            // Same program, honest endpoint: through it goes.
+            try testing.expectEqual(ring.Status.ok, status);
+            try testing.expectEqual(@as(usize, 8), m.device(0xFF00).?.console.out.items.len);
+        }
+    }
+}
+
 test "the one-shot timer side door: a dropped timeout is a park with no wake" {
     // §6.3's discipline, demonstrated rather than asserted. A timeout is
     // a verdict, so §4.2 lets it drop when a CQ is full — and for an

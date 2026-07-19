@@ -278,16 +278,39 @@ pub const RxEntry = struct {
 
 /// A PTT entry image, as CAPLD reads it from the near page (§3.2, §6.4):
 ///   word0 IPv6 prefix (high 64)     word1 IPv6 prefix (low 64)
-///   word2 rights[0..3) | route[8..16)     word3 capability token
+///   word2 rights[0..3) | route[8..16) | dialect[16..18)   word3 token
 ///
 /// Simulator convention for the prefix: cores are addressed fd65:6400::/32
 /// with the low word carrying the mesh coordinates the simulator routes by —
 /// dst core[0..16) | dst context[16..24) | dst RX descriptor slot[24..32).
+/// What an endpoint IS (Amendment 4, movement 1). Not a permission: a
+/// description, with exactly one value per endpoint, checked by
+/// EQUALITY. A weakened dialect is nonsense — you cannot half-print to
+/// a teletype — which is precisely why it lives beside the verbs
+/// instead of among them.
+pub const Dialect = enum(u2) {
+    /// Unset: no claim is checked. Legacy wiring and hand-written code
+    /// that has not opted in.
+    any = 0,
+    /// A sink that takes bytes: payload is content, nothing is framed.
+    raw = 1,
+    /// An actor: payload is a joe wire image, word0 low half is a tag.
+    msg = 2,
+    /// An asking device (§7.3): word0 is the caller tag, word1 the
+    /// reply window. Sending a msg image here would have the device
+    /// read a tag word as a return address — the hazard this check
+    /// exists to make unrepresentable.
+    ask = 3,
+};
+
 pub const PttEntry = struct {
     prefix_hi: u64 = 0,
     prefix_lo: u64 = 0,
     rights: Rights = .{},
     route: u8 = 0,
+    /// What the far end is (equality-checked); `verbs` is what the
+    /// holder may do (subset-checked). Two fields, two disciplines.
+    dialect: Dialect = .any,
     token: u64 = 0,
 
     pub const Rights = packed struct(u3) {
@@ -312,6 +335,7 @@ pub const PttEntry = struct {
             .prefix_lo = words[1],
             .rights = @bitCast(@as(u3, @truncate(words[2]))),
             .route = @truncate(words[2] >> 8),
+            .dialect = @enumFromInt(@as(u2, @truncate(words[2] >> 16))),
             .token = words[3],
         };
     }
@@ -320,7 +344,8 @@ pub const PttEntry = struct {
         return .{
             self.prefix_hi,
             self.prefix_lo,
-            @as(u64, @as(u3, @bitCast(self.rights))) | (@as(u64, self.route) << 8),
+            @as(u64, @as(u3, @bitCast(self.rights))) | (@as(u64, self.route) << 8) |
+                (@as(u64, @intFromEnum(self.dialect)) << 16),
             self.token,
         };
     }
