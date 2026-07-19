@@ -500,6 +500,225 @@ test "cq overflow: a lost delivery kills the context; a lost verdict does not" {
     }
 }
 
+test "A4 movement 2: succession — a capability moves, with provenance" {
+    // Rocci's fourth costume, in miniature: a dying screen hands its live
+    // framebuffer to its successor. No copy, no redraw — the capability
+    // moves, the memory stays exactly where it is.
+    const grantor =
+        \\        .org $1000
+        \\        LDA ##$4000         ; the region: base…
+        \\        STA $100            ;   (descriptor slot 8)
+        \\        LDA ##$020F_0000_0000_0000  ; REGION flag | verbs rwsg
+        \\        STA $108
+        \\        LDA ##512
+        \\        STA $110
+        \\        LDA ##$6564         ; our token
+        \\        STA $118
+        \\        LDA #4              ; SQE: op = grant
+        \\        STA !$2400
+        \\        LDA ##$FF00_0000_0000_0000
+        \\        STA !$2408          ; to the successor, via PTT 0
+        \\        LDA #8
+        \\        STA !$2410          ; source descriptor slot
+        \\        LDA ##$1_0000_0003  ; verbs granted: read|write (no send, no grant)
+        \\        STA !$2418
+        \\        SEND 0
+        \\        HLT
+    ;
+    const heir =
+        \\        .org $1400
+        \\        RECV 2
+        \\wait:   LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wait
+        \\        AND ##$FFFF
+        \\        CMP #3              ; a delivery?
+        \\        BNE wait
+        \\        STX $200            ; where the grant record landed
+        \\        HLT
+    ;
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 2,
+        .ram_size = 0x8000,
+    });
+    defer m.deinit();
+    // The successor's RX ring, and the grantor's capability to reach it.
+    m.setPtt(0, 0, .{
+        .prefix_hi = 0xfd65_6400_0000_0000,
+        .prefix_lo = ring.PttEntry.loFrom(0, 1, ring.slot_rx),
+        .rights = .{ .send = true },
+        .dialect = .msg,
+        .token = 0x6564,
+    });
+    for ([_]u8{ 0, 1 }) |c| {
+        m.setRing(0, c, ring.slot_sq, .{
+            .base = 0x2400 + @as(u64, c) * 0x200,
+            .cap_log2 = 0,
+            .entry_size = ring.sq_entry_size,
+            .watermark = 0,
+            .companion_cq = ring.slot_cq,
+            .head = 0,
+            .tail = 0,
+            .token = 0,
+        });
+        m.setRing(0, c, ring.slot_cq, .{
+            .base = 0x2000 + @as(u64, c) * 0x200,
+            .cap_log2 = 4,
+            .entry_size = ring.cq_entry_size,
+            .watermark = 0,
+            .companion_cq = ring.slot_cq,
+            .head = 0,
+            .tail = 0,
+            .token = 0,
+        });
+    }
+    m.setRing(0, 1, ring.slot_rx, .{
+        .base = 0x2800,
+        .cap_log2 = 1,
+        .entry_size = ring.rx_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0x6564,
+    });
+    var entry_bytes: [32]u8 = undefined;
+    const rx = ring.RxEntry{ .buf = 0x2900, .cap = 64, .filled = 0, .cookie = 0x2900 };
+    for (rx.pack(), 0..) |w, i| std.mem.writeInt(u64, entry_bytes[i * 8 ..][0..8], w, .little);
+    m.load(0, 0x2800, &entry_bytes);
+
+    var g = try asm6564.assemble(testing.allocator, grantor, null);
+    defer g.deinit();
+    var h = try asm6564.assemble(testing.allocator, heir, null);
+    defer h.deinit();
+    m.load(0, g.origin, g.code);
+    m.load(0, h.origin, h.code);
+    try m.spawn(0, 1, 0x1400, 0x3800, 0); // the heir listens first
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    _ = try m.run();
+
+    try testing.expectEqual(@as(u64, 1), m.stats.grants);
+    // The grantor surrendered its copy: the token is gone, so the region
+    // it just handed on is no longer reachable through the old capability.
+    const old_token = std.mem.readInt(u64, m.cores[0].contexts[0].near[0x118..][0..8], .little);
+    try testing.expectEqual(@as(u64, 0), old_token);
+
+    // The heir received a grant record — and hardware chose the slot.
+    const landed = std.mem.readInt(u64, m.cores[0].contexts[1].near[0x200..][0..8], .little);
+    const rec = m.cores[0].ram[@intCast(landed - machine.ram_base)..][0..56];
+    const w = struct {
+        fn at(p: []const u8, i: usize) u64 {
+            return std.mem.readInt(u64, p[i * 8 ..][0..8], .little);
+        }
+    }.at;
+    try testing.expectEqual(ring.grant_record_tag, w(rec, 0));
+    const new_slot: u8 = @truncate(w(rec, 1));
+    try testing.expect(new_slot >= 8);
+    try testing.expectEqual(@as(u64, 0x4000), w(rec, 3)); // same memory…
+    try testing.expectEqual(@as(u64, 512), w(rec, 4)); // …same extent
+    try testing.expect(w(rec, 2) != 0x6564); // …fresh token, not the old one
+    // Provenance: who granted it, from which of their slots, in which life.
+    try testing.expectEqual(@as(u64, 0), w(rec, 5) & 0xFFFF); // core 0
+    try testing.expectEqual(@as(u64, 0), (w(rec, 5) >> 16) & 0xFFFF); // ctx 0
+    try testing.expectEqual(@as(u64, 8), w(rec, 6)); // their slot 8
+
+    // The derived capability carries the verbs it was granted — read and
+    // write, but NOT grant: this heir cannot pass it on again.
+    const doff = @as(usize, new_slot) * ring.desc_size;
+    const dw1 = std.mem.readInt(u64, m.cores[0].contexts[1].near[doff + 8 ..][0..8], .little);
+    const verbs: ring.Verbs = @bitCast(@as(u4, @truncate(dw1 >> 48)));
+    try testing.expect(verbs.read and verbs.write);
+    try testing.expect(!verbs.grant);
+    // And it is a region, with hardware's fresh token.
+    try testing.expect(@as(u8, @truncate(dw1 >> 56)) & ring.desc_flag_region != 0);
+    try testing.expectEqual(
+        w(rec, 2),
+        std.mem.readInt(u64, m.cores[0].contexts[1].near[doff + 24 ..][0..8], .little),
+    );
+}
+
+test "A4 movement 2: what you do not hold, you cannot pass on" {
+    // Three refusals, one mechanism: a revoked capability (token zero), a
+    // capability granted out to silicon (OWNED), and one whose holder was
+    // never given the right to delegate.
+    const src =
+        \\        .org $1000
+        \\        LDA #4
+        \\        STA !$2400
+        \\        LDA ##$FF00_0000_0000_0000
+        \\        STA !$2408
+        \\        LDA #8
+        \\        STA !$2410
+        \\        LDA ##$1_0000_0003
+        \\        STA !$2418
+        \\        SEND 0
+        \\wait:   LSTN 1
+        \\        CQPOP 1
+        \\        BEQ wait
+        \\        STA $200
+        \\        HLT
+    ;
+    const cases = [_]struct { w1: u64, token: u64 }{
+        .{ .w1 = 0x020F_0000_0000_0000, .token = 0 }, // revoked
+        .{ .w1 = 0x060F_0000_0000_0000, .token = 0x6564 }, // OWNED by silicon
+        .{ .w1 = 0x0203_0000_0000_0000, .token = 0x6564 }, // holder has no grant verb
+    };
+    for (cases) |c| {
+        var m = try Machine.init(testing.allocator, .{
+            .cores = 1,
+            .contexts_per_core = 2,
+            .ram_size = 0x8000,
+        });
+        defer m.deinit();
+        m.setPtt(0, 0, .{
+            .prefix_hi = 0xfd65_6400_0000_0000,
+            .prefix_lo = ring.PttEntry.loFrom(0, 1, ring.slot_rx),
+            .rights = .{ .send = true },
+            .dialect = .msg,
+            .token = 0x6564,
+        });
+        m.setRing(0, 0, ring.slot_sq, .{
+            .base = 0x2400,
+            .cap_log2 = 0,
+            .entry_size = ring.sq_entry_size,
+            .watermark = 0,
+            .companion_cq = ring.slot_cq,
+            .head = 0,
+            .tail = 0,
+            .token = 0,
+        });
+        m.setRing(0, 0, ring.slot_cq, .{
+            .base = 0x2000,
+            .cap_log2 = 4,
+            .entry_size = ring.cq_entry_size,
+            .watermark = 0,
+            .companion_cq = ring.slot_cq,
+            .head = 0,
+            .tail = 0,
+            .token = 0,
+        });
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, 0x4000, .little);
+        m.writeNear(0, 0, 0x100, &buf);
+        std.mem.writeInt(u64, &buf, c.w1, .little);
+        m.writeNear(0, 0, 0x108, &buf);
+        std.mem.writeInt(u64, &buf, 512, .little);
+        m.writeNear(0, 0, 0x110, &buf);
+        std.mem.writeInt(u64, &buf, c.token, .little);
+        m.writeNear(0, 0, 0x118, &buf);
+        var out = try asm6564.assemble(testing.allocator, src, null);
+        defer out.deinit();
+        m.load(0, out.origin, out.code);
+        try m.spawn(0, 0, 0x1000, 0x3000, 0);
+        _ = try m.run();
+        try testing.expectEqual(@as(u64, 0), m.stats.grants);
+        const verdict = std.mem.readInt(u64, m.cores[0].contexts[0].near[0x200..][0..8], .little);
+        const status: ring.Status = @enumFromInt(@as(u8, @truncate(verdict >> 8)));
+        try testing.expectEqual(ring.Status.reject_capability, status);
+    }
+}
+
 test "A4 movement 1: the RBC rejects a lying dialect claim, compiler or no compiler" {
     // The thesis test. A hand-written program stamps a MSG claim into an
     // SQE aimed at a RAW endpoint — the bypass a static check cannot see.

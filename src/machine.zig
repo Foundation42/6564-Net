@@ -241,6 +241,8 @@ pub const Stats = struct {
     /// Staged entries cancelled by an upstream chain break.
     chain_cancels: u64 = 0,
     cq_overflows: u64 = 0,
+    /// Capability transfers completed (A4 movement 2).
+    grants: u64 = 0,
     /// Requests accepted by peripheral-row devices (§7).
     dev_deliveries: u64 = 0,
     /// Reply datagrams devices fired back through their own PTTs.
@@ -299,6 +301,8 @@ const PendingSend = struct {
 };
 
 pub const Machine = struct {
+    /// Monotonic mint counter for transferred capabilities (A4 m2).
+    grant_seq: u64 = 0,
     alloc: std.mem.Allocator,
     cfg: Config,
     cores: []Core,
@@ -550,6 +554,75 @@ pub const Machine = struct {
         const flags: u8 = @truncate(w1 >> 56);
         if (flags & ring.desc_flag_region == 0) return null;
         return .{ .base = base, .len = len, .token = token, .flags = flags };
+    }
+
+    /// Capability transfer (A4 movement 2): move a region capability from
+    /// the granting context to the grantee, minting a fresh token and
+    /// leaving a paper trail. Returns the grantee's new descriptor slot,
+    /// or null with the reject status set.
+    ///
+    /// The verbs narrow (subset, attenuable); a region carries no dialect
+    /// to copy — dialect is an ENDPOINT property, and a span of memory is
+    /// not an endpoint — so the movement-1 tripwire stays silent here,
+    /// which is itself the finding: the two fields are not parallel
+    /// across capability kinds.
+    fn transferRegion(
+        self: *Machine,
+        from_core: u16,
+        from_ctx: u8,
+        src_slot: u8,
+        to_core: u16,
+        to_ctx: u8,
+        verbs: ring.Verbs,
+    ) ?struct { slot: u8, token: u64, base: u64, len: u64 } {
+        if (from_core >= self.cores.len or to_core >= self.cores.len) return null;
+        const src = &self.cores[from_core].contexts[from_ctx];
+        if (src_slot >= ring.desc_slots) return null;
+        const soff = @as(u64, src_slot) * ring.desc_size;
+        const base = read64(&self.cores[from_core], src, soff) catch return null;
+        const w1 = read64(&self.cores[from_core], src, soff + 8) catch return null;
+        const len = read64(&self.cores[from_core], src, soff + 16) catch return null;
+        const token = read64(&self.cores[from_core], src, soff + 24) catch return null;
+        const flags: u8 = @truncate(w1 >> 56);
+        // You cannot pass on what you do not hold: not a region, already
+        // granted out to silicon, or revoked (token zero) — all refuse.
+        if (flags & ring.desc_flag_region == 0) return null;
+        if (flags & ring.desc_flag_owned != 0) return null;
+        if (token == 0) return null;
+        // The grantor's own verbs bound the grantee's (subset).
+        const held: ring.Verbs = @bitCast(@as(u4, @truncate(w1 >> 48)));
+        const holds_any = @as(u4, @bitCast(held)) != 0;
+        if (holds_any and !verbs.subsetOf(held)) return null;
+        if (holds_any and !held.grant) return null; // no right to pass it on
+
+        // Find the grantee a free descriptor slot. Hardware picks, and
+        // says which in the grant record: a grantor that had to know the
+        // grantee's table layout would be reaching into it.
+        const dst = &self.cores[to_core].contexts[to_ctx];
+        var slot: u8 = 8; // 0..7 are architected/loader territory
+        const free_slot = while (slot < ring.desc_slots) : (slot += 1) {
+            const off = @as(u64, slot) * ring.desc_size;
+            const b = read64(&self.cores[to_core], dst, off) catch return null;
+            const t = read64(&self.cores[to_core], dst, off + 24) catch return null;
+            if (b == 0 and t == 0) break slot;
+        } else return null;
+
+        // Mint: fresh token, verbs as granted, region flag set.
+        self.grant_seq +%= 1;
+        const fresh = 0x6772_0000_0000_0000 | self.grant_seq;
+        const off = @as(u64, free_slot) * ring.desc_size;
+        const nw1 = (@as(u64, @as(u4, @bitCast(verbs))) << 48) |
+            (@as(u64, ring.desc_flag_region) << 56);
+        write64(&self.cores[to_core], dst, off, base) catch return null;
+        write64(&self.cores[to_core], dst, off + 8, nw1) catch return null;
+        write64(&self.cores[to_core], dst, off + 16, len) catch return null;
+        write64(&self.cores[to_core], dst, off + 24, fresh) catch return null;
+
+        // Surrender the grantor's copy: succession, not sharing. Zeroing
+        // the token is the same revocation software already had (§6.2).
+        write64(&self.cores[from_core], src, soff + 24, 0) catch return null;
+        self.stats.grants += 1;
+        return .{ .slot = free_slot, .token = fresh, .base = base, .len = len };
     }
 
     fn setRegionOwned(self: *Machine, job: AccelJob, owned: bool) void {
@@ -1631,6 +1704,73 @@ pub const Machine = struct {
                 for (&words, 0..) |*w, i| w.* = std.mem.readInt(u64, entry_mem[i * 8 ..][0..8], .little);
                 const sqe = ring.SqEntry.unpack(words);
                 if (!ring.isWindow(sqe.target)) return error.NoCapability;
+                if (sqe.op == .grant) {
+                    // A4 movement 2: hand a capability to whoever this
+                    // window names. The grant record arrives as an
+                    // ordinary delivery — a capability moving is a
+                    // message like any other, and the paper trail is
+                    // therefore auditable by anyone who can read a CQ.
+                    d.tail +%= 1;
+                    writeDesc(ctx, desc_slot, d);
+                    const slot_idx = ring.windowPtt(sqe.target);
+                    const pe = if (slot_idx < core.ptt.len) core.ptt[slot_idx] else ring.PttEntry{};
+                    const dst_core = pe.dstCore();
+                    const dst_ctx = pe.dstContext();
+                    var payload: [56]u8 = @splat(0);
+                    const moved = if (pe.rights.send and dst_core < self.cores.len and
+                        dst_ctx < self.cfg.contexts_per_core)
+                        self.transferRegion(
+                            core.id,
+                            ctx_idx,
+                            @truncate(sqe.buf),
+                            dst_core,
+                            dst_ctx,
+                            @bitCast(@as(u4, @truncate(sqe.len))),
+                        )
+                    else
+                        null;
+                    const st: ring.Status = if (moved == null) .reject_capability else .ok;
+                    if (moved) |g| {
+                        // The grant record: what you got, and where it
+                        // came from. Provenance is data, in a delivery,
+                        // because everything auditable here already is.
+                        const words_out = [_]u64{
+                            ring.grant_record_tag,
+                            g.slot,
+                            g.token,
+                            g.base,
+                            g.len,
+                            @as(u64, core.id) | (@as(u64, ctx_idx) << 16) |
+                                (@as(u64, @as(u16, @truncate(ctx.gen))) << 32),
+                            @as(u64, @truncate(sqe.buf)),
+                        };
+                        for (words_out, 0..) |w, i|
+                            std.mem.writeInt(u64, payload[i * 8 ..][0..8], w, .little);
+                        try self.sendDatagram(
+                            core.id,
+                            slot_idx,
+                            ring.windowOffset(sqe.target),
+                            &payload,
+                            .{
+                                .core = core.id,
+                                .ctx = ctx_idx,
+                                .cq_slot = d.companion_cq,
+                                .tag = .send,
+                                .cookie = sqe.cookie_lo,
+                            },
+                            .msg,
+                        );
+                        return .keep;
+                    }
+                    self.stats.rejects += 1;
+                    self.cqPost(core.id, ctx_idx, d.companion_cq, .{
+                        .tag = .send,
+                        .status = st,
+                        .byte_count = 0,
+                        .cookie = sqe.cookie_lo,
+                    });
+                    return .keep;
+                }
                 // Payload by op: a block transfer, or an 8-byte immediate.
                 var txr_payload: [8]u8 = undefined;
                 const payload: []const u8 = switch (sqe.op) {

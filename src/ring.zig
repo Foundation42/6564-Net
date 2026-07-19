@@ -205,7 +205,47 @@ pub const Completion = struct {
 
 /// Submission-queue entry operations. Non-exhaustive: unknown bytes decode
 /// to `_` and fault at execution, honestly.
-pub const SqOp = enum(u8) { nop = 0, send = 1, txr = 2, recv = 3, _ };
+pub const SqOp = enum(u8) {
+    nop = 0,
+    send = 1,
+    txr = 2,
+    recv = 3,
+    /// **Capability transfer (A4 movement 2).** Hand a capability this
+    /// context holds to another context: `buf` names the source
+    /// descriptor slot, `len`'s low bits are the verb mask the grantee
+    /// receives (⊆ the grantor's), `target` is the window of whoever
+    /// receives it. The RBC mints a fresh token, writes the derived
+    /// capability into the grantee's descriptor table, and delivers a
+    /// **grant record** — base, length, token, new slot, and the
+    /// provenance of where it came from. The grantor's copy is
+    /// surrendered: this is succession, not sharing.
+    grant = 4,
+    _,
+};
+
+/// The architected first word of a grant record delivered to a grantee
+/// (A4 movement 2), above every program tag like the accelerator
+/// convention it is modelled on ($6772, §7.6).
+pub const grant_record_tag: u64 = 0x6772_0001;
+
+/// A capability's verbs — what the holder may DO, checked by subset and
+/// therefore attenuable, unlike the dialect that says what an endpoint
+/// IS (see PttEntry.Dialect).
+pub const Verbs = packed struct(u4) {
+    read: bool = false,
+    write: bool = false,
+    send: bool = false,
+    /// May pass this capability on — the right that makes transfer
+    /// itself a right, so a delegation chain can be ended by whoever
+    /// withholds it.
+    grant: bool = false,
+
+    pub fn subsetOf(self: Verbs, other: Verbs) bool {
+        const a: u4 = @bitCast(self);
+        const b: u4 = @bitCast(other);
+        return a & ~b == 0;
+    }
+};
 
 /// A submission entry, 32 bytes, normative as of spec v2.2 (§4.2):
 ///
