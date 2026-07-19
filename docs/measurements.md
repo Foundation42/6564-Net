@@ -1241,3 +1241,43 @@ without it:
 - One drift repaired: joe had two string-escape decoders and only one
   knew `\n`; neither knew `\r`, so every CRLF was "rn" and cloudflare
   answered 400 Bad Request. One decoder now.
+
+## Amendment 4 — rights on capabilities (2026-07-19)
+
+Christian's sketch, priced. The rights word splits into **dialect** (what
+an endpoint IS — equality-checked, not attenuable) and **verbs** (what a
+holder MAY DO — subset-checked, attenuable). `any` is unset, not top: its
+checks are skipped rather than satisfied, so replacing it is not
+attenuation, and a derived capability may never carry it.
+
+**Movement 1 — the dialect check.** Claim in the SQE's reserved hint
+word, compared against the endpoint at accept, one step after the rights
+test. TXR claims `msg` structurally (you cannot print a register), so the
+hottest path encodes nothing.
+
+| pre-registered claim | outcome |
+|---|---|
+| null cost | **byte-identical frozen table**: 2820 B / 171,532 instr / 479,275 cy / 13,281 switches |
+| rejected programs | 3 compile errors: msg→raw sink, raw→actor, msg→ask device |
+| the bypass test | hand-written `.asm` lying about its claim: **rejected by the RBC**, console unheard |
+
+**Movement 2 — succession.** `SqOp.grant`: hardware picks the grantee's
+slot, mints a fresh token, surrenders the grantor's copy, narrows verbs
+to the granted subset, and delivers a grant record carrying provenance
+(core, context, incarnation, source slot). Three refusals, one rule —
+what you do not hold, you cannot pass on. Frozen tables unmoved again.
+
+**The finding.** Movement 1's tripwire (if transfer wants to modify a
+dialect, the boundary is wrong) stayed silent — because a region carries
+no dialect at all. Dialect is an endpoint property; a span of memory is
+not an endpoint. **Verbs are universal; dialect belongs to things you
+send to.** The asymmetry was not designed, it fell out of building both.
+
+Also this pass: §2.3 promoted from observation to principle — *every
+static check is the early copy of a dynamic one; a compiler never
+extends trust, it only moves a reject earlier in time* — with the
+diagnostic corollary that a static check lacking a runtime twin is a
+smell (it would have caught A3.6's gap by inspection). And §6.3's
+one-shot timer discipline: a liveness-bearing timer must be AUTO_REARM,
+because a dropped one-shot timeout is the eternal park returning through
+the side door.
