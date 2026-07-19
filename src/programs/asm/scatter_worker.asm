@@ -4,11 +4,21 @@
 ; resends, which IS the retransmission protocol. Immortal, like every node
 ; that has an upstream: parked between requests, costing nothing.
 ;
-; Harness contract:
-;   PTT 0 → coordinator's result ring
-;   desc slots: 0 result SQ, 1 CQ, 2 task RX (cap 1)
-;   RAM: $2200 task landing {id, v}, $2280 reply out {id, v²}
-;   near: $850 served count (harness reads; > 1 per task = duplicates seen)
+; The contract, as directives: the capability back to the coordinator's
+; result ring pinned at PTT 0 (the reply SQE below bakes the window
+; constant) and the demo's three rings — SQ, CQ, and the cap-2
+; AUTO_REPOST task RX whose landing entries the code stages itself at
+; $2A00. $2200/$2220 are the task landing buffers, $2280 the reply out;
+; the served count at near $850 is the readback (> 1 per task means
+; duplicates were seen — all idempotent). The coordinator is the lead
+; source: the deployment's .system block lives there.
+
+        .actor Worker(coord cap = 0)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq base=$2000 cap=32
+        .ring 2 rx base=$2A00 cap=2 auto_repost
+        .reserve $2200 $100
+        .var served $850
 
         .org $1000
         ; stage both task landing entries (cap-2 AUTO_REPOST ring;

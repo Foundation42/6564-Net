@@ -8,15 +8,67 @@
 ; buffers, each staged (by the harness) with its own ADDRESS as its cookie —
 ; so a completion record tells us exactly where that result landed.
 ;
-; Harness contract:
-;   PTT 0 = black hole (timer); PTT i = worker i's task ring (i = 1..W)
-;   desc slots: 0 task SQ, 1 CQ, 2 result RX (cap 8, entries staged by
-;   harness: buf $2C00+64i, cookie = buf address)
-;   near (staged by harness): $8A8 W, $8B0 8·(W+1) — scatter loop bound,
-;     $A00+8i worker window pointers, $B00+8i task values
-;   near (ours): $8C0 gathered sum, $8C8 gathered count, $8D0 scatter sends,
-;     $900+8i done flags
-;   RAM: $2280 task out {id, value}
+; The contract, as directives the loader executes (src/asm_run.zig): the
+; black hole pinned at PTT 0 (the timer SQE below bakes its window
+; constant; the period is the fabric's send_timeout) and the eight
+; workers' capabilities staged as window pointers at $A00+8i — the
+; loader allocates their slots above the pin, so worker i lands at
+; PTT i and the staged fan-out chain can bake the same windows. The
+; demo's four rings — task SQ, CQ, the timer SQ at slot 5, and the
+; cap-8 AUTO_REPOST result RX with eight loader-posted landing entries
+; (cookie = buffer address; the code reads results only through
+; cookies, so the cells are the loader's to place). The fan-out chain
+; is staged data: worker 1's SQE is the ring head at $2400, workers
+; 2..8 LINK-chained near-page entries at $C20.., each carrying its own
+; {id, value} payload from $2280+16(i−1). W at $8A8 and the scatter
+; loop bound 8·(W+1) at $8B0 arrive as spawn args; $B00+8i are the
+; task values for straggler re-sends, $2380 the straggler payload
+; buffer (reserved). Gathered sum, count and the send counter are the
+; readbacks the demo verifies; $900+8i are our done flags.
+;
+; The .system block is the demo's default shape: the coordinator on
+; core 0, eight workers on cores 1..8 — singletons, because a worker
+; pins its ring storage and each must own a core. The coordinator is
+; declared first: spawn is reverse declaration, so every worker is
+; parked listening before the fan-out chain fires.
+
+        .actor Coord(w1 cap @ $A08, w2 cap @ $A10, w3 cap @ $A18, w4 cap @ $A20, w5 cap @ $A28, w6 cap @ $A30, w7 cap @ $A38, w8 cap @ $A40, w arg @ $8A8, bound arg @ $8B0)
+        .ring 0 sq base=$2400 cap=1
+        .ring 1 cq base=$2000 cap=32
+        .ring 2 rx base=$2A00 cap=8 auto_repost post=8 size=64
+        .ring 5 sq base=$2480 cap=1
+        .timer = 0 period=2500
+        .reserve $2380 $10
+        ; the task payloads {id, value}, value = id + 3
+        .stage $2280 1, 4, 2, 5, 3, 6, 4, 7, 5, 8, 6, 9, 7, 10, 8, 11
+        ; the straggler task-value table at $B00+8i
+        .stage $B08 4, 5, 6, 7, 8, 9, 10, 11
+        ; the fan-out chain: head SQE in the ring, the rest LINK-chained
+        ; near-page entries (word0 = op send | LINK | next<<16)
+        .stage $2400 $0C20_0101, $FF00_0100_0000_0000, $2280, $1_0000_0010
+        .stage $C20 $0C40_0101, $FF00_0200_0000_0000, $2290, $2_0000_0010
+        .stage $C40 $0C60_0101, $FF00_0300_0000_0000, $22A0, $3_0000_0010
+        .stage $C60 $0C80_0101, $FF00_0400_0000_0000, $22B0, $4_0000_0010
+        .stage $C80 $0CA0_0101, $FF00_0500_0000_0000, $22C0, $5_0000_0010
+        .stage $CA0 $0CC0_0101, $FF00_0600_0000_0000, $22D0, $6_0000_0010
+        .stage $CC0 $0CE0_0101, $FF00_0700_0000_0000, $22E0, $7_0000_0010
+        .stage $CE0 $0000_0001, $FF00_0800_0000_0000, $22F0, $8_0000_0010
+        .var sum $8C0
+        .var gathered $8C8
+        .var scatter_sends $8D0
+        .use "scatter_worker.asm"
+
+        .system
+        c = Coord(w1, w2, w3, w4, w5, w6, w7, w8, 8, 72) on 0
+        w1 = Worker(c) on 1
+        w2 = Worker(c) on 2
+        w3 = Worker(c) on 3
+        w4 = Worker(c) on 4
+        w5 = Worker(c) on 5
+        w6 = Worker(c) on 6
+        w7 = Worker(c) on 7
+        w8 = Worker(c) on 8
+        .endsystem
 
         .org $1000
         ; post all result landing buffers (entries pre-staged in RAM)
