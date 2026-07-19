@@ -273,7 +273,7 @@ const Pattern = struct {
 const AssignOp = enum { set, add, sub };
 
 const Stmt = union(enum) {
-    assign: struct { name: []const u8, idx: ?*Expr, op: AssignOp, expr: *Expr },
+    assign: struct { name: []const u8, idx: ?*Expr, op: AssignOp, expr: *Expr, field: ?[]const u8 = null },
     /// `let x = e` — a burst-local binding (Amendment 3): lives for the
     /// rest of its block, never crosses a park, cannot be reassigned.
     /// Where it lives is codegen's business; the lifetime is the contract.
@@ -357,6 +357,8 @@ const VarDecl = struct {
     buf_cap: u16 = 0,
     region_len: u16 = 0,
     region_f64: bool = false,
+    /// `var anim Anim` (A3.4): the record this variable is shaped by.
+    record: ?[]const u8 = null,
 };
 
 /// One element of a `pack` tuple literal: constants pre-pack at compile
@@ -407,9 +409,15 @@ const Program = struct {
     /// staged after code the way string literals are; the on-ramp to
     /// §11's shared const pages.
     consts: []Const,
+    records: []Record = &.{},
 };
 
 const Const = struct { name: []const u8, text: []const u8 };
+
+/// `struct Anim { last u64, index u64 }` (A3.4) — named offsets into the
+/// near page: no pointers, no nesting, scalar fields, fixed layout. A
+/// shape, not a heap.
+const Record = struct { name: []const u8, fields: []Field };
 
 // ── Lexer ────────────────────────────────────────────────────────────────
 
@@ -651,6 +659,7 @@ const Parser = struct {
         var actors = std.ArrayList(Actor).init(self.arena);
         var system = std.ArrayList(InstanceDecl).init(self.arena);
         var consts = std.ArrayList(Const).init(self.arena);
+        var records = std.ArrayList(Record).init(self.arena);
         try self.advance();
         while (self.tok.kind != .eof) {
             if (try self.eatKw("message")) {
@@ -669,6 +678,14 @@ const Parser = struct {
                 const text = try self.decodeStr(self.tok.text);
                 try self.advance();
                 try consts.append(.{ .name = cname.text, .text = text });
+            } else if (try self.eatKw("struct")) {
+                const rname = try self.expect(.ident, "struct name");
+                const rfields = try self.parseFields();
+                for (rfields) |*f| {
+                    if (f.ty == .bytes_ or f.ty == .vec_ or f.ty == .addr_slice)
+                        return self.fail("a record holds scalars (v1): a shape, not a heap", Error.Unsupported);
+                }
+                try records.append(.{ .name = rname.text, .fields = rfields });
             } else if (try self.eatKw("system")) {
                 _ = try self.expect(.lbrace, "{");
                 while (self.tok.kind != .rbrace) {
@@ -682,6 +699,7 @@ const Parser = struct {
             .actors = try actors.toOwnedSlice(),
             .system = try system.toOwnedSlice(),
             .consts = try consts.toOwnedSlice(),
+            .records = try records.toOwnedSlice(),
         };
     }
 
@@ -862,6 +880,18 @@ const Parser = struct {
                 if (n.value == 0 or n.value > 256)
                     return self.fail("array length is 1..256 in v1", Error.Semantics);
                 try vlist.append(.{ .name = vname.text, .ty = .u64_, .init = null, .array = @intCast(n.value) });
+                continue;
+            }
+            if (self.tok.kind == .ident and Type.named(self.tok.text) == null) {
+                // `var anim Anim` — a record-shaped variable (A3.4).
+                const rname = self.tok.text;
+                try self.advance();
+                try vlist.append(.{
+                    .name = vname.text,
+                    .ty = .u64_,
+                    .init = null,
+                    .record = rname,
+                });
                 continue;
             }
             const ty = try self.parseType();
@@ -1200,8 +1230,13 @@ const Parser = struct {
             if (self.isKw(kw))
                 return self.fail("`" ++ kw ++ "` is not in v1 yet", Error.Unsupported);
         }
-        // assignment: ident[idx]? (=|+=|-=) expr
+        // assignment: ident(.field | [idx])? (=|+=|-=) expr
         const name = try self.expect(.ident, "a statement");
+        var field: ?[]const u8 = null;
+        if (self.tok.kind == .dot) {
+            try self.advance();
+            field = (try self.expect(.ident, "field name")).text;
+        }
         var idx: ?*Expr = null;
         if (self.tok.kind == .lbracket) {
             try self.advance();
@@ -1215,7 +1250,13 @@ const Parser = struct {
             else => return self.fail("expected `=`, `+=` or `-=`", Error.Syntax),
         };
         try self.advance();
-        return .{ .assign = .{ .name = name.text, .idx = idx, .op = op, .expr = try self.parseExpr() } };
+        return .{ .assign = .{
+            .name = name.text,
+            .idx = idx,
+            .op = op,
+            .expr = try self.parseExpr(),
+            .field = field,
+        } };
     }
 
     /// `("users", ?id, ..rest)` — the A2.4 tuple pattern.
@@ -1650,6 +1691,8 @@ const Gen = struct {
     /// rides in `slots` like any binding; this map is what makes it a
     /// let — typed, immutable, and removed at its block's end.
     lets: std.StringHashMap(bool),
+    /// Record-shaped variables (A3.4): name → its base slot and shape.
+    records: std.StringHashMap(struct { base: u16, rec: *const Record }),
     /// Consts staged so far: name → string label. Lazily registered on
     /// first use, so an unreferenced const costs an actor nothing.
     const_labels: std.StringHashMap(usize),
@@ -1782,6 +1825,17 @@ const Gen = struct {
         }
         for (self.actor.vars) |v| {
             if (v.array > 0 or v.buf_cap > 0 or v.region_len > 0 or v.ty == .vec_) continue; // wide things get their own homes
+            if (v.record) |rname| {
+                // A record is named offsets: its fields take consecutive
+                // near slots, and the variable names the first (A3.4).
+                const rec = for (self.prog.records) |*r| {
+                    if (std.mem.eql(u8, r.name, rname)) break r;
+                } else return self.fail(0, "unknown record type", Error.Semantics);
+                try self.slots.put(v.name, off);
+                try self.records.put(v.name, .{ .base = off, .rec = rec });
+                off += @intCast(8 * rec.fields.len);
+                continue;
+            }
             try self.slots.put(v.name, off);
             off += 8;
         }
@@ -2119,6 +2173,16 @@ const Gen = struct {
 
     fn spawnRec(self: *Gen, k: u16) u16 {
         return self.spawn_base + k * 48;
+    }
+
+    /// `anim.index` — the near slot a record field lives in (A3.4), or
+    /// null when this isn't a record access at all.
+    fn recordSlot(self: *Gen, base: []const u8, field: []const u8) ?u16 {
+        const r = self.records.get(base) orelse return null;
+        for (r.rec.fields, 0..) |*f, i| {
+            if (std.mem.eql(u8, f.name, field)) return r.base + @as(u16, @intCast(i * 8));
+        }
+        return null;
     }
 
     /// The label of a `const`'s staged bytes, registered on first use.
@@ -2473,6 +2537,10 @@ const Gen = struct {
             .vlit, .permute => return self.fail(0, "a vector value needs a vec home", Error.Semantics),
             .grantref => return self.fail(0, "`grant` rides inside a send's braces", Error.Semantics),
             .field => |f| {
+                if (self.recordSlot(f.base, f.name)) |slot| {
+                    try self.w("        LDA ${X}", .{slot});
+                    return;
+                }
                 if (self.exit_bind != null and std.mem.eql(u8, self.exit_bind.?, f.base)) {
                     // w.id = the dead worker's context id; w.life = the
                     // incarnation that died (both from the exit cookie).
@@ -3107,6 +3175,41 @@ const Gen = struct {
             .assign => |a| {
                 if (self.lets.contains(a.name))
                     return self.fail(0, "a let is a binding, not a variable — this wants a var", Error.Semantics);
+                if (a.field) |fname| {
+                    // `anim.index = e` — a record field is a near slot
+                    // like any other (A3.4).
+                    const slot = self.recordSlot(a.name, fname) orelse
+                        return self.fail(0, "no such record field", Error.Semantics);
+                    switch (a.op) {
+                        .set => try self.evalInto(a.expr),
+                        .add, .sub => {
+                            // slot OP expr, in that order — subtraction
+                            // does not commute, and the operand form
+                            // keeps the near page out of it when it can.
+                            const mn: []const u8 = if (a.op == .add) "ADC" else "SBC";
+                            const carry: []const u8 = if (a.op == .add) "CLC" else "SEC";
+                            if (self.simpleOperand(a.expr)) |opr| {
+                                try self.w("        LDA ${X}", .{slot});
+                                try self.w("        {s}", .{carry});
+                                if (a.op == .add) {
+                                    try self.opSimple("ADC", opr);
+                                } else {
+                                    try self.opSimple("SBC", opr);
+                                }
+                            } else {
+                                const tmp = try self.pushTmp();
+                                try self.evalInto(a.expr);
+                                try self.w("        STA ${X}", .{tmp});
+                                try self.w("        LDA ${X}", .{slot});
+                                try self.w("        {s}", .{carry});
+                                try self.w("        {s} ${X}", .{ mn, tmp });
+                                self.popTmp();
+                            }
+                        },
+                    }
+                    try self.w("        STA ${X}", .{slot});
+                    return;
+                }
                 if (a.idx) |ix| {
                     // arr[e] = v — evaluate v first (it may clobber Y).
                     const arr = self.arrays.get(a.name) orelse
@@ -5152,6 +5255,7 @@ pub fn compile(
         .diag = diag,
         .slots = std.StringHashMap(u16).init(arena),
         .lets = std.StringHashMap(bool).init(arena),
+        .records = .init(arena),
         .const_labels = std.StringHashMap(usize).init(arena),
         .strings = .init(arena),
         .arrays = .init(arena),
@@ -5425,6 +5529,42 @@ test "joe A3.1: a let does not shadow" {
         \\message Go { }
     , "A", .{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message, "does not shadow") != null);
+}
+
+test "joe A3.4: a record is named offsets, read and written by field" {
+    var r = try compile(testing.allocator,
+        \\struct Anim { last u64, index u64, cell u64 }
+        \\message Tick { }
+        \\actor P() {
+        \\    var anim Anim
+        \\    var seen u64 = 0
+        \\    serve {
+        \\        case Tick(_):
+        \\            anim.index += 1
+        \\            anim.cell = anim.index + 3
+        \\            seen = anim.cell
+        \\    }
+        \\}
+    , "P", .{}, null);
+    defer r.deinit();
+    // Three fields, three consecutive near slots — and `anim` names the
+    // first, so the field slots differ by 8.
+    const base = for (r.vars) |v| {
+        if (std.mem.eql(u8, v.name, "anim")) break v.off;
+    } else unreachable;
+    const seen = for (r.vars) |v| {
+        if (std.mem.eql(u8, v.name, "seen")) break v.off;
+    } else unreachable;
+    try testing.expectEqual(base + 24, seen); // the record took three slots
+}
+
+test "joe A3.4: a record holds scalars, not heaps" {
+    var diag = Diagnostic{};
+    try testing.expectError(Error.Unsupported, compile(testing.allocator,
+        \\struct Bad { payload bytes }
+        \\actor P() { var b Bad }
+    , "P", .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message, "a shape, not a heap") != null);
 }
 
 test "joe: the system block parses into a plan" {
