@@ -531,6 +531,162 @@ test "A4 movement 3: probate from joe — the estate reaches the executor" {
     try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
 }
 
+test "A4 movement 3: signing for the estate — adopt, and the chain of custody" {
+    // Probate end to end. A screen dies having handed its framebuffer to
+    // its supervisor `onward`; the Cabinet SIGNS for it (`adopt`), reads
+    // the dead actor's memory through a name of its own, and passes it to
+    // the Archive. Three holders, one span of memory, never copied.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\actor Screen(tick u64) {
+        \\    var frame region [64]u64
+        \\    frame[0] = 6564
+        \\    grant frame to boss onward
+        \\    halt ok
+        \\}
+        \\actor Archive(name u64) {
+        \\    var kept region [64]u64
+        \\    var got u64 = 0
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as kept
+        \\            got = kept[0]
+        \\    }
+        \\}
+        \\actor Cabinet(arch addr) {
+        \\    var frame region [64]u64
+        \\    var saw u64 = 0
+        \\    spawn Screen(1) restarts 0 watchdog 0
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as frame
+        \\            saw = frame[0]
+        \\            grant frame to arch
+        \\    }
+        \\}
+        \\system { arch = Archive(1) on 0 cab = Cabinet(arch) on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    // Two successions, and the value survives both: what the Archive reads
+    // was written by an actor that died two hops ago.
+    try testing.expectEqual(@as(u64, 2), o.stats.grants);
+    try testing.expectEqual(@as(u64, 6564), o.varOf("cab", "saw").?);
+    try testing.expectEqual(@as(u64, 6564), o.varOf("arch", "got").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
+}
+
+test "A4 movement 3: an heir does not mistake its inheritance for a message" {
+    // The bug movement 3 found in movement 2's wire format. The grant
+    // record was $6772_0001 — the architected mark in the half the
+    // dispatcher does not mask, and tag ONE in the half it does. Tags are
+    // handed out from 1, so every program's first message collided, and a
+    // sole-case actor does no tag test at all. The estate was handled as
+    // an ordinary Draw, silently, with the descriptor slot read as a field.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Draw { n u64 }
+        \\actor Screen(tick u64) {
+        \\    var frame region [64]u64
+        \\    grant frame to boss
+        \\    halt ok
+        \\}
+        \\actor Cabinet() {
+        \\    var draws u64 = 0
+        \\    spawn Screen(1) restarts 0 watchdog 0
+        \\    serve {
+        \\        case Draw(d):
+        \\            draws += 1
+        \\    }
+        \\}
+        \\system { cab = Cabinet() }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 1), o.stats.grants);
+    // Nobody ever sent a Draw.
+    try testing.expectEqual(@as(u64, 0), o.varOf("cab", "draws").?);
+}
+
+test "A4 movement 3: the chain ends where somebody declines to extend it" {
+    // The same program as the chain of custody, minus one word: the screen
+    // grants WITHOUT `onward`, so the Cabinet receives read|write and not
+    // the right to delegate. It adopts and reads happily; its own grant is
+    // refused. Attenuation is not advisory.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\actor Screen(tick u64) {
+        \\    var frame region [64]u64
+        \\    frame[0] = 6564
+        \\    grant frame to boss
+        \\    halt ok
+        \\}
+        \\actor Archive(name u64) {
+        \\    var kept region [64]u64
+        \\    var got u64 = 0
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as kept
+        \\            got = kept[0]
+        \\    }
+        \\}
+        \\actor Cabinet(arch addr) {
+        \\    var frame region [64]u64
+        \\    var saw u64 = 0
+        \\    spawn Screen(1) restarts 0 watchdog 0
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as frame
+        \\            saw = frame[0]
+        \\            grant frame to arch
+        \\    }
+        \\}
+        \\system { arch = Archive(1) on 0 cab = Cabinet(arch) on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    // The estate reached the executor and stopped there.
+    try testing.expectEqual(@as(u64, 1), o.stats.grants);
+    try testing.expectEqual(@as(u64, 6564), o.varOf("cab", "saw").?);
+    try testing.expectEqual(@as(u64, 0), o.varOf("arch", "got").?);
+}
+
+test "A4 movement 3: a region may not leave its memory domain" {
+    // RAM is per-core, so a region's base is a core-local address. Carried
+    // to another core it would still be a well-formed capability — right
+    // length, fresh token, correct verbs — over memory the grantee never
+    // named. The identical program, with the Archive placed on core 1:
+    // the first succession still runs, the crossing is refused, and the
+    // Archive reads nothing, because it was handed nothing.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\actor Screen(tick u64) {
+        \\    var frame region [64]u64
+        \\    frame[0] = 6564
+        \\    grant frame to boss onward
+        \\    halt ok
+        \\}
+        \\actor Archive(name u64) {
+        \\    var kept region [64]u64
+        \\    var got u64 = 0
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as kept
+        \\            got = kept[0]
+        \\    }
+        \\}
+        \\actor Cabinet(arch addr) {
+        \\    var frame region [64]u64
+        \\    var saw u64 = 0
+        \\    spawn Screen(1) restarts 0 watchdog 0
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as frame
+        \\            saw = frame[0]
+        \\            grant frame to arch
+        \\    }
+        \\}
+        \\system { arch = Archive(1) on 1 cab = Cabinet(arch) on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 1), o.stats.grants);
+    try testing.expectEqual(@as(u64, 6564), o.varOf("cab", "saw").?);
+    try testing.expectEqual(@as(u64, 0), o.varOf("arch", "got").?);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability

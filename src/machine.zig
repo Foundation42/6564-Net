@@ -576,6 +576,20 @@ pub const Machine = struct {
         verbs: ring.Verbs,
     ) ?struct { slot: u8, token: u64, base: u64, len: u64 } {
         if (from_core >= self.cores.len or to_core >= self.cores.len) return null;
+        // A region is a span of ONE core's RAM, and RAM is per-core: the
+        // base is a core-local address, not a machine-wide one. Carried
+        // across a core boundary it would still be a well-formed
+        // capability — same length, fresh token, correct verbs — over
+        // memory the grantee never named. So the memory domains must
+        // MATCH, which makes `domain` a third discipline alongside the
+        // two A4 found: verbs attenuate by subset, dialects compare by
+        // equality, and a region simply may not leave home.
+        //
+        // Movement 2 shipped without this because its test granted
+        // between two contexts on one core, where the check cannot fire.
+        // A capability that is meaningless at the destination must be
+        // refused at the source.
+        if (from_core != to_core) return null;
         const src = &self.cores[from_core].contexts[from_ctx];
         if (src_slot >= ring.desc_slots) return null;
         const soff = @as(u64, src_slot) * ring.desc_size;

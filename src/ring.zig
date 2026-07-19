@@ -223,10 +223,30 @@ pub const SqOp = enum(u8) {
     _,
 };
 
+/// The architected low 16 bits of every word0 that carries region
+/// business rather than a program message ($6772 — "gr", §7.6). Tags are
+/// handed out from 1 upwards, so this is far above any tag space a
+/// program can reach, and a receiver can test one masked compare to know
+/// a delivery is not its own vocabulary.
+///
+/// The family has two members, told apart by the KIND byte at bits
+/// 24..31 (the completion status lives at 16..23, so the byte above it is
+/// free):
+///
+///   kind 0 — a grant I MADE completed; word1 holds my region slot.
+///   kind 1 — a grant I RECEIVED: the grant record below.
+///
+/// A4 movement 3 found this the hard way. The record used to be
+/// `0x6772_0001`, which reads as $6772 in the half the dispatcher does
+/// not mask and tag **1** in the half it does — so an heir whose first
+/// declared message was tag 1 (which is every program's first message)
+/// silently handled its own inheritance as an ordinary delivery. The
+/// guard was written in the wrong half of the word.
+pub const region_tag: u64 = 0x6772;
+
 /// The architected first word of a grant record delivered to a grantee
-/// (A4 movement 2), above every program tag like the accelerator
-/// convention it is modelled on ($6772, §7.6).
-pub const grant_record_tag: u64 = 0x6772_0001;
+/// (A4 movement 2): the region family, kind 1.
+pub const grant_record_tag: u64 = (1 << 24) | region_tag;
 
 /// A capability's verbs — what the holder may DO, checked by subset and
 /// therefore attenuable, unlike the dialect that says what an endpoint

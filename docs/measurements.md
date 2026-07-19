@@ -1281,3 +1281,51 @@ smell (it would have caught A3.6's gap by inspection). And §6.3's
 one-shot timer discipline: a liveness-bearing timer must be AUTO_REARM,
 because a dropped one-shot timeout is the eternal park returning through
 the side door.
+
+**Movement 3 — probate, both halves.** `grant frame to boss [onward]`
+hands an estate to the executor; `case handoff(h)` + `adopt h as frame`
+signs for it. Adoption copies hardware's descriptor into the slot the
+heir's own name binds and clears the source — a copy, never a rebuild,
+because rebuilding would re-derive an attenuation the heir does not get
+to choose. Cost: **five stores**, and `frame[i]` addresses the inherited
+memory immediately, because a joe region was always indirect through a
+near-page pointer cell. Frozen table unmoved a third time: 2820 B /
+171,532 instr / 479,275 cy / 13,281 switches.
+
+| pre-registered claim | outcome |
+|---|---|
+| chain of custody | Screen → Cabinet → Archive, **one span of memory at every hop**; the Archive reads 6564 written by an actor that died two hops earlier |
+| attenuation ends it | the same program minus `onward`: the executor adopts and reads, its own grant **refused** |
+| domains must match | the same program with the Archive on core 1: the crossing **refused**, the heir handed nothing |
+| the heir's own vocabulary | a program whose first message is tag 1 no longer handles its inheritance as that message |
+
+**Two defects the second half found in the first.** Both were invisible
+until something needed to *receive* an estate rather than send one.
+
+The grant record was `$6772_0001` — the architected mark in the half no
+dispatcher masks, and tag **1** in the half every dispatcher does. Since
+tags are handed out from 1, every program's first message collided, and
+joe's sole-case elision (which skips the tag test entirely) meant the
+estate was handled as that message in silence, with a descriptor slot
+read as a field. Fixed in both halves: the mark moved into the low 16
+bits with a kind byte above it, and the elision now checks whether the
+program grants at all — because a grant makes the RBC a sender that no
+`message` declaration describes, which is exactly the precondition the
+elision claimed. **An optimisation's precondition is a claim, and claims
+go stale when the system grows a new kind of sender.**
+
+And RAM is per-core, so a region's base is a core-local address — yet
+the RBC granted across cores, handing the grantee a flawless capability
+(right length, correct verbs, fresh token) over memory it never named.
+Nothing malformed, so nothing complained. Movement 2 shipped it; its
+test could not see it, because both parties sat on core 0. Regions now
+may not leave their memory domain, which gives the rights word a third
+companion to its two disciplines: **verbs attenuate by subset, dialects
+compare by equality, domains must simply match.**
+
+**The honest gap.** Probate runs end to end, but not yet to a
+*successor*: `spawn` gives a supervisor no name for its child, so the
+Cabinet can pass an estate to any peer it can name and not to the screen
+it just started. A missing capability in supervision, not in transfer —
+a supervisor that can bury a child but not write to one is only half a
+parent.

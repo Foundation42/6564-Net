@@ -501,11 +501,23 @@ region table**:
   same token* — the future the PTT `write` right was explicitly
   reserved for. v0.1 made remote loads fault because there was no
   ownership story; this is the ownership story.
-- **Grant completions** are deliveries to the granting actor's RX ring
-  whose word 0 carries the architected tag **`$6772`** (status above
-  it, the region's slot in word 1) — outside any application tag
-  space, so language runtimes route completions without devices ever
-  knowing an application's message vocabulary.
+- **The `$6772` family.** Region business arrives on the ordinary RX
+  ring, marked by the architected value **`$6772` in the low 16 bits of
+  word 0** — outside any application tag space, so language runtimes
+  route it without devices ever knowing an application's message
+  vocabulary. The **kind byte at bits 24..31** says which member it is:
+  kind 0 a **grant completion** (status at bits 16..23, the region's
+  slot in word 1); kind 1 a **grant record**, the estate itself
+  (§6.4). *The mark must be in the low 16 bits, and the requirement is
+  not stylistic.* A receiver's tag test masks that half, and tags are
+  handed out from 1 upward; a family member marked anywhere else is a
+  number that collides with somebody's first message. v2.6 shipped the
+  grant record as `$6772_0001` — the mark in the half nothing masks,
+  and tag **1** in the half everything does — so heirs handled their
+  own inheritance as an ordinary delivery, reading a descriptor slot as
+  a message field, in silence. **A guard written in the wrong half of
+  the word is not a weak guard; it is a different value that happens to
+  contain the right bytes.**
 - **Saturation is backpressure, never corruption**: a busy accelerator
   — or a grant of an already-OWNED region — reject-completes at the
   sender, and the first job completes bit-exact. Same law as the
@@ -550,6 +562,23 @@ This composes naturally with capability-based operating systems — a PTT entry 
 | **verbs** | what the holder **may do** — read, write, send, and `grant` (reserved for transfer) | **subset**, at accept | yes — that is what attenuation means |
 
 A submission carries a **claim** of what its payload is (the SQE's reserved hint word; a register send claims `msg` by construction, since one cannot print a register). The RBC compares claim against dialect one step after the rights test, on the path that already checks tokens — measured at **zero cycles**, the frozen tables byte-identical. Mismatch is a capability-family reject: both ends told, no bytes moved. This is what makes the §7.3 misdirection hazard unrepresentable — a `msg` image at an `ask` device would have the device read a message tag as a reply window *in its own PTT space*, synthesizing a wild capability out of a number.
+
+**A region capability may not leave its memory domain (v2.6).** Verbs
+attenuate by subset and dialects compare by equality — and a region
+carries a third property that does neither: the **domain** its base
+address is meaningful in. RAM is per-core, so a region descriptor names
+a span of *one core's* memory. Carried across a core boundary the
+capability stays perfectly well-formed — right length, correct verbs,
+freshly minted token — over memory the grantee never named, which is
+the worst possible failure shape: nothing is malformed, so nothing
+complains. The RBC therefore refuses a transfer whose source and
+destination domains differ, at the source, before minting. Succession
+is a movement *within* an address space; carrying a span across one is
+a copy, and a copy is a different operation that must be asked for by
+name. The general principle is the one dialects taught: **a boundary
+that holds because the two sides have different domains is structure,
+and structure has to be checked somewhere.** Here the domains are
+literally memory.
 
 **`any` is unset, not top.** A dialect field may read `any`, meaning *no declaration was made*: a loader-era entry, wired before the field existed or by a loader with nothing to say. Its checks are **skipped, not satisfied**. This is deliberate and it is not a lattice: `any` is not a permissive value that concrete dialects refine, so replacing it is not attenuation — there is nothing there to attenuate. Two consequences follow, both load-bearing for capability transfer: **a derived entry may never carry `any`** (minting a capability is precisely when the grantor must state what it is for), and `any` is therefore scaffolding that transfer cannot propagate — it ends where the static wiring ends.
 

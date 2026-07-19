@@ -332,7 +332,21 @@ const Stmt = union(enum) {
     /// `grant frame to boss` (A4 movement 3) — hand a region capability
     /// to another actor. Probate, not bequest: the grantee an actor
     /// names is its supervisor, which the exit link already legitimizes.
-    grant_: struct { region: []const u8, to: []const u8, line: usize },
+    /// `onward` adds the `grant` verb, so the grantee may pass it on
+    /// again. Withheld by default: a chain ends wherever somebody
+    /// declines to extend it, and that decision should be readable in
+    /// the source rather than inferred from the grantee's identity.
+    /// Probate needs it — an executor that cannot distribute the estate
+    /// is not an executor — and probate is exactly where it is written.
+    grant_: struct { region: []const u8, to: []const u8, onward: bool, line: usize },
+    /// `adopt h as frame` (A4 movement 3) — sign for the estate. Copies
+    /// the descriptor hardware installed (base, verbs, extent, token)
+    /// into the slot the heir's own `frame` names, points `frame`'s base
+    /// cell at the inherited memory, and clears hardware's slot so the
+    /// estate is named exactly once. The verbs come across by copy, not
+    /// by reconstruction: the grantor's attenuation survives adoption
+    /// because nobody re-derives it.
+    adopt_: struct { rec: []const u8, region: []const u8, line: usize },
     /// `copy dst, src` — bytes into a buf from another buf or from the
     /// bound message's bytes field. The store's Put, among others.
     copy_: struct { dst: []const u8, src: *Expr, line: usize },
@@ -365,6 +379,15 @@ const Handler = union(enum) {
         bind: []const u8,
         cause: ExitCause,
         code_bind: ?[]const u8,
+        body: []Stmt,
+        line: usize,
+    },
+    /// `case handoff(h):` (A4 movement 3) — an estate arrived. The
+    /// binding names the grant record, not the memory: until `adopt`
+    /// runs, the heir holds a capability it cannot address, in a
+    /// descriptor slot hardware chose. Probate, not bequest.
+    handoff_case: struct {
+        bind: []const u8,
         body: []Stmt,
         line: usize,
     },
@@ -978,6 +1001,19 @@ const Parser = struct {
         if (try self.eatKw("case")) {
             const line = self.tok.line;
             const msg = try self.expect(.ident, "message name");
+            if (std.mem.eql(u8, msg.text, "handoff")) {
+                // `case handoff(h):` — the estate arrives as an ordinary
+                // delivery, because a capability moving IS a message.
+                _ = try self.expect(.lparen, "(");
+                const bind = try self.expect(.ident, "a name for the estate");
+                _ = try self.expect(.rparen, ")");
+                _ = try self.expect(.colon, ":");
+                return .{ .handoff_case = .{
+                    .bind = bind.text,
+                    .body = try self.parseHandlerBody(),
+                    .line = line,
+                } };
+            }
             if (std.mem.eql(u8, msg.text, "exit")) {
                 // `case exit(w, crash(code) | hung | abandoned):`
                 _ = try self.expect(.lparen, "(");
@@ -1261,7 +1297,20 @@ const Parser = struct {
             if (!try self.eatKw("to"))
                 return self.fail("a grant names its grantee: `grant frame to boss`", Error.Syntax);
             const to = try self.expect(.ident, "the grantee");
-            return .{ .grant_ = .{ .region = rname.text, .to = to.text, .line = line } };
+            const onward = try self.eatKw("onward");
+            return .{ .grant_ = .{
+                .region = rname.text,
+                .to = to.text,
+                .onward = onward,
+                .line = line,
+            } };
+        }
+        if (try self.eatKw("adopt")) {
+            const rec = try self.expect(.ident, "the estate (a `handoff` binding)");
+            if (!try self.eatKw("as"))
+                return self.fail("an adoption names the region it becomes: `adopt h as frame`", Error.Syntax);
+            const rname = try self.expect(.ident, "a region name");
+            return .{ .adopt_ = .{ .rec = rec.text, .region = rname.text, .line = line } };
         }
         inline for (.{ "chain", "region", "log" }) |kw| {
             if (self.isKw(kw))
@@ -1699,6 +1748,9 @@ const Gen = struct {
     /// Current exit-case bindings: worker (fields id/life) and fault code.
     exit_bind: ?[]const u8 = null,
     exit_code_bind: ?[]const u8 = null,
+    /// The `case handoff(h)` binding, live only inside that handler:
+    /// `adopt` is the one statement that may name it.
+    handoff_bind: ?[]const u8 = null,
     in_handler: bool = false,
     uses_timer: bool = false,
     uses_self: bool = false,
@@ -2020,6 +2072,7 @@ const Gen = struct {
                         .case => |c| c.body,
                         .after => |a| a.body,
                         .exit_case => |x| x.body,
+                        .handoff_case => |x| x.body,
                     };
                     if (bodyGrants(body, e.key_ptr.*)) granted = true;
                 }
@@ -2032,11 +2085,51 @@ const Gen = struct {
                     .case => |c| c.body,
                     .after => |a| a.body,
                     .exit_case => |e| e.body,
+                    .handoff_case => |e| e.body,
                 };
                 if (anyQuiesce(body)) break :blk true;
             }
             break :blk false;
         };
+    }
+
+    /// Does anything in this program hand a capability on? If so, the
+    /// wire is NOT closed: the RBC becomes a sender that no `message`
+    /// declaration describes, and the sole-case elision below loses its
+    /// precondition. Whole-program, because the grantor is somebody
+    /// else's source — an heir cannot know locally that it is an heir.
+    fn programGrants(prog: *const Program) bool {
+        for (prog.actors) |*a| {
+            if (anyGrantIn(a.body)) return true;
+            for (a.handlers) |h| {
+                const body = switch (h) {
+                    .case => |c| c.body,
+                    .after => |t| t.body,
+                    .exit_case => |e| e.body,
+                    .handoff_case => |e| e.body,
+                };
+                if (anyGrantIn(body)) return true;
+            }
+            for (a.quiesce) |h| if (anyGrantIn(h.case.body)) return true;
+        }
+        return false;
+    }
+
+    fn anyGrantIn(list: []const Stmt) bool {
+        for (list) |s| {
+            switch (s) {
+                .grant_ => return true,
+                .send => |sd| for (sd.args) |a| {
+                    if (a.* == .grantref) return true;
+                },
+                .if_ => |i| if (anyGrantIn(i.then) or anyGrantIn(i.els)) return true,
+                .bounded => |b| if (anyGrantIn(b.body)) return true,
+                .for_range => |f| if (anyGrantIn(f.body)) return true,
+                .for_group => |f| if (anyGrantIn(f.body)) return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     /// Does this statement list grant the named region anywhere?
@@ -2046,6 +2139,7 @@ const Gen = struct {
                 .send => |sd| for (sd.args) |a| {
                     if (a.* == .grantref and std.mem.eql(u8, a.grantref, name)) return true;
                 },
+                .grant_ => |g| if (std.mem.eql(u8, g.region, name)) return true,
                 .if_ => |i| if (bodyGrants(i.then, name) or bodyGrants(i.els, name)) return true,
                 .bounded => |b| if (bodyGrants(b.body, name)) return true,
                 .for_range => |f| if (bodyGrants(f.body, name)) return true,
@@ -2162,6 +2256,7 @@ const Gen = struct {
                 },
                 .after => |a| n += self.countBufEqIn(a.body),
                 .exit_case => |x| n += self.countBufEqIn(x.body),
+                .handoff_case => |x| n += self.countBufEqIn(x.body),
             }
         }
         for (self.actor.quiesce) |h| {
@@ -2214,6 +2309,7 @@ const Gen = struct {
                 .case => |c| c.body,
                 .after => |a| a.body,
                 .exit_case => |e| e.body,
+                .handoff_case => |e| e.body,
             };
             if (packsInto(body, name)) return true;
         }
@@ -3135,6 +3231,46 @@ const Gen = struct {
                 try self.w("        STA ${X}", .{slot});
                 try self.lets.put(l.name, ty == .f64_);
             },
+            .adopt_ => |a| {
+                // A4 movement 3, the other half: signing for the estate.
+                if (self.handoff_bind == null or !std.mem.eql(u8, self.handoff_bind.?, a.rec))
+                    return self.fail(a.line, "`adopt` signs for a `case handoff` binding", Error.Semantics);
+                const rp = self.regions.getPtr(a.region) orelse
+                    return self.fail(a.line, "an estate becomes a `region` variable", Error.Semantics);
+                if (rp.locked)
+                    return self.fail(a.line, "this region is granted out to silicon here (§6.2)", Error.Semantics);
+                const arr = self.arrays.get(a.region).?;
+                const doff = @as(u64, rp.slot) * ring.desc_size;
+                try self.w("; adopt {s} as {s}: hardware chose the slot, the heir chooses the name", .{ a.rec, a.region });
+                try self.w("        LDA ${X}", .{self.off_ptr});
+                try self.w("        CLC", .{});
+                try self.w("        ADC #8", .{});
+                try self.w("        STA ${X}", .{self.off_fp});
+                try self.w("        LDA (${X})          ; word1: the slot the RBC picked", .{self.off_fp});
+                try self.w("        AND #$FF", .{});
+                try self.w("        ASL #5              ; × 32: a descriptor's stride", .{});
+                try self.w("        TAX", .{});
+                // The descriptor moves by COPY, not by reconstruction:
+                // whatever attenuation the grantor chose survives,
+                // because nobody here re-derives it (§2.3 — the only
+                // honest way to preserve a field you do not interpret).
+                try self.w("        LDA $0,X            ; base", .{});
+                try self.w("        STA ${X}          ; {s}[i] now reads the inherited memory", .{ arr.ptr_slot, a.region });
+                try self.w("        STA ${X}", .{doff});
+                try self.w("        LDA $8,X            ; verbs | REGION — copied, never re-derived", .{});
+                try self.w("        STA ${X}", .{doff + 8});
+                try self.w("        LDA $10,X           ; extent", .{});
+                try self.w("        STA ${X}", .{doff + 16});
+                try self.w("        LDA $18,X           ; the token the RBC minted", .{});
+                try self.w("        STA ${X}", .{doff + 24});
+                // Release hardware's slot: the estate is named once, and
+                // the slot is free for the next inheritance.
+                try self.w("        LDA #0", .{});
+                try self.w("        STA $0,X", .{});
+                try self.w("        STA $8,X", .{});
+                try self.w("        STA $10,X", .{});
+                try self.w("        STA $18,X", .{});
+            },
             .grant_ => |g| {
                 // A4 movement 3: the estate, handed to the executor.
                 const rp = self.regions.getPtr(g.region) orelse
@@ -3153,9 +3289,18 @@ const Gen = struct {
                 try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
                 try self.w("        LDA {s}", .{try self.imm(rp.slot)});
                 try self.w("        STA !${X}", .{self.layout.sqBase() + 16});
-                // verbs the heir receives: read|write, never `grant` —
-                // v1 lends one level deep, per A4.4's decision.
-                try self.w("        LDA ##${X}", .{@as(u64, 1) << 32 | 0x3});
+                // The verbs the grantee receives. read|write always;
+                // `grant` only when this grant said `onward`, so the
+                // delegation chain ends by default and is extended on
+                // purpose (A4.5).
+                // Built from the type, not spelled as a constant: the
+                // bit positions live in ring.Verbs and nowhere else.
+                const verbs: u64 = @as(u4, @bitCast(ring.Verbs{
+                    .read = true,
+                    .write = true,
+                    .grant = g.onward,
+                }));
+                try self.w("        LDA ##${X}", .{@as(u64, 1) << 32 | verbs});
                 try self.w("        STA !${X}", .{self.layout.sqBase() + 24});
                 try self.w("        SEND 0", .{});
                 // The region is no longer ours: the compiler's copy of
@@ -4890,25 +5035,62 @@ const Gen = struct {
         }
     }
 
-    /// Grant completions (item 6): deliveries whose word0 low16 is the
-    /// architected $6772 — far outside any program's tag space — with
-    /// the status above it and the region's descriptor slot in word1.
-    /// Routed to `case done(r)` / `case failed(r)`; unmatched ones are
-    /// consumed, so the case ladder never sees a completion, and the
-    /// sole-case elision stays sound.
+    /// The $6772 family (item 6, A4 movement 3): deliveries whose word0
+    /// low16 is the architected $6772 — far outside any program's tag
+    /// space — carrying region business rather than a program message.
+    /// The KIND byte at bits 24..31 says which:
+    ///
+    ///   kind 0 — a grant I MADE completed: status at 16..23, my region
+    ///            slot in word1. Routed to `case done(r)` / `failed(r)`.
+    ///   kind 1 — a grant I RECEIVED: routed to `case handoff(h)`.
+    ///
+    /// Unmatched ones are consumed, so the case ladder never sees region
+    /// business and the sole-case elision stays sound. That elision is
+    /// why the low16 must be $6772 and not merely contain it: a program
+    /// whose sole case is tag 1 does no tag test at all, and an
+    /// inheritance arriving as "tag 1" would be handled as that message.
     fn emitRegionDispatcher(self: *Gen) Error!void {
         var any = false;
         var rit = self.regions.iterator();
         while (rit.next()) |e| {
             if (e.value_ptr.granted_anywhere) any = true;
         }
-        if (!any) return;
+        var handoff: ?@TypeOf(self.actor.handlers[0].handoff_case) = null;
+        for (self.actor.handlers) |*h| {
+            if (h.* == .handoff_case) handoff = h.handoff_case;
+        }
+        if (!any and handoff == null) return;
         const l_not = self.label();
-        try self.w("; grant completions: the $6772 tag routes by region slot", .{});
+        try self.w("; region business: the $6772 family, kind byte at 24..31", .{});
         try self.w("        LDA (${X})", .{self.off_ptr});
         try self.w("        AND ##$FFFF", .{});
         try self.w("        CMP ##$6772", .{});
         try self.w("        BNE L{d}", .{l_not});
+        if (handoff) |hc| {
+            const l_not_handoff = self.label();
+            try self.w("; kind 1: an estate arrived — `case handoff({s})`", .{hc.bind});
+            try self.w("        LDA (${X})", .{self.off_ptr});
+            try self.w("        LSR #24", .{});
+            try self.w("        AND #$FF", .{});
+            try self.w("        CMP #1", .{});
+            try self.w("        BNE L{d}", .{l_not_handoff});
+            self.handoff_bind = hc.bind;
+            self.setRegionLocks(hc.body, null);
+            self.in_handler = true;
+            const bm = self.beginBurst();
+            try self.stmts(hc.body);
+            try self.endBurst(bm, hc.line, false);
+            self.in_handler = false;
+            self.handoff_bind = null;
+            try self.w("        BRA L{d}", .{self.serve_label});
+            try self.w("L{d}:", .{l_not_handoff});
+        }
+        if (!any) {
+            // Nothing of ours is out on loan: consume and go round.
+            try self.w("        BRA L{d}", .{self.serve_label});
+            try self.w("L{d}:", .{l_not});
+            return;
+        }
         try self.w("        LDA ${X}", .{self.off_ptr});
         try self.w("        CLC", .{});
         try self.w("        ADC #8", .{});
@@ -4989,7 +5171,10 @@ const Gen = struct {
             try self.w("        BRA L{d}", .{loop_label});
             return;
         }
-        if (case_count == 1 and !any_guard) {
+        // The elision is sound only while the wire is closed. A program
+        // that grants has a sender the vocabulary does not cover, so the
+        // tag test earns its two instructions back.
+        if (case_count == 1 and !any_guard and !programGrants(self.prog)) {
             for (handlers) |*h| {
                 if (h.* != .case) continue;
                 if (self.isRegionCase(h.case)) continue;
