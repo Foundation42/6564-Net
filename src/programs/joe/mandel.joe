@@ -1,0 +1,75 @@
+// mandel.joe — the Mandelbrot set in joe: Tier 0 scalar FP through the
+// language, one console row per self-send slice, every character bound
+// for the same oracle mandel.asm answers to. The third implementation
+// of this picture (host f64, hand assembly, now joe), and all three
+// must agree to the bit — IEEE RNE is the contract and the palette
+// char is the proof.
+//
+// Amendment 3, reporting for duty: `const` names the palette, `let`
+// keeps the per-iteration squares register-honest, `append` builds the
+// row raw (pack speaks struple to actors; this is a teletype), and
+// `send tty, line` ships whatever length the row turned out to be.
+//
+// The row loop is an A1.1 self-send — one park per row, so the console
+// acks always outrun the next row's 51,000-cycle grind and the one-slot
+// SQ never sees two rows at once.
+
+const pal = " .,:;~=+xoXO#%$&@"
+
+message Row { }
+
+actor Mandel(tty addr) {
+    var line buf [72]u8
+    var row u64 = 0
+    var cx f64 = 0.0
+    var cy f64 = 1.1
+    var dx f64 = 0.0
+    var dy f64 = 0.0
+    var zx f64 = 0.0
+    var zy f64 = 0.0
+    var n u64 = 0
+    var done u64 = 0
+
+    dx = 2.5 / 63.0
+    dy = 2.2 / 21.0
+    send self, Row{}
+
+    serve {
+        case Row(_):
+            clear line
+            cx = 0.0 - 2.0
+            for c in 0..64 {
+                zx = 0.0
+                zy = 0.0
+                n = 0
+                done = 0
+                for it in 0..16 {
+                    if done == 0 {
+                        let zx2 = zx * zx
+                        let zy2 = zy * zy
+                        if zy2 + zx2 < 4.0 {
+                            let t = zx * zy
+                            zy = t + t + cy
+                            zx = zx2 - zy2 + cx
+                            n += 1
+                        } else {
+                            done = 1
+                        }
+                    }
+                }
+                append line, byte(pal[n])
+                cx = cx + dx
+            }
+            append line, "\n"
+            send tty, line
+            row += 1
+            cy = cy - dy
+            if row == 22 { halt ok }
+            send self, Row{}
+    }
+}
+
+system {
+    m = Mandel(tty) on 0
+    tty = Console()
+}

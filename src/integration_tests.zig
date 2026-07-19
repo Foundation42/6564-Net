@@ -2146,6 +2146,26 @@ fn mandelOracleRow(alloc: std.mem.Allocator, row: usize) ![]u8 {
     return line;
 }
 
+test "mandel.joe: the language draws the same picture as the assembly and the host" {
+    // The third implementation. Amendment 3's surface (const/let/append/
+    // raw send) plus Tier 0 FP, against the same oracle — one misrounded
+    // FP op anywhere in the tower is a visibly wrong character.
+    var o = try @import("joe_run.zig").simulate(testing.allocator, @embedFile("programs/joe/mandel.joe"), .{
+        .loss_ppm4k = 0,
+        .dup_ppm4k = 0,
+    });
+    defer o.deinit();
+    try testing.expectEqual(machine.StopReason.all_halted, o.reason);
+    const text = o.console.?;
+    try testing.expectEqual(@as(usize, (mandel_cols + 1) * mandel_rows), text.len);
+    for (0..mandel_rows) |r| {
+        const expected = try mandelOracleRow(testing.allocator, r);
+        defer testing.allocator.free(expected);
+        const got = text[r * (mandel_cols + 1) ..][0 .. mandel_cols + 1];
+        try testing.expectEqualStrings(expected, got);
+    }
+}
+
 test "mandel: the whole picture matches the host-f64 oracle, row for row" {
     // 1,408 points, up to 16 iterations each — thousands of FMUL/FADD/
     // FSUB/FCMP results, every one of which must round exactly as the

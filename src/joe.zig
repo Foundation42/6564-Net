@@ -255,6 +255,13 @@ const Stmt = union(enum) {
     /// `send tty, "TEXT"` — raw bytes to a device: no tag, no fields,
     /// just the payload a teletype expects.
     send_str: struct { target: []const u8, text: []const u8, line: usize },
+    /// `send tty, b` — a buf's current bytes, verbatim, length at send
+    /// time (Amendment 3). Raw is for devices; actors take messages.
+    send_buf: struct { target: []const u8, buf: []const u8, line: usize },
+    /// `clear b` / `append b, …` — the raw dialect (Amendment 3):
+    /// `pack` speaks struple to actors, `append` speaks raw to devices.
+    clear_: struct { buf: []const u8, line: usize },
+    append_: struct { buf: []const u8, src: AppendSrc, line: usize },
     if_: struct { cond: *Expr, then: []Stmt, els: []Stmt },
     halt: struct { ok: bool },
     bounded: struct { n: u64, body: []Stmt, line: usize },
@@ -275,6 +282,8 @@ const Stmt = union(enum) {
         line: usize,
     },
 };
+
+const AppendSrc = union(enum) { str: []const u8, byte: *Expr };
 
 const ExitCause = enum { crash, hung, abandoned };
 
@@ -362,7 +371,13 @@ const Program = struct {
     messages: []Message,
     actors: []Actor,
     system: []InstanceDecl,
+    /// `const name = "…"` — named read-only byte data (Amendment 3),
+    /// staged after code the way string literals are; the on-ramp to
+    /// §11's shared const pages.
+    consts: []Const,
 };
+
+const Const = struct { name: []const u8, text: []const u8 };
 
 // ── Lexer ────────────────────────────────────────────────────────────────
 
@@ -601,24 +616,36 @@ const Parser = struct {
         var msgs = std.ArrayList(Message).init(self.arena);
         var actors = std.ArrayList(Actor).init(self.arena);
         var system = std.ArrayList(InstanceDecl).init(self.arena);
+        var consts = std.ArrayList(Const).init(self.arena);
         try self.advance();
         while (self.tok.kind != .eof) {
             if (try self.eatKw("message")) {
                 try msgs.append(try self.parseMessage());
             } else if (try self.eatKw("actor")) {
                 try actors.append(try self.parseActor());
+            } else if (try self.eatKw("const")) {
+                const cname = try self.expect(.ident, "const name");
+                if (self.tok.kind != .assign)
+                    return self.fail("a const is `const name = \"…\"`", Error.Syntax);
+                try self.advance();
+                if (self.tok.kind != .string)
+                    return self.fail("v1 consts are byte strings", Error.Unsupported);
+                const text = try self.decodeStr(self.tok.text);
+                try self.advance();
+                try consts.append(.{ .name = cname.text, .text = text });
             } else if (try self.eatKw("system")) {
                 _ = try self.expect(.lbrace, "{");
                 while (self.tok.kind != .rbrace) {
                     try system.append(try self.parseInstance());
                 }
                 try self.advance(); // }
-            } else return self.fail("expected `message`, `actor` or `system`", Error.Syntax);
+            } else return self.fail("expected `message`, `actor`, `const` or `system`", Error.Syntax);
         }
         return .{
             .messages = try msgs.toOwnedSlice(),
             .actors = try actors.toOwnedSlice(),
             .system = try system.toOwnedSlice(),
+            .consts = try consts.toOwnedSlice(),
         };
     }
 
@@ -947,6 +974,12 @@ const Parser = struct {
                 } };
             }
             const msg = try self.expect(.ident, "message name");
+            if (self.tok.kind != .lbrace) {
+                // `send tty, b` — a buf, raw (Amendment 3).
+                if (target_idx != null)
+                    return self.fail("a raw send goes to one device", Error.Semantics);
+                return .{ .send_buf = .{ .target = target.text, .buf = msg.text, .line = line } };
+            }
             _ = try self.expect(.lbrace, "{");
             var args = std.ArrayList(*Expr).init(self.arena);
             while (self.tok.kind != .rbrace) {
@@ -1060,6 +1093,26 @@ const Parser = struct {
             const dst = try self.expect(.ident, "a buf name");
             _ = try self.expect(.comma, ",");
             return .{ .copy_ = .{ .dst = dst.text, .src = try self.parseExpr(), .line = line } };
+        }
+        if (try self.eatKw("clear")) {
+            const bname = try self.expect(.ident, "a buf name");
+            return .{ .clear_ = .{ .buf = bname.text, .line = line } };
+        }
+        if (try self.eatKw("append")) {
+            const bname = try self.expect(.ident, "a buf name");
+            _ = try self.expect(.comma, ",");
+            if (self.tok.kind == .string) {
+                const text = try self.decodeStr(self.tok.text);
+                try self.advance();
+                return .{ .append_ = .{ .buf = bname.text, .src = .{ .str = text }, .line = line } };
+            }
+            if (try self.eatKw("byte")) {
+                _ = try self.expect(.lparen, "(");
+                const e = try self.parseExpr();
+                _ = try self.expect(.rparen, ")");
+                return .{ .append_ = .{ .buf = bname.text, .src = .{ .byte = e }, .line = line } };
+            }
+            return self.fail("append takes a string literal or byte(expr) (v1)", Error.Unsupported);
         }
         if (self.isKw("while"))
             return self.fail(
@@ -1511,6 +1564,9 @@ const Gen = struct {
     /// rides in `slots` like any binding; this map is what makes it a
     /// let — typed, immutable, and removed at its block's end.
     lets: std.StringHashMap(bool),
+    /// Consts staged so far: name → string label. Lazily registered on
+    /// first use, so an unreferenced const costs an actor nothing.
+    const_labels: std.StringHashMap(usize),
     off_w0: u16 = 0,
     off_ptr: u16 = 0,
     off_t: u16 = 0,
@@ -1963,6 +2019,20 @@ const Gen = struct {
         return self.spawn_base + k * 48;
     }
 
+    /// The label of a `const`'s staged bytes, registered on first use.
+    fn constLabel(self: *Gen, name: []const u8) Error!?usize {
+        if (self.const_labels.get(name)) |l| return l;
+        for (self.prog.consts) |c| {
+            if (std.mem.eql(u8, c.name, name)) {
+                const lbl = self.label();
+                try self.strings.append(.{ .label = lbl, .text = c.text });
+                try self.const_labels.put(name, lbl);
+                return lbl;
+            }
+        }
+        return null;
+    }
+
     /// Loop variables and bindings get near slots on demand; the same
     /// name reuses its slot (a shadowed loop variable is the same cell).
     fn getOrAddSlot(self: *Gen, name: []const u8) Error!u16 {
@@ -2223,8 +2293,27 @@ const Gen = struct {
                 try self.w("        LDA ${X}", .{slot});
             },
             .index => |ix| {
+                // A3.2: byte indexing over bufs and consts — one byte,
+                // zero-extended. Arrays keep their word semantics.
+                if (self.bufs.get(ix.base)) |bi| {
+                    try self.evalInto(ix.idx);
+                    try self.w("        STA ${X}", .{self.off_t});
+                    try self.w("        LDX ${X}", .{self.off_t});
+                    try self.w("        LDA ${X},X", .{bi.data});
+                    try self.w("        AND #$FF", .{});
+                    return;
+                }
+                if (try self.constLabel(ix.base)) |lbl| {
+                    try self.evalInto(ix.idx);
+                    try self.w("        CLC", .{});
+                    try self.w("        ADC ##L{d}", .{lbl});
+                    try self.w("        STA ${X}", .{self.off_t});
+                    try self.w("        LDA (${X})", .{self.off_t});
+                    try self.w("        AND #$FF", .{});
+                    return;
+                }
                 const arr = self.arrays.get(ix.base) orelse
-                    return self.fail(0, "not an array or group", Error.Semantics);
+                    return self.fail(0, "not an array, buf, const or group", Error.Semantics);
                 if (self.regions.get(ix.base)) |r| {
                     if (r.locked)
                         return self.fail(0, "a granted region is inaccessible until done/failed rebinds it (§6.2)", Error.Semantics);
@@ -2778,6 +2867,64 @@ const Gen = struct {
                 const slot = try self.getOrAddSlot(l.name);
                 try self.w("        STA ${X}", .{slot});
                 try self.lets.put(l.name, ty == .f64_);
+            },
+            .clear_ => |c| {
+                const bi = self.bufs.get(c.buf) orelse
+                    return self.fail(c.line, "`clear` empties a buf", Error.Semantics);
+                try self.w("        LDA #0", .{});
+                try self.w("        STA ${X}", .{bi.len_slot});
+            },
+            .append_ => |ap| {
+                const bi = self.bufs.get(ap.buf) orelse
+                    return self.fail(ap.line, "`append` fills a buf", Error.Semantics);
+                switch (ap.src) {
+                    .str => |txt| {
+                        if (txt.len == 0) return;
+                        if (txt.len > bi.cap)
+                            return self.fail(ap.line, "this literal cannot fit the buf", Error.Semantics);
+                        const l_fit = self.label();
+                        try self.w("        LDA ${X}", .{bi.len_slot});
+                        try self.w("        CMP {s}", .{try self.imm(bi.cap - txt.len + 1)});
+                        try self.w("        BCC L{d}", .{l_fit});
+                        try self.w("        BRK                 ; pack_overflow", .{});
+                        try self.w("L{d}:", .{l_fit});
+                        for (txt) |ch| {
+                            try self.w("        LDA #{d}", .{ch});
+                            try self.w("        LDX ${X}", .{bi.len_slot});
+                            try self.w("        STA ${X},X", .{bi.data});
+                            try self.w("        INC ${X}", .{bi.len_slot});
+                        }
+                    },
+                    .byte => |e| {
+                        const l_fit = self.label();
+                        try self.w("        LDA ${X}", .{bi.len_slot});
+                        try self.w("        CMP {s}", .{try self.imm(bi.cap)});
+                        try self.w("        BCC L{d}", .{l_fit});
+                        try self.w("        BRK                 ; pack_overflow", .{});
+                        try self.w("L{d}:", .{l_fit});
+                        try self.evalInto(e);
+                        try self.w("        AND #$FF", .{});
+                        try self.w("        LDX ${X}", .{bi.len_slot});
+                        try self.w("        STA ${X},X", .{bi.data});
+                        try self.w("        INC ${X}", .{bi.len_slot});
+                    },
+                }
+            },
+            .send_buf => |sb| {
+                const tslot = self.slots.get(sb.target) orelse
+                    return self.fail(sb.line, "unknown send target", Error.Semantics);
+                const bi = self.bufs.get(sb.buf) orelse
+                    return self.fail(sb.line, "a raw send takes a buf", Error.Semantics);
+                try self.w("        LDA #1              ; SQE: op = send", .{});
+                try self.w("        STA !${X}", .{self.layout.sqBase()});
+                try self.w("        LDA ${X}", .{tslot});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 8});
+                try self.w("        LDA {s}", .{try self.imm(bi.data)});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 16});
+                try self.w("        LDA ${X}", .{bi.len_slot});
+                try self.w("        ORA ##${X}", .{@as(u64, 1) << 32});
+                try self.w("        STA !${X}", .{self.layout.sqBase() + 24});
+                try self.w("        SEND 0", .{});
             },
             .assign => |a| {
                 if (self.lets.contains(a.name))
@@ -4721,6 +4868,7 @@ pub fn compile(
         .diag = diag,
         .slots = std.StringHashMap(u16).init(arena),
         .lets = std.StringHashMap(bool).init(arena),
+        .const_labels = std.StringHashMap(usize).init(arena),
         .strings = .init(arena),
         .arrays = .init(arena),
         .bufs = .init(arena),
