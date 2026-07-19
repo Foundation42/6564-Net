@@ -21,7 +21,7 @@
 //! compiler is four passes in one file — lex → parse → check → emit —
 //! producing .asm text for asm.zig. No IR.
 //!
-//! Amendment 1 (docs/joe-v1-ammendment-1.md) makes `bounded` CHECKED:
+//! Amendment 1 (docs/joe-v1-amendment-1.md) makes `bounded` CHECKED:
 //! every emitted instruction is charged its ISA-table cycles, so every
 //! burst has a computed worst case, and `bounded N` is required exactly
 //! when that bound exceeds the spawn-site watchdog (or is data-dependent),

@@ -112,7 +112,7 @@ with every register *poisoned* at every park (`sim6564 joe
 src/programs/joe/ring.joe 0x6564 1024 scorch`). A context is a near page,
 a run-queue entry and a control block; nothing else survives, and
 nothing compiled ever needed more. Amendment 1
-(`docs/joe-v1-ammendment-1.md`) made the language smaller and the
+(`docs/joe-v1-amendment-1.md`) made the language smaller and the
 promise larger: `while` is gone — unbounded work is a `send self`
 loop, on-chip and lossless, one park per slice (`crunch.joe`) — and
 `bounded` is *checked*: the compiler charges every emitted instruction

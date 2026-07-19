@@ -477,7 +477,7 @@ matter for extending it:
   handoff item 4's experiment and should arrive as a measured change,
   not a freebie.
 
-## joe Amendment 1: iteration (docs/joe-v1-ammendment-1.md)
+## joe Amendment 1: iteration (docs/joe-v1-amendment-1.md)
 
 The amendment's verdict — *`while` dies, `for` becomes replicated PAR,
 `bounded` becomes checkable, `map` stays pure* — landed as follows:
@@ -561,7 +561,7 @@ parks — was measured, not assumed. Implementation notes:
   ceiling) is the one new silicon mechanism the collapse requires — it
   rides with the v2.6 spec draft, not the simulator measurement.
 
-## joe Amendment 2, phase one (docs/joe-v1-ammendment-2.md)
+## joe Amendment 2, phase one (docs/joe-v1-amendment-2.md)
 
 struple is joe's tuple encoding; the joe/6564 codec is the format's
 thirteenth implementation, conformance-driven by the vendored corpus

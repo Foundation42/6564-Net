@@ -55,9 +55,30 @@ Refusals share one rule — *what you do not hold, you cannot pass on*: a revoke
 
 **The tripwire stayed silent, and the reason is a finding.** Movement 1's rule was: if the transfer verb ever wants to modify a dialect, the field boundary was drawn wrong. It never wanted to — because **a region carries no dialect to copy.** Dialect is an *endpoint* property; a span of memory is not an endpoint. So the two fields are not parallel across capability kinds: **verbs are universal, dialect belongs to things you send to.** That asymmetry was not designed; it fell out of implementing both, and it is the strongest evidence so far that the split is real rather than tidy.
 
-## A4.4 What joe cannot say yet (movement 3)
+**Why it is true, and therefore what it predicts.** Dialect is a property of the **object** — what the thing at the far end will do with arriving bytes; it presupposes an *interpreter*. Verbs are a property of the **relationship** — what this holder may do with what it holds. A region has a base and an extent and no interpreter, so it has no dialect to have. That makes the rule predictive rather than descriptive: **any future capability kind gets verbs automatically, and gets a dialect if and only if something on the far end interprets.**
 
-The machine can hand a region to a successor; joe cannot ask it to. The surface wants to be small — something like `grant frame to heir` in a dying actor's last breath, with the heir receiving an ordinary `case Handoff(h)` — and it needs the loader to know that a spawned successor is a legitimate grantee. That is the next increment, and rocci-bird's Cabinet is its first caller.
+The prediction is pre-registered here, on a capability kind that does not exist yet. Amendment 2's D1 note (key-as-location) will eventually make a *key range* a capability. A range you merely **own** is a region — verbs, no dialect, nothing interprets. A range you can **send to** — the fabric resolving a coordinate from the key prefix — is an endpoint, and it should acquire a dialect at that exact moment (`msg`, presumably, since the store speaks struple messages), not before. If D1's work finds a range capability wanting a dialect precisely when routing lands, the asymmetry is confirmed on a kind that was not in evidence when the rule was found. If it wants one earlier, or never wants one at all, this section is wrong and should say so.
+
+## A4.4 Movement 3: succession is probate, not bequest
+
+The obvious shape — a dying screen grants directly to its heir — has an ordering hole that no mechanism can close: **the heir does not exist yet.** The Cabinet spawns it only after hearing the death, and a grantor cannot grant after halting. Bequest would need grant-to-a-future-incarnation, or a loader clairvoyant about who counts as an heir.
+
+The house answer needs neither, because the rocci ledger already found it for transitions: **route through the supervisor.** A screen grants its frame *to the Cabinet* in its last breath and halts; the Cabinet hears the exit, spawns the successor, and re-grants. Two records in the paper trail instead of one — which for an estate is not overhead, it is the point. **Probate is the paper trail.**
+
+Legitimacy comes free: the only grantee an actor ever needs to name is its supervisor, the exit link already establishes that relationship, and the supervisor's authority to redistribute is nothing more than the `grant` verb it holds. *The supervisor is the executor of the estate*, which sits exactly beside *death is a message*.
+
+**The decision this forces, made on purpose: who owns a frame while a screen is drawing on it?**
+
+The honest edge is dying while `OWNED`. A screen that crashes mid-`Present` has its region granted out to the display: the refusal rule correctly blocks any last-breath grant, and the release completion arrives incarnation-stamped at a corpse. The descriptor survives in the near page and hardware clears `OWNED` before the record lands, so the region *is* reclaimable — but by whom, and how does the executor learn it is safe? That is the succession analogue of lame-duck: **an estate is not distributable until silicon has finished with it.**
+
+Two ways to answer, and this amendment picks the second:
+
+1. *Screens own their frames.* The Cabinet must then learn when a dead child's grant has drained — a wait-for-silicon step in the executor, and a new thing for a supervisor to know about.
+2. **Screens receive, never own.** The Cabinet holds the frame capability from the start and lends it to each screen; a screen's death returns nothing, because it was never the owner. The `OWNED` race dissolves: whatever the display still has, it has against the Cabinet's capability, and the Cabinet is not dead.
+
+The second is chosen because it removes a state rather than handling one, and because it matches what a cabinet *is* — the machine outlives the game. The cost is honest and worth stating: a screen can no longer be given a frame it may pass on, so a future workload that genuinely wants transitive lending will have to revisit this. It is a choice, not an accident.
+
+joe's surface, then, is two statements and one case: `grant frame to boss` in a last breath, the loader staging every spawned child a capability to its spawner (the exit link's twin, and free for the same reason), and `case handoff(h)` adopting a granted region into the heir's own descriptor slot.
 
 ## A4.5 What this says about the kernel
 

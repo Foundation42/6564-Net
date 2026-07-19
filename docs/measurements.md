@@ -599,7 +599,7 @@ intact. Next: item 4, park-point liveness, against ring.joe's 110.
 
 ## Amendment 1: the language gets smaller, the promise gets larger (2026-07-18)
 
-Christian's `docs/joe-v1-ammendment-1.md` (worked out with Claude Chat,
+Christian's `docs/joe-v1-amendment-1.md` (worked out with Claude Chat,
 status: adopted) — *`while` dies, `for` becomes replicated PAR,
 `bounded` becomes checkable, `map` stays pure* — implemented the same
 day. What the machine had to say about it:
@@ -724,7 +724,7 @@ programmer.
 
 ## Amendment 2, phase one: bytes are honest, and #13 speaks (2026-07-18)
 
-Christian's `docs/joe-v1-ammendment-2.md` (struple as joe's tuple
+Christian's `docs/joe-v1-amendment-2.md` (struple as joe's tuple
 encoding; views as indices; the store as a §7 device) began landing the
 day it arrived — before item 5, by its own logic: the client surface is
 pure scalar work, the conformance oracle already existed with twelve
