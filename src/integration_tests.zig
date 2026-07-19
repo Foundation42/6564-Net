@@ -500,6 +500,63 @@ test "cq overflow: a lost delivery kills the context; a lost verdict does not" {
     }
 }
 
+test "the one-shot timer side door: a dropped timeout is a park with no wake" {
+    // §6.3's discipline, demonstrated rather than asserted. A timeout is
+    // a verdict, so §4.2 lets it drop when a CQ is full — and for an
+    // AUTO_REARM timer that is harmless, because the next tick re-derives
+    // the wake. A ONE-SHOT has no next tick: lose it and the actor waits
+    // forever with nothing outstanding. This is why a liveness-bearing
+    // timer must auto-rearm.
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x4000,
+    });
+    defer m.deinit();
+    m.setRing(0, 0, ring.slot_cq, .{
+        .base = 0x2000,
+        .cap_log2 = 0, // one record, and the ack will take it
+        .entry_size = ring.cq_entry_size,
+        .watermark = 0,
+        .companion_cq = ring.slot_cq,
+        .head = 0,
+        .tail = 0,
+        .token = 0,
+    });
+    m.load(0, 0x1000, &.{0xDB});
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    // The queue fills with an ordinary verdict…
+    m.postCompletion(0, 0, ring.slot_cq, .{ .tag = .send, .status = .ok, .byte_count = 0, .cookie = 1 });
+    // …and the one-shot's wake arrives to no room at all.
+    m.postCompletion(0, 0, ring.slot_cq, .{ .tag = .send, .status = .timeout, .byte_count = 0, .cookie = 0x77 });
+    try testing.expectEqual(@as(u64, 1), m.stats.cq_overflows);
+    // Dropped, and the context is NOT faulted: by the narrowed rule this
+    // is a survivable loss — which is exactly right for a rearming timer
+    // and exactly the hazard for a one-shot.
+    try testing.expectEqual(machine.Fault.none, m.cores[0].contexts[0].fault);
+}
+
+test "compiled timers auto-rearm: joe never stages a liveness one-shot" {
+    // The corpus side of §6.3's discipline. joe's `after` is the only
+    // timer the language can express, and it must tick forever.
+    var r = try @import("joe.zig").compile(testing.allocator,
+        \\message Go { }
+        \\actor A(peer addr) {
+        \\    serve {
+        \\        case Go(_):
+        \\            send peer, Go{}
+        \\        after 500:
+        \\            send peer, Go{}
+        \\    }
+        \\}
+    , "A", .{}, null);
+    defer r.deinit();
+    try testing.expect(r.uses_timer);
+    // $202 = op txr | flags AUTO_REARM — the flag is in the staged word,
+    // not in a comment.
+    try testing.expect(std.mem.indexOf(u8, r.asm_text, "LDA ##$202") != null);
+}
+
 // ── The generic .asm runner: the retired harnesses' scenarios, run from
 //    the programs' own contracts (src/asm_run.zig). Each program carries
 //    its deployment; tests that need another shape hand simulateSystem a
