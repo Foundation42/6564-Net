@@ -19,10 +19,20 @@
 //!                        the actor and its params. `cap` is a capability:
 //!                        `= N` pins PTT slot N (the code bakes window
 //!                        constants); `@ addr` lets the loader pick a slot
-//!                        and stage the window pointer at addr. `arg` is a
+//!                        and stage the window pointer at addr; bare `cap`
+//!                        is grant-only. Options: `reply` (the device's
+//!                        own PTT aims back at our RX), `rx=N` (which of
+//!                        the target's RX rings — a stage takes items on
+//!                        one ring and acks on another). `arg` is a
 //!                        number: `@ A` arrives in the accumulator at
-//!                        spawn, `@ addr` is staged. `cap[]`/`arg[]` stage
-//!                        an 8-byte-stride array at addr (group refs).
+//!                        spawn, `@ addr` is staged. `cap[]` stages a
+//!                        group's window pointers at addr, aligned like
+//!                        joe groups: a singleton takes them all, equal
+//!                        groups pair off, larger groups slice. `sup @
+//!                        addr watchdog=N` supervises: the child's spawn
+//!                        block {ctx, entry, sp, arg} lands at addr, its
+//!                        exit link aims at our CQ, its leash is ours to
+//!                        set (spec §5.4).
 //!   .ring 2 rx cap=2 auto_repost post=2 size=8
 //!                        a descriptor the loader stages: slot, kind
 //!                        (sq|cq|rx), capacity (a power of two), optional
@@ -80,7 +90,7 @@ pub const Diagnostic = struct {
     message: []const u8 = "",
 };
 
-pub const ParamKind = enum { cap, arg };
+pub const ParamKind = enum { cap, arg, sup };
 pub const ParamWhere = union(enum) {
     /// Bare `cap` — grant only: the code builds target addresses itself
     /// (SQE routing by prefix match); no slot pinned, nothing staged.
@@ -104,6 +114,14 @@ pub const MetaParam = struct {
     /// loader stages the target's own capability aimed at our RX ring
     /// (a device's reply window, staged like wiring any two actors).
     reply: bool = false,
+    /// `rx=N`: which of the target's RX rings this capability aims at.
+    /// Null aims at the target's first-declared RX — but an actor
+    /// targeted on two rings (a pipeline stage: items one way, acks the
+    /// other) needs its callers to say which.
+    rx: ?u8 = null,
+    /// `sup … watchdog=N`: the child's burst budget (spec §5.4), set by
+    /// the supervisor's contract — an actor must not edit its own leash.
+    watchdog: u64 = 0,
 };
 
 /// One `.ring` descriptor for the loader to stage.
@@ -475,9 +493,13 @@ const Assembler = struct {
             var kind: ParamKind = undefined;
             var group = false;
             var matched = false;
-            for ([_][]const u8{ "cap[]", "arg[]", "cap", "arg" }) |kw| {
+            for ([_][]const u8{ "cap[]", "arg[]", "cap", "arg", "sup" }) |kw| {
                 if (std.mem.startsWith(u8, spec, kw)) {
-                    kind = if (kw[0] == 'c') .cap else .arg;
+                    kind = switch (kw[0]) {
+                        'c' => .cap,
+                        'a' => .arg,
+                        else => .sup,
+                    };
                     group = kw.len == 5;
                     spec = std.mem.trim(u8, spec[kw.len..], " \t");
                     matched = true;
@@ -485,7 +507,7 @@ const Assembler = struct {
                 }
             }
             if (!matched)
-                return self.fail(line_no, "param kind must be cap or arg", Error.BadDirective);
+                return self.fail(line_no, "param kind must be cap, arg or sup", Error.BadDirective);
             if (spec.len == 0) {
                 // Bare `cap`: grant only, the code routes by address.
                 if (kind != .cap or group)
@@ -500,16 +522,28 @@ const Assembler = struct {
             if (spec.len < 2 or (spec[0] != '@' and spec[0] != '='))
                 return self.fail(line_no, "param needs `@ where` or `= slot`", Error.BadDirective);
             const sep = spec[0];
-            var val = std.mem.trim(u8, spec[1..], " \t");
+            var toks = std.mem.tokenizeAny(u8, spec[1..], " \t");
+            const val = toks.next() orelse
+                return self.fail(line_no, "param needs a value after @ or =", Error.BadDirective);
             var reply = false;
-            if (std.mem.endsWith(u8, val, "reply")) {
-                const stem = std.mem.trimRight(u8, val[0 .. val.len - 5], " \t");
-                if (stem.len < val.len - 5) {
+            var rx: ?u8 = null;
+            var watchdog: u64 = 0;
+            while (toks.next()) |t| {
+                if (std.ascii.eqlIgnoreCase(t, "reply")) {
                     if (kind != .cap)
                         return self.fail(line_no, "only a cap takes `reply`", Error.BadDirective);
                     reply = true;
-                    val = stem;
-                }
+                } else if (std.ascii.startsWithIgnoreCase(t, "rx=")) {
+                    if (kind != .cap)
+                        return self.fail(line_no, "only a cap takes `rx=`", Error.BadDirective);
+                    const v = try self.evalStr(line_no, t[3..]);
+                    if (v > 63) return self.fail(line_no, "rx slot out of range", Error.ValueOutOfRange);
+                    rx = @intCast(v);
+                } else if (std.ascii.startsWithIgnoreCase(t, "watchdog=")) {
+                    if (kind != .sup)
+                        return self.fail(line_no, "only a sup takes `watchdog=`", Error.BadDirective);
+                    watchdog = try self.evalStr(line_no, t[9..]);
+                } else return self.fail(line_no, "unknown param option", Error.BadDirective);
             }
             const where: ParamWhere = if (sep == '=') blk: {
                 if (kind != .cap or group)
@@ -521,13 +555,19 @@ const Assembler = struct {
                 if (kind != .arg or group)
                     return self.fail(line_no, "only a scalar arg rides the accumulator", Error.BadDirective);
                 break :blk .reg_a;
-            } else .{ .cell = try self.evalStr(line_no, val) };
+            } else blk: {
+                break :blk .{ .cell = try self.evalStr(line_no, val) };
+            };
+            if (kind == .sup and where != .cell)
+                return self.fail(line_no, "a sup param needs `@ cell` for its spawn block", Error.BadDirective);
             try self.meta_params.append(self.alloc, .{
                 .name = try self.alloc.dupe(u8, pname),
                 .kind = kind,
                 .group = group,
                 .where = where,
                 .reply = reply,
+                .rx = rx,
+                .watchdog = watchdog,
             });
         }
     }

@@ -13,6 +13,8 @@
 ; (spec §5.4) can pry the core back. Either way, hardware posts the exit
 ; notification and the supervisor decides its fate.
 
+        .actor Worker(cfg arg @ A)
+
         .org $1200
         STA $830            ; config pointer
         LDY #0

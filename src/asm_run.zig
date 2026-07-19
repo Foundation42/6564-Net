@@ -373,15 +373,40 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
         }
     }.of;
 
-    // A capability target is an instance's first RX ring.
+    // A capability target is an instance's RX ring: `rx=N` names one,
+    // otherwise the first declared. An actor targeted on two rings (a
+    // pipeline stage: items one way, acks the other) needs its callers
+    // to say which.
     const rxSlotOf = struct {
-        fn f(meta: *const asm6564.Meta) ?u8 {
+        fn f(meta: *const asm6564.Meta, want: ?u8) ?u8 {
+            if (want) |w| {
+                for (meta.rings) |r| {
+                    if (r.kind == .rx and r.slot == w) return w;
+                }
+                return null;
+            }
             for (meta.rings) |r| {
                 if (r.kind == .rx) return r.slot;
             }
             return null;
         }
     }.f;
+    // The spawn-argument value an instance's `arg @ A` param carries.
+    const argA = struct {
+        fn f(t: *const Placed, params: []const asm6564.MetaParam) u64 {
+            for (t.args, params) |ia, prm| {
+                if (prm.kind == .arg and prm.where == .reg_a) {
+                    return switch (ia) {
+                        .int => |v| v,
+                        .index => @intCast(t.gi),
+                        .ref => 0,
+                    };
+                }
+            }
+            return 0;
+        }
+    }.f;
+
     const writeCell = struct {
         fn f(mach: *machine.Machine, p: *const Placed, addr: u64, v: u64) void {
             var b: [8]u8 = undefined;
@@ -451,18 +476,36 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                         if (std.mem.eql(u8, d.name, rname)) break d;
                     } else null;
                     if (prm.group) {
-                        // cap[]: every member of a group, 8-byte stride.
+                        // cap[]: a group's windows, aligned like joe
+                        // groups — a singleton takes them all, a larger
+                        // member group slices over the replicas, a
+                        // smaller one is shared.
                         if (ddev != null)
                             return fail("{s}: {s} is a device, not a group", .{ p.name, rname });
-                        if (p.gn > 1)
-                            return fail("{s}: only a singleton takes a cap[] group", .{p.name});
                         const g = groups.get(rname) orelse
                             return fail("{s}: no group named {s}", .{ p.name, rname });
                         const cell0 = prm.where.cell;
-                        for (0..g.count) |j| {
-                            const t = &all.items[g.first + j];
-                            const rx = rxSlotOf(&actors.items[t.ai].out.meta) orelse
-                                return fail("{s}: {s} declares no rx ring", .{ p.name, t.name });
+                        if (p.gn > 1 and cell0 >= machine.ram_base)
+                            return fail("{s}: replicas keep cap[] cells in the near page", .{p.name});
+                        var first = g.first;
+                        var count = g.count;
+                        if (p.gn > 1) {
+                            if (g.count >= p.gn) {
+                                if (g.count % p.gn != 0)
+                                    return fail("{s}: {d} members of {s} do not divide over {d} replicas", .{ p.name, g.count, rname, p.gn });
+                                count = g.count / p.gn;
+                                first = g.first + p.gi * count;
+                            } else {
+                                if (p.gn % g.count != 0)
+                                    return fail("{s}: {d} replicas do not divide over {d} members of {s}", .{ p.name, p.gn, g.count, rname });
+                                count = 1;
+                                first = g.first + (p.gi * g.count) / p.gn;
+                            }
+                        }
+                        for (0..count) |j| {
+                            const t = &all.items[first + j];
+                            const rx = rxSlotOf(&actors.items[t.ai].out.meta, prm.rx) orelse
+                                return fail("{s}: {s} declares no matching rx ring", .{ p.name, t.name });
                             const slot = try pttFor(&m, &ptt_map, ptt_next, p.core, ring.PttEntry.loFrom(t.core, t.ctx, rx), token);
                             writeCell(&m, p, cell0 + 8 * @as(u64, @intCast(j)), ring.windowAddr(slot, 0));
                         }
@@ -475,8 +518,8 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                         const t = for (all.items) |*t2| {
                             if (t2.gn == 1 and std.mem.eql(u8, t2.name, rname)) break t2;
                         } else return fail("{s}: no instance named {s}", .{ p.name, rname });
-                        const rx = rxSlotOf(&actors.items[t.ai].out.meta) orelse
-                            return fail("{s}: {s} declares no rx ring", .{ p.name, rname });
+                        const rx = rxSlotOf(&actors.items[t.ai].out.meta, prm.rx) orelse
+                            return fail("{s}: {s} declares no matching rx ring", .{ p.name, rname });
                         break :blk ring.PttEntry.loFrom(t.core, t.ctx, rx);
                     };
                     switch (prm.where) {
@@ -502,7 +545,7 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                         // driver to device, same act as wiring two actors.
                         const d = ddev orelse
                             return fail("{s}: `reply` wires a device; {s} replies through its own caps", .{ p.name, rname });
-                        const my_rx = rxSlotOf(meta) orelse
+                        const my_rx = rxSlotOf(meta, null) orelse
                             return fail("{s}: takes a reply but declares no rx ring", .{p.name});
                         const gop = try reply_claim.getOrPut(d.coord);
                         if (gop.found_existing)
@@ -532,6 +575,35 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
                         },
                         .slot, .none => unreachable,
                     }
+                },
+                .sup => {
+                    // Supervision (spec §5.4): the child's spawn block
+                    // lands where the contract says, its exit link aims
+                    // at our CQ, and its leash is ours to set.
+                    const rname = switch (arg) {
+                        .ref => |r| r,
+                        else => return fail("{s}: param {s} supervises an instance, got a number", .{ p.name, prm.name }),
+                    };
+                    const t = for (all.items) |*t2| {
+                        if (t2.gn == 1 and std.mem.eql(u8, t2.name, rname)) break t2;
+                    } else return fail("{s}: no instance named {s}", .{ p.name, rname });
+                    if (t.core != p.core)
+                        return fail("{s}: supervision is core-local; {s} lives on core {d}", .{ p.name, rname, t.core });
+                    const tmeta = &actors.items[t.ai].out.meta;
+                    const cell = prm.where.cell;
+                    const words = [4]u64{
+                        t.ctx,
+                        actors.items[t.ai].out.origin,
+                        t.sp,
+                        argA(t, tmeta.params),
+                    };
+                    for (words, 0..) |w, j|
+                        writeCell(&m, p, cell + 8 * @as(u64, @intCast(j)), w);
+                    const cq = companion orelse
+                        return fail("{s}: supervises but declares no cq ring", .{p.name});
+                    m.linkSupervisor(p.core, t.ctx, p.ctx, cq);
+                    if (prm.watchdog != 0)
+                        m.setWatchdog(p.core, t.ctx, prm.watchdog);
                 },
             }
         }
@@ -578,17 +650,7 @@ pub fn simulate(alloc: std.mem.Allocator, sources: []const Source, opts: Options
         s -= 1;
         const p = &all.items[s];
         const meta = &actors.items[p.ai].out.meta;
-        var arg: u64 = 0;
-        for (p.args, meta.params) |ia, prm| {
-            if (prm.kind == .arg and prm.where == .reg_a) {
-                arg = switch (ia) {
-                    .int => |v| v,
-                    .index => @intCast(p.gi),
-                    .ref => 0,
-                };
-            }
-        }
-        try m.spawn(p.core, p.ctx, actors.items[p.ai].out.origin, p.sp, arg);
+        try m.spawn(p.core, p.ctx, actors.items[p.ai].out.origin, p.sp, argA(p, meta.params));
     }
 
     const reason = try m.run();
