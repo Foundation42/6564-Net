@@ -101,6 +101,34 @@ pub const Console = struct {
     }
 };
 
+// ── APU: sound as fire-and-forget ────────────────────────────────────────
+//
+// `send apu, Tone{n}` — a plain message (word0 = tag, word1 = the tone),
+// and no reply. The APU is a sink like the console, but it takes a message
+// instead of raw text: it counts the tones and remembers the last one,
+// which is all a headless machine can honestly say about sound. Fire-and-
+// forget is not a limitation here, it is the right shape — you do not wait
+// on a sound the way you wait on a frame.
+
+pub const Apu = struct {
+    tones: u64 = 0,
+    last: u64 = 0,
+    /// A running sum of every tone value played. Order-independent, so it
+    /// proves which tones the wire carried without depending on the order
+    /// a fire-and-forget burst happens to arrive in.
+    sum: u64 = 0,
+
+    fn handle(self: *Apu, payload: []const u8) Result {
+        self.tones += 1;
+        if (payload.len >= 16) {
+            const n = word(payload, 1);
+            self.last = n;
+            self.sum +%= n;
+        }
+        return .{}; // no reply: sound is fire-and-forget
+    }
+};
+
 // ── Entropy: seeded randomness as a service ──────────────────────────────
 //
 // Request: word0 = tag, word1 = reply window, word2 = byte count
@@ -322,6 +350,7 @@ pub const Device = union(enum) {
     rtc: Rtc,
     block: Block,
     net: Net,
+    apu: Apu,
 
     /// One request, delivered at fabric time `due`.
     pub fn handle(self: *Device, due: u64, payload: []const u8) Result {
@@ -331,6 +360,7 @@ pub const Device = union(enum) {
             .rtc => |*d| d.handle(due, payload),
             .block => |*d| d.handle(payload),
             .net => |*d| d.handle(payload),
+            .apu => |*d| d.handle(payload),
         };
     }
 

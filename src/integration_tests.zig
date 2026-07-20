@@ -875,6 +875,37 @@ test "device row: the display is the frame clock — grant, present, get it back
     try testing.expectEqual(@as(u64, 6566), o.display_checksum);
 }
 
+test "device row: the APU is a fire-and-forget sink — tones, no answer" {
+    // rocci §1: `W4.tone!(...)` becomes `send apu, Tone{...}`, fire and
+    // forget, as sound should be. The APU takes a plain message — no
+    // reply window, no completion — and counts what it was told to play.
+    // A headless machine cannot make a sound, but it can say truthfully
+    // how many were asked for and what the last one was, which is exactly
+    // enough to prove the wire without pretending to be a speaker.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Tone { n u64 }
+        \\actor Player(apu addr) {
+        \\    var played u64 = 0
+        \\    send apu, Tone{100}
+        \\    send apu, Tone{200}
+        \\    send apu, Tone{300}
+        \\    played = 3
+        \\    halt ok
+        \\}
+        \\system {
+        \\    p = Player(apu) on 0
+        \\    apu = Apu()
+        \\}
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    // Three tones asked for, three played; the sum proves the values on
+    // the wire (100 + 200 + 300), independent of the order a fire-and-
+    // forget burst arrives in.
+    try testing.expectEqual(@as(u64, 3), o.apu_tones);
+    try testing.expectEqual(@as(u64, 600), o.apu_sum);
+    try testing.expectEqual(@as(u64, 3), o.varOf("p", "played").?);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability

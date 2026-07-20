@@ -75,6 +75,9 @@ const device_table = [_]struct {
     // PresentDone (`case done`) comes back one vblank later. The grant is
     // the pacing; the completion is the frame clock.
     .{ .name = "Display", .coord = 0xFF07, .dialect = .msg },
+    // The APU: `send apu, Tone{n}` — a plain message, fire-and-forget. A
+    // sink that counts what it was told to play.
+    .{ .name = "Apu", .coord = 0xFF08, .dialect = .msg },
 };
 
 const abi_token = joe.abi.token;
@@ -128,6 +131,12 @@ pub const Outcome = struct {
     /// presented, and the checksum of the last one to reach the glass.
     display_frames: u64 = 0,
     display_checksum: u64 = 0,
+    /// The APU's tally: how many tones were played, the last one, and a
+    /// sum of all tone values (order-independent, so it survives the
+    /// arrival order of a fire-and-forget burst).
+    apu_tones: u64 = 0,
+    apu_last: u64 = 0,
+    apu_sum: u64 = 0,
 
     pub fn deinit(self: *Outcome) void {
         for (self.instances) |inst| {
@@ -410,6 +419,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             0xFF05 => try m.attachAccel(d.coord, d.token, .inproc),
             0xFF06 => try m.attachAccel(d.coord, d.token, .remote),
             0xFF07 => try m.attachDisplay(d.coord, d.token, display_period),
+            0xFF08 => try m.attachDevice(d.coord, d.token, .{ .apu = .{} }),
             else => unreachable,
         }
     }
@@ -625,10 +635,19 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     var console: ?[]u8 = null;
     var display_frames: u64 = 0;
     var display_checksum: u64 = 0;
+    var apu_tones: u64 = 0;
+    var apu_last: u64 = 0;
+    var apu_sum: u64 = 0;
     for (devices.items) |*d| {
-        if (d.coord == 0xFF00) {
-            console = try alloc.dupe(u8, m.device(d.coord).?.console.out.items);
-        }
+        if (m.device(d.coord)) |dv| switch (dv.*) {
+            .console => |*c| console = try alloc.dupe(u8, c.out.items),
+            .apu => |*a| {
+                apu_tones = a.tones;
+                apu_last = a.last;
+                apu_sum = a.sum;
+            },
+            else => {},
+        };
         if (m.displayStats(d.coord)) |ds| {
             display_frames = ds.frames;
             display_checksum = ds.checksum;
@@ -643,6 +662,9 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         .stats = m.stats,
         .display_frames = display_frames,
         .display_checksum = display_checksum,
+        .apu_tones = apu_tones,
+        .apu_last = apu_last,
+        .apu_sum = apu_sum,
     };
 }
 
