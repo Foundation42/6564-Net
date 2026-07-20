@@ -34,6 +34,8 @@ const ring = @import("ring.zig");
 const machine = @import("machine.zig");
 const asm6564 = @import("asm.zig");
 const dev = @import("dev.zig");
+const term = @import("term_display.zig");
+const ppu6564 = @import("ppu.zig");
 const joe = @import("joe.zig");
 
 /// Builtin device types a `system` block may instantiate — peripherals
@@ -92,6 +94,11 @@ const device_table = [_]struct {
     // `pushes` = it aims its own window at whoever last subscribed, so
     // many screens may hold it and take the input in turn (§7.8).
     .{ .name = "Pad", .coord = 0xFF09, .answers = true, .pushes = true, .dialect = .ask },
+    // The PPU (§7.9): a picture processor. The core writes a display list
+    // into a granted region and submits; the PPU composites tiles and
+    // sprites into the framebuffer part and completes — matmul's twin for
+    // pixels, so the core never lays down a pixel itself.
+    .{ .name = "Ppu", .coord = 0xFF0A, .dialect = .msg },
 };
 
 const abi_token = joe.abi.token;
@@ -123,6 +130,14 @@ pub const Options = struct {
     /// the deterministic (harness) source; a seed-driven or real pad is a
     /// separate implementation of the same contract (§7.5). Caller-owned.
     pad_trace: []const u64 = &.{},
+    /// When set, attach a real TermDisplay at $FF07 instead of the headless
+    /// Display: the granted frame is painted to the terminal, `width` pixels
+    /// per row, each frame held `frame_ms` real milliseconds. An external
+    /// device on the row (term_display.zig) — output only, so the run stays
+    /// bit-identical to a headless one.
+    watch: ?Watch = null,
+
+    pub const Watch = struct { width: u16, frame_ms: u32 = 50 };
 };
 
 pub const VarOut = struct { name: []const u8, value: u64, f64: bool = false };
@@ -456,9 +471,13 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             0xFF04 => try m.attachDevice(d.coord, d.token, dev.Net.init(alloc)),
             0xFF05 => try m.attachDevice(d.coord, d.token, dev.Matmul{ .remote = false }),
             0xFF06 => try m.attachDevice(d.coord, d.token, dev.Matmul{ .remote = true }),
-            0xFF07 => try m.attachDevice(d.coord, d.token, dev.Display{ .period = display_period }),
+            0xFF07 => if (opts.watch) |wc|
+                try m.attachDevice(d.coord, d.token, term.TermDisplay{ .period = display_period, .width = wc.width, .frame_ms = wc.frame_ms })
+            else
+                try m.attachDevice(d.coord, d.token, dev.Display{ .period = display_period }),
             0xFF08 => try m.attachDevice(d.coord, d.token, dev.Apu{}),
             0xFF09 => try m.attachPad(d.coord, d.token, opts.pad_trace, pad_interval),
+            0xFF0A => try m.attachDevice(d.coord, d.token, ppu6564.Ppu{}),
             else => unreachable,
         }
     }
@@ -689,7 +708,12 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             0xFF00 => if (m.deviceAs(d.coord, dev.Console)) |c| {
                 console = try alloc.dupe(u8, c.out.items);
             },
-            0xFF07 => if (m.deviceAs(d.coord, dev.Display)) |disp| {
+            0xFF07 => if (opts.watch != null) {
+                if (m.deviceAs(d.coord, term.TermDisplay)) |disp| {
+                    display_frames = disp.frames;
+                    display_checksum = disp.checksum;
+                }
+            } else if (m.deviceAs(d.coord, dev.Display)) |disp| {
                 display_frames = disp.frames;
                 display_checksum = disp.checksum;
             },

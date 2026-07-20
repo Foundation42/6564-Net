@@ -128,6 +128,7 @@ const device_dialects = [_]struct { name: []const u8, dialect: ring.Dialect }{
     .{ .name = "Display", .dialect = .msg },
     .{ .name = "Apu", .dialect = .msg },
     .{ .name = "Pad", .dialect = .ask },
+    .{ .name = "Ppu", .dialect = .msg },
 };
 
 /// An instance name → what that endpoint is. Devices carry their own

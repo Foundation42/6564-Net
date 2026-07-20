@@ -280,7 +280,12 @@ pub fn main() !void {
         // retry, so a dropped vblank would simply stall it.
         const trace = [_]u64{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0 };
         var opts = sim.joe_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace };
-        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        // `sim6564 joey --watch` swaps the headless display for a real one:
+        // the frame is painted to your terminal (term_display.zig), an
+        // external device on the row. 80 = joey's framebuffer width.
+        while (args.next()) |s| {
+            if (std.mem.eql(u8, s, "--watch")) opts.watch = .{ .width = 80 } else opts.seed = parseOr(u64, s, "seed");
+        }
         return sim.joe_run.run(alloc, @embedFile("programs/joe/joey/joey.joe"), opts);
     }
 
