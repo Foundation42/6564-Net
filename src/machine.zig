@@ -253,57 +253,36 @@ pub const Stats = struct {
     accel_pulls: u64 = 0,
 };
 
-/// A device attached to the peripheral row: the device itself, the token it
-/// demands of requesters (0 = open), and the PTT its replies route through —
-/// bound by the loader exactly like any actor's capabilities.
+/// A device attached to the peripheral row, seen through its vtable (§7.5,
+/// dev.zig): the interface, the token it demands of requesters (0 = open),
+/// the PTT its replies route through, and the state a grant device needs —
+/// `busy` (one job in flight, single-buffered) and the `pending` grant. The
+/// machine never learns a device's concrete type; `dispose` frees the box it
+/// was put in (attachDevice, which alone knows that type, records it).
 pub const DevEndpoint = struct {
-    dev: dev.Device,
+    iface: dev.Device,
     token: u64 = 0,
     ptt: [dev.ptt_slots]ring.PttEntry = @splat(.{}),
-};
-
-/// An accelerator actor on the peripheral row (handoff item 6): matmul,
-/// in two indistinguishable implementations per §7.5 — an in-proc "TPU"
-/// that DMAs the granted region, and a fabric-remote polyfill that pulls
-/// it through the network window chunk by chunk with the same token.
-/// Both declare `deterministic`: C[i,j] = Σ_k A[i,k]·B[k,j], k ascending,
-/// IEEE RNE — the reduction order is in the contract, so the two
-/// implementations agree to the bit and only the clock can tell them
-/// apart. Queue depth one: a busy accelerator rejects, and saturation is
-/// backpressure, never corruption.
-pub const Accel = struct {
-    kind: enum { inproc, remote, display },
-    token: u64 = 0,
+    /// A grant device (matmul, display) holds one job in flight; `busy` makes
+    /// it single-buffered — a second submit is backpressure (§5.4).
     busy: bool = false,
-    /// Display state (kind == .display). A display is an accelerator whose
-    /// "work" is to present: it takes a granted frame region, holds it for
-    /// one vblank interval, and returns it — the completion is the frame
-    /// clock, the grant is the pacing (rocci §2). `frames` counts presents;
-    /// `checksum` is the last frame's bytes summed, a headless stand-in for
-    /// a framebuffer that proves the actor's drawing reached the glass;
-    /// `period` is the vblank interval, the backpressure that paces the
-    /// frame loop.
-    frames: u64 = 0,
-    checksum: u64 = 0,
-    period: u64 = 0,
-};
+    /// The one grant in flight: its region identity (which context's slot,
+    /// under which token), and the device's private job memo. Re-checked
+    /// against the LIVE descriptor at completion — the deferred-read
+    /// discipline, so revocation between grant and fence is an honest reject.
+    pending: ?GrantInFlight = null,
+    /// Frees the machine's box around the device. Only attachDevice knows the
+    /// concrete type, so it records the destructor here; the device's own
+    /// buffers are freed first through the vtable's `deinit`.
+    dispose: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) void,
 
-/// One granted matmul in flight: everything re-checked at completion
-/// time against the LIVE descriptor — the deferred-read discipline, so
-/// revocation between grant and completion turns the job into an honest
-/// reject instead of a scribble.
-const AccelJob = struct {
-    coord: u16,
-    core: u16,
-    ctx: u8,
-    slot: u8,
-    token: u64,
-    m: u16,
-    k: u16,
-    n: u16,
-    off_a: u64,
-    off_b: u64,
-    off_c: u64,
+    const GrantInFlight = struct {
+        core: u16,
+        ctx: u8,
+        slot: u8,
+        token: u64,
+        job: dev.DeviceJob,
+    };
 };
 
 const PendingSend = struct {
@@ -322,9 +301,6 @@ pub const Machine = struct {
     seq: u64 = 0,
     pending: std.AutoHashMap(u64, PendingSend),
     devices: std.AutoHashMap(u16, DevEndpoint),
-    accels: std.AutoHashMap(u16, Accel),
-    accel_jobs: std.AutoHashMap(u64, AccelJob),
-    accel_next_id: u64 = 1,
     /// Which die this machine is on the IO plane (§6.5); 0 standalone.
     die_id: u16 = 0,
     /// The die's hook onto the plane; PTT entries with route != 0 need it.
@@ -362,8 +338,6 @@ pub const Machine = struct {
             .prng = std.Random.DefaultPrng.init(cfg.seed),
             .pending = std.AutoHashMap(u64, PendingSend).init(alloc),
             .devices = std.AutoHashMap(u16, DevEndpoint).init(alloc),
-            .accels = std.AutoHashMap(u16, Accel).init(alloc),
-            .accel_jobs = std.AutoHashMap(u64, AccelJob).init(alloc),
         };
     }
 
@@ -372,10 +346,11 @@ pub const Machine = struct {
         self.events.deinit();
         self.pending.deinit();
         var it = self.devices.valueIterator();
-        while (it.next()) |ep| ep.dev.deinit();
+        while (it.next()) |ep| {
+            ep.iface.deinit(); // the device's own buffers
+            ep.dispose(ep.iface.ptr, self.alloc); // the box the machine put it in
+        }
         self.devices.deinit();
-        self.accels.deinit();
-        self.accel_jobs.deinit();
         for (self.cores) |*core| {
             self.alloc.free(core.ram);
             self.alloc.free(core.contexts);
@@ -440,15 +415,28 @@ pub const Machine = struct {
         self.cores[core_idx].ptt[slot] = entry;
     }
 
-    /// Pre-stage bytes into a context's near page (config blocks, spawn
-    /// tables — the loader's job in a real system).
-    /// Attach a device at a peripheral-row coordinate ($FF00..$FFFE). The
-    /// token is what requesters' PTT entries must present (0 = open).
-    pub fn attachDevice(self: *Machine, coord: u16, token: u64, d: dev.Device) !void {
+    /// Attach a device at a peripheral-row coordinate ($FF00..$FFFE). Takes
+    /// any concrete device by value (Console, Matmul, an external renderer —
+    /// anything with `pub fn device(*T) dev.Device`), boxes it so its address
+    /// is stable behind the vtable, and records a type-aware destructor. The
+    /// machine thereafter knows only the interface (§7.5). Token 0 = open.
+    pub fn attachDevice(self: *Machine, coord: u16, token: u64, device_val: anytype) !void {
         std.debug.assert(coord >= dev.first_core and coord <= dev.last_core);
+        const T = @TypeOf(device_val);
+        const box = try self.alloc.create(T);
+        errdefer self.alloc.destroy(box);
+        box.* = device_val;
         const slot = try self.devices.getOrPut(coord);
         std.debug.assert(!slot.found_existing);
-        slot.value_ptr.* = .{ .dev = d, .token = token };
+        slot.value_ptr.* = .{
+            .iface = box.device(),
+            .token = token,
+            .dispose = struct {
+                fn f(ptr: *anyopaque, a: std.mem.Allocator) void {
+                    a.destroy(@as(*T, @ptrCast(@alignCast(ptr))));
+                }
+            }.f,
+        };
     }
 
     /// Bind a reply capability into a device's PTT — the loader wiring a
@@ -457,195 +445,79 @@ pub const Machine = struct {
         self.devices.getPtr(coord).?.ptt[slot] = entry;
     }
 
-    /// Attach a matmul accelerator at a peripheral coordinate (item 6).
-    pub fn attachAccel(self: *Machine, coord: u16, token: u64, kind: @FieldType(Accel, "kind")) !void {
-        std.debug.assert(coord >= dev.first_core and coord <= dev.last_core);
-        try self.accels.put(coord, .{ .kind = kind, .token = token });
-    }
-
-    /// A display in the peripheral row: it takes a granted frame region,
-    /// holds it for one vblank `period`, presents it, and returns it. The
-    /// frame clock is backpressure — a second Present before PresentDone
-    /// is refused, so an actor cannot draw faster than the glass returns
-    /// its region (rocci §2). Single-buffered; the double buffer is two
-    /// regions alternating grants, a program's choice, not the display's.
-    pub fn attachDisplay(self: *Machine, coord: u16, token: u64, period: u64) !void {
-        std.debug.assert(coord >= dev.first_core and coord <= dev.last_core);
-        try self.accels.put(coord, .{ .kind = .display, .token = token, .period = period });
-    }
-
-    /// The last frame a display presented: how many, and a checksum of the
-    /// bytes that reached it. Read after a run — the headless proof that
-    /// what the actor drew is what the glass received.
-    pub fn displayStats(self: *Machine, coord: u16) ?struct { frames: u64, checksum: u64 } {
-        const ac = self.accels.getPtr(coord) orelse return null;
-        if (ac.kind != .display) return null;
-        return .{ .frames = ac.frames, .checksum = ac.checksum };
-    }
-
     /// A pad in the peripheral row: a device that pushes. The trace is the
     /// button sequence (caller-owned), `interval` the input rate. It stays
     /// silent until an actor subscribes with a Poll ask, then streams one
     /// `Pad` per trace entry to the ask's reply window.
     pub fn attachPad(self: *Machine, coord: u16, token: u64, input_trace: []const u64, interval: u64) !void {
-        try self.attachDevice(coord, token, .{ .pad = .{ .trace = input_trace, .interval = interval } });
+        try self.attachDevice(coord, token, dev.Pad{ .trace = input_trace, .interval = interval });
     }
 
-    /// A matmul request arrives (contract, all u64 LE words):
-    ///   w0 reserved (joe's tag word — silicon ignores it)
-    ///   w1 region desc slot   w2 token presented
-    ///   w3 dims M | K<<16 | N<<32 (each 1..32)
-    ///   w4 offset of A   w5 offset of B   w6 offset of C  (bytes, in-region)
-    /// Grant-on-submit: acceptance sets the descriptor's OWNED flag; the
-    /// completion (a delivery to the sender's RX ring, word0 low16 =
-    /// $6772 with the status above it, word1 = the slot) is the release
-    /// fence. A busy accelerator — or an already-granted region — rejects:
-    /// saturation is backpressure.
-    fn deliverToAccel(self: *Machine, due: u64, gram: mesh.Datagram) !void {
-        const ac = self.accels.getPtr(gram.dst_core).?;
-        if (ac.kind == .display) return self.deliverToDisplay(due, gram, ac);
-        const reject = struct {
-            fn of(m: *Machine, d: u64, g: mesh.Datagram, s: ring.Status) !void {
-                m.stats.rejects += 1;
-                try m.ackSender(d, g, g.dst_core, s, 0);
-            }
-        }.of;
-        if (ac.token != 0 and ac.token != gram.token)
-            return reject(self, due, gram, .reject_capability);
-        if (ac.busy or gram.payload.len < 56)
-            return reject(self, due, gram, .reject_no_buffer);
+    /// A grant device (matmul, display) accepted a request and asked, via
+    /// its `handle`, for a region grant (§7.6–7.7). The device already
+    /// validated the request against the payload; the machine owns the
+    /// region half: resolve the granting context (the sender), read its LIVE
+    /// descriptor, check the token, the OWNED flag, and that the device's
+    /// declared `extent` fits — then set OWNED (the grant fence), mark the
+    /// endpoint busy, stash the in-flight grant, and schedule the completion
+    /// `latency` out. The completion (a delivery to the sender's RX ring,
+    /// word0 low16 = $6772 with the status above it, word1 = the slot) is
+    /// the release fence. Returns the ack status; a busy device, a revoked
+    /// or already-granted region, or an oversized extent is backpressure.
+    /// The completion event is scheduled BEFORE the caller sends the ack —
+    /// the grant precedes the receipt, as it did before this unification.
+    fn grantSubmit(self: *Machine, ep: *DevEndpoint, due: u64, gram: mesh.Datagram, s: dev.Action.Submit) !ring.Status {
+        if (ep.busy) return .reject_no_buffer; // single-buffered
         // the granting context is the sender of this request
-        const pend = self.pending.get(gram.send_id) orelse
-            return reject(self, due, gram, .reject_capability);
+        const pend = self.pending.get(gram.send_id) orelse return .reject_capability;
         const rcore = pend.reply.core;
         const rctx = pend.reply.ctx;
-        const w = struct {
-            fn at(p: []const u8, i: usize) u64 {
-                return std.mem.readInt(u64, p[i * 8 ..][0..8], .little);
-            }
-        }.at;
-        const job = AccelJob{
-            .coord = gram.dst_core,
-            .core = rcore,
-            .ctx = rctx,
-            .slot = @truncate(w(gram.payload, 1)),
-            .token = w(gram.payload, 2),
-            .m = @truncate(w(gram.payload, 3)),
-            .k = @truncate(w(gram.payload, 3) >> 16),
-            .n = @truncate(w(gram.payload, 3) >> 32),
-            .off_a = w(gram.payload, 4),
-            .off_b = w(gram.payload, 5),
-            .off_c = w(gram.payload, 6),
-        };
-        if (job.m == 0 or job.k == 0 or job.n == 0 or job.m > 32 or job.k > 32 or job.n > 32)
-            return reject(self, due, gram, .reject_capability);
-        const desc = self.regionDesc(job) orelse
-            return reject(self, due, gram, .reject_capability);
-        if (desc.token == 0 or desc.token != job.token)
-            return reject(self, due, gram, .reject_capability);
-        if (desc.flags & ring.desc_flag_owned != 0)
-            return reject(self, due, gram, .reject_no_buffer); // already granted out
-        const need_a = @as(u64, job.m) * job.k * 8;
-        const need_b = @as(u64, job.k) * job.n * 8;
-        const need_c = @as(u64, job.m) * job.n * 8;
-        if (job.off_a + need_a > desc.len or job.off_b + need_b > desc.len or
-            job.off_c + need_c > desc.len)
-            return reject(self, due, gram, .reject_capability);
+        const desc = self.regionDesc(rcore, rctx, s.slot) orelse return .reject_capability;
+        if (desc.token == 0 or desc.token != s.token) return .reject_capability;
+        if (desc.flags & ring.desc_flag_owned != 0) return .reject_no_buffer; // already granted out
+        if (s.extent > desc.len) return .reject_capability;
         // grant: the region is hardware-owned until the completion fence
-        self.setRegionOwned(job, true);
-        ac.busy = true;
-        const flops = @as(u64, job.m) * job.k * job.n;
-        const latency: u64 = switch (ac.kind) {
-            // the in-proc unit DMAs; the polyfill pulls and pushes the
-            // region through the window in 64-byte chunks, same token —
-            // same bytes at the end, only the clock can tell
-            .inproc => 100 + flops,
-            .remote => blk: {
-                const chunks = (need_a + need_b + need_c + 63) / 64;
-                self.stats.accel_pulls += chunks;
-                break :blk 400 + chunks * 200 + flops;
-            },
-            .display => unreachable, // routed to deliverToDisplay above
-        };
-        const id = self.accel_next_id;
-        self.accel_next_id += 1;
-        try self.accel_jobs.put(id, job);
-        try self.events.add(.{ .due = due + latency, .seq = self.nextSeq(), .kind = .{ .accel = .{ .id = id } } });
-        self.stats.delivered += 1;
-        self.stats.dev_deliveries += 1;
-        self.trace("accel ${X} @{d} grant slot{d} {d}x{d}x{d}", .{ gram.dst_core, due, job.slot, job.m, job.k, job.n });
-        try self.ackSender(due, gram, gram.dst_core, .ok, @intCast(gram.payload.len));
+        self.setRegionOwned(rcore, rctx, s.slot, true);
+        ep.busy = true;
+        ep.pending = .{ .core = rcore, .ctx = rctx, .slot = s.slot, .token = s.token, .job = s.job };
+        self.stats.accel_pulls += s.pulls;
+        try self.events.add(.{ .due = due + s.latency, .seq = self.nextSeq(), .kind = .{ .complete = .{ .coord = gram.dst_core } } });
+        self.trace("grant ${X} @{d} slot{d} extent{d}", .{ gram.dst_core, due, s.slot, s.extent });
+        return .ok;
     }
 
-    /// A Present request arrives (all u64 LE words):
-    ///   w0 reserved (joe's tag word — silicon ignores it)
-    ///   w1 region desc slot   w2 token presented
-    /// The whole region is the frame; there are no dimensions to give,
-    /// because a display does not compute, it presents. Grant-on-submit
-    /// sets OWNED; the completion after one vblank interval snapshots the
-    /// frame and is the release fence. `busy` makes the display single-
-    /// buffered: a second Present before PresentDone is backpressure —
-    /// the frame clock refusing to run ahead of the glass.
-    fn deliverToDisplay(self: *Machine, due: u64, gram: mesh.Datagram, ac: *Accel) !void {
-        const reject = struct {
-            fn of(m: *Machine, d: u64, g: mesh.Datagram, s: ring.Status) !void {
-                m.stats.rejects += 1;
-                try m.ackSender(d, g, g.dst_core, s, 0);
-            }
-        }.of;
-        if (ac.token != 0 and ac.token != gram.token)
-            return reject(self, due, gram, .reject_capability);
-        if (ac.busy or gram.payload.len < 24)
-            return reject(self, due, gram, .reject_no_buffer);
-        const pend = self.pending.get(gram.send_id) orelse
-            return reject(self, due, gram, .reject_capability);
-        const w = struct {
-            fn at(p: []const u8, i: usize) u64 {
-                return std.mem.readInt(u64, p[i * 8 ..][0..8], .little);
-            }
-        }.at;
-        const job = AccelJob{
-            .coord = gram.dst_core,
-            .core = pend.reply.core,
-            .ctx = pend.reply.ctx,
-            .slot = @truncate(w(gram.payload, 1)),
-            .token = w(gram.payload, 2),
-            .m = 0,
-            .k = 0,
-            .n = 0,
-            .off_a = 0,
-            .off_b = 0,
-            .off_c = 0,
-        };
-        const desc = self.regionDesc(job) orelse
-            return reject(self, due, gram, .reject_capability);
-        if (desc.token == 0 or desc.token != job.token)
-            return reject(self, due, gram, .reject_capability);
-        if (desc.flags & ring.desc_flag_owned != 0)
-            return reject(self, due, gram, .reject_no_buffer); // a frame is already up
-        self.setRegionOwned(job, true);
-        ac.busy = true;
-        const id = self.accel_next_id;
-        self.accel_next_id += 1;
-        try self.accel_jobs.put(id, job);
-        try self.events.add(.{ .due = due + ac.period, .seq = self.nextSeq(), .kind = .{ .accel = .{ .id = id } } });
-        self.stats.delivered += 1;
-        self.stats.dev_deliveries += 1;
-        self.trace("display ${X} @{d} present slot{d}", .{ gram.dst_core, due, job.slot });
-        try self.ackSender(due, gram, gram.dst_core, .ok, @intCast(gram.payload.len));
+    /// A pushing device (the pad) accepted a subscription (§7.8). Aim its
+    /// push window at the subscriber's RX ring — last subscriber wins, so
+    /// every Poll re-aims — and, if this is the first subscription (`first`
+    /// > 0), start the stream one interval out. Called AFTER the ack, so the
+    /// stream begins behind the receipt, exactly as the pad path did before.
+    fn subscribe(self: *Machine, ep_coord: u16, due: u64, gram: mesh.Datagram, sub: dev.Action.Subscribe) !void {
+        if (self.pending.get(gram.send_id)) |pend| {
+            const dc = &self.cores[pend.reply.core];
+            const dx = &dc.contexts[pend.reply.ctx];
+            const rx_token = read64(dc, dx, @as(u64, ring.slot_rx) * ring.desc_size + 24) catch 0;
+            self.setDevicePtt(ep_coord, 0, .{
+                .prefix_hi = 0xfd65_6400_0000_0000,
+                .prefix_lo = ring.PttEntry.loFrom(pend.reply.core, pend.reply.ctx, ring.slot_rx),
+                .rights = .{ .send = true },
+                .token = rx_token,
+            });
+        }
+        if (sub.first > 0)
+            try self.events.add(.{ .due = due + sub.first, .seq = self.nextSeq(), .kind = .{ .push = .{ .coord = ep_coord } } });
     }
 
     const RegionDesc = struct { base: u64, len: u64, token: u64, flags: u8 };
 
     /// Read a region descriptor LIVE from the granting context's near
     /// page — every check is against current words, never a copy.
-    fn regionDesc(self: *Machine, job: AccelJob) ?RegionDesc {
-        if (job.core >= self.cores.len) return null;
-        const core = &self.cores[job.core];
-        if (job.ctx >= core.contexts.len) return null;
-        const ctx = &core.contexts[job.ctx];
-        if (job.slot >= ring.desc_slots) return null;
-        const off = @as(u64, job.slot) * ring.desc_size;
+    fn regionDesc(self: *Machine, core_id: u16, ctx_id: u8, slot: u8) ?RegionDesc {
+        if (core_id >= self.cores.len) return null;
+        const core = &self.cores[core_id];
+        if (ctx_id >= core.contexts.len) return null;
+        const ctx = &core.contexts[ctx_id];
+        if (slot >= ring.desc_slots) return null;
+        const off = @as(u64, slot) * ring.desc_size;
         const base = read64(core, ctx, off) catch return null;
         const w1 = read64(core, ctx, off + 8) catch return null;
         const len = read64(core, ctx, off + 16) catch return null;
@@ -738,10 +610,10 @@ pub const Machine = struct {
         return .{ .slot = free_slot, .token = fresh, .base = base, .len = len };
     }
 
-    fn setRegionOwned(self: *Machine, job: AccelJob, owned: bool) void {
-        const core = &self.cores[job.core];
-        const ctx = &core.contexts[job.ctx];
-        const off = @as(u64, job.slot) * ring.desc_size + 8;
+    fn setRegionOwned(self: *Machine, core_id: u16, ctx_id: u8, slot: u8, owned: bool) void {
+        const core = &self.cores[core_id];
+        const ctx = &core.contexts[ctx_id];
+        const off = @as(u64, slot) * ring.desc_size + 8;
         const w1 = read64(core, ctx, off) catch return;
         const flags: u8 = @truncate(w1 >> 56);
         const nf: u8 = if (owned) flags | ring.desc_flag_owned else flags & ~ring.desc_flag_owned;
@@ -749,62 +621,32 @@ pub const Machine = struct {
         write64(core, ctx, off, nw) catch return;
     }
 
-    /// The accelerator finishes: re-check the LIVE descriptor (the
-    /// deferred-read discipline — revocation between grant and now turns
-    /// the job into a reject, and nothing is scribbled), do the work,
-    /// clear OWNED, and deliver the completion to the sender's RX ring.
+    /// A grant device's completion fence fires (§7.6–7.7): re-read the LIVE
+    /// descriptor (the deferred-read discipline — revocation between grant
+    /// and now turns the job into a reject, and nothing is scribbled), hand
+    /// the device a mutable byte view of the region so it can do its work,
+    /// clear OWNED, and deliver the completion to the sender's RX ring. The
+    /// machine owns the fence and the record; the device owns the numbers.
     /// Completion payload: w0 = 0 ok / 1 rejected, w1 = the desc slot.
-    fn accelComplete(self: *Machine, due: u64, id: u64) !void {
-        const kv = self.accel_jobs.fetchRemove(id) orelse return;
-        const job = kv.value;
-        const acp = self.accels.getPtr(job.coord);
-        if (acp) |ac| ac.busy = false;
-        const is_display = acp != null and acp.?.kind == .display;
+    fn deviceComplete(self: *Machine, due: u64, coord: u16) !void {
+        const ep = self.devices.getPtr(coord) orelse return;
+        const p = ep.pending orelse return;
+        ep.pending = null;
+        ep.busy = false;
         var ok = false;
-        if (self.regionDesc(job)) |desc| {
-            if (desc.token != 0 and desc.token == job.token) {
-                const core = &self.cores[job.core];
-                const ctx = &core.contexts[job.ctx];
-                if (is_display) {
-                    // Present: read the frame the actor drew (deferred —
-                    // a revoked grant would have failed the token check
-                    // above and scribbled nothing) and snapshot it. The
-                    // whole region is the frame; its checksum is the proof
-                    // the drawing reached the glass.
-                    var sum: u64 = 0;
-                    var off: u64 = 0;
-                    while (off + 8 <= desc.len) : (off += 8) {
-                        sum +%= read64(core, ctx, desc.base + off) catch break;
-                    }
-                    acp.?.frames += 1;
-                    acp.?.checksum = sum;
-                    ok = true;
-                } else {
-                    // the DMA: C[i,j] = Σ_k A[i,k]·B[k,j], k ascending — the
-                    // declared-deterministic contract, bit for bit
-                    var i: u64 = 0;
-                    outer: while (i < job.m) : (i += 1) {
-                        var j: u64 = 0;
-                        while (j < job.n) : (j += 1) {
-                            var acc: f64 = 0;
-                            var kk: u64 = 0;
-                            while (kk < job.k) : (kk += 1) {
-                                const a_at = desc.base + job.off_a + (i * job.k + kk) * 8;
-                                const b_at = desc.base + job.off_b + (kk * job.n + j) * 8;
-                                const av: f64 = @bitCast(read64(core, ctx, a_at) catch break :outer);
-                                const bv: f64 = @bitCast(read64(core, ctx, b_at) catch break :outer);
-                                acc += av * bv;
-                            }
-                            const c_at = desc.base + job.off_c + (i * job.n + j) * 8;
-                            write64(core, ctx, c_at, @bitCast(acc)) catch break :outer;
-                        }
-                    }
-                    ok = i == job.m;
-                }
+        if (self.regionDesc(p.core, p.ctx, p.slot)) |desc| {
+            if (desc.token != 0 and desc.token == p.token) {
+                const core = &self.cores[p.core];
+                const ctx = &core.contexts[p.ctx];
+                // The region is contiguous host memory (§6.2, bytesAt); the
+                // device reads/writes it directly, blind to the machine.
+                if (bytesAt(core, ctx, desc.base, desc.len)) |region| {
+                    ok = ep.iface.complete(region, p.job);
+                } else |_| {}
             }
         }
-        self.setRegionOwned(job, false); // the release fence precedes the record
-        self.trace("accel ${X} @{d} {s} slot{d}", .{ job.coord, due, if (ok) @as([]const u8, "complete") else "REVOKED", job.slot });
+        self.setRegionOwned(p.core, p.ctx, p.slot, false); // the release fence precedes the record
+        self.trace("complete ${X} @{d} {s} slot{d}", .{ coord, due, if (ok) @as([]const u8, "complete") else "REVOKED", p.slot });
         var payload: [16]u8 = undefined;
         // word0: the architected grant-completion tag $6772 with the
         // status above it — far outside any program's message tag space,
@@ -812,18 +654,18 @@ pub const Machine = struct {
         // the program's message table.
         const status: u64 = if (ok) 0 else 1;
         std.mem.writeInt(u64, payload[0..8], 0x6772 | (status << 16), .little);
-        std.mem.writeInt(u64, payload[8..16], job.slot, .little);
+        std.mem.writeInt(u64, payload[8..16], p.slot, .little);
         const rx_token = blk: {
             // silicon presents whatever the target ring demands
-            const core = &self.cores[job.core];
-            const ctx = &core.contexts[job.ctx];
+            const core = &self.cores[p.core];
+            const ctx = &core.contexts[p.ctx];
             break :blk read64(core, ctx, @as(u64, ring.slot_rx) * ring.desc_size + 24) catch 0;
         };
         const gram = mesh.Datagram{
             .send_id = self.nextSeq(),
             .src_die = self.die_id,
-            .dst_core = job.core,
-            .dst_ctx = job.ctx,
+            .dst_core = p.core,
+            .dst_ctx = p.ctx,
             .dst_slot = ring.slot_rx,
             .offset = 0,
             .token = rx_token,
@@ -832,9 +674,13 @@ pub const Machine = struct {
         try self.events.add(.{ .due = due + 4, .seq = self.nextSeq(), .kind = .{ .deliver = gram } });
     }
 
-    pub fn device(self: *Machine, coord: u16) ?*dev.Device {
+    /// The concrete device at a coordinate, recovered from its box behind the
+    /// vtable — the caller names the type it attached (coord → type is fixed
+    /// by the row). Read-back after a run: console text, display frames, and
+    /// the like. Returns null if nothing is attached there.
+    pub fn deviceAs(self: *Machine, coord: u16, comptime T: type) ?*T {
         const ep = self.devices.getPtr(coord) orelse return null;
-        return &ep.dev;
+        return @ptrCast(@alignCast(ep.iface.ptr));
     }
 
     // ── The IO plane (§6.5): egress hook and window-barrier ingress ──────
@@ -852,7 +698,7 @@ pub const Machine = struct {
     /// validated here; an invalid target vanishes and the sender's timeout
     /// speaks (§6.1), exactly as for an unroutable local prefix.
     pub fn injectDeliver(self: *Machine, gram: mesh.Datagram, due: u64) !void {
-        const ok = self.devices.contains(gram.dst_core) or self.accels.contains(gram.dst_core) or
+        const ok = self.devices.contains(gram.dst_core) or
             (gram.dst_core < self.cores.len and
                 gram.dst_ctx < self.cfg.contexts_per_core and
                 gram.dst_slot < ring.desc_slots);
@@ -1129,7 +975,7 @@ pub const Machine = struct {
         }
         // The peripheral row (§7): a device coordinate routes like any
         // other — context/slot bits below the row are device-defined.
-        const routable = self.devices.contains(entry.dstCore()) or self.accels.contains(entry.dstCore()) or
+        const routable = self.devices.contains(entry.dstCore()) or
             (entry.dstCore() < self.cores.len and
                 entry.dstContext() < self.cfg.contexts_per_core and
                 entry.dstSlot() < ring.desc_slots);
@@ -1189,8 +1035,6 @@ pub const Machine = struct {
         });
         if (self.devices.contains(gram.dst_core))
             return self.deliverToDevice(due, gram);
-        if (self.accels.contains(gram.dst_core))
-            return self.deliverToAccel(due, gram);
         const core = &self.cores[gram.dst_core];
         const ctx = &core.contexts[gram.dst_ctx];
         const d = readDesc(ctx, gram.dst_slot);
@@ -1311,80 +1155,62 @@ pub const Machine = struct {
     }
 
     /// A request reached the peripheral row (§7). The endpoint's token gates
-    /// admission exactly as a ring descriptor's does; the device applies the
-    /// request at fabric time `due`; any reply routes through the device's
-    /// own PTT as ordinary fire-and-forget datagrams.
+    /// admission exactly as a ring descriptor's does; the device's `handle`
+    /// applies the request at fabric time `due` and returns the ack status,
+    /// an optional immediate reply, and an optional follow-up. The machine
+    /// owns only the fabric: token gate, ack, and the two follow-up shapes
+    /// (a grant, a subscription) — it never learns which device it is (§7.5).
+    ///
+    /// Ordering is load-bearing for bit-identical replay: a submit schedules
+    /// its completion BEFORE the ack (the grant is the fence), a reply goes
+    /// out before the ack, and a subscription's stream starts AFTER it — the
+    /// exact `nextSeq()` order the pre-vtable device/accel/pad paths had.
     fn deliverToDevice(self: *Machine, due: u64, gram: mesh.Datagram) !void {
         const ep = self.devices.getPtr(gram.dst_core).?;
-        var status: ring.Status = .ok;
-        var count: u32 = 0;
+        // Token gate — admission, exactly as a ring descriptor's.
         if (ep.token != 0 and ep.token != gram.token) {
-            status = .reject_capability;
             self.stats.rejects += 1;
-        } else {
-            const res = ep.dev.handle(due, gram.payload);
-            status = res.status;
-            if (status == .ok or status == .truncated) {
-                count = @intCast(gram.payload.len);
-                self.stats.delivered += 1;
-                self.stats.dev_deliveries += 1;
-                self.trace("dev ${X} @{d} accepted {d} bytes", .{ gram.dst_core, due, gram.payload.len });
-            } else {
-                self.stats.rejects += 1;
-            }
-            if (res.reply) |r| try self.deviceReply(ep, due, r);
+            return self.ackSender(due, gram, gram.dst_core, .reject_capability, 0);
         }
+        const res = ep.iface.handle(due, gram.payload);
+        var status = res.status;
+        if (status == .ok) {
+            switch (res.action) {
+                .submit => |s| status = try self.grantSubmit(ep, due, gram, s),
+                else => {},
+            }
+        }
+        var count: u32 = 0;
+        if (status == .ok or status == .truncated) {
+            count = @intCast(gram.payload.len);
+            self.stats.delivered += 1;
+            self.stats.dev_deliveries += 1;
+            self.trace("dev ${X} @{d} accepted {d} bytes", .{ gram.dst_core, due, gram.payload.len });
+        } else {
+            self.stats.rejects += 1;
+        }
+        if (res.reply) |r| try self.deviceReply(ep, due, r);
         try self.ackSender(due, gram, gram.dst_core, status, count);
-        // A pad's Poll is a subscription: the answer is a stream of pushes,
-        // not one reply. Every Poll re-aims the pad's push window at whoever
-        // just subscribed — last wins — so a screen transition moves the
-        // input stream to the new screen (§7.8). The first Poll also starts
-        // the stream; later ones only redirect it.
-        switch (ep.dev) {
-            .pad => |*pad| if (status == .ok) {
-                if (self.pending.get(gram.send_id)) |pend| {
-                    const dc = &self.cores[pend.reply.core];
-                    const dx = &dc.contexts[pend.reply.ctx];
-                    const rx_token = read64(dc, dx, @as(u64, ring.slot_rx) * ring.desc_size + 24) catch 0;
-                    self.setDevicePtt(gram.dst_core, 0, .{
-                        .prefix_hi = 0xfd65_6400_0000_0000,
-                        .prefix_lo = ring.PttEntry.loFrom(pend.reply.core, pend.reply.ctx, ring.slot_rx),
-                        .rights = .{ .send = true },
-                        .token = rx_token,
-                    });
-                }
-                if (!pad.streaming) {
-                    pad.streaming = true;
-                    try self.events.add(.{ .due = due + pad.interval, .seq = self.nextSeq(), .kind = .{ .pad = .{ .coord = gram.dst_core } } });
-                }
-            },
-            else => {},
+        if (status == .ok) {
+            switch (res.action) {
+                .subscribe => |sub| try self.subscribe(gram.dst_core, due, gram, sub),
+                else => {},
+            }
         }
     }
 
-    /// A pad's turn: push the next button state to the subscriber and
-    /// schedule the one after, until the trace runs dry. The push is an
-    /// ordinary device reply — same PTT capability, same fault-injected
-    /// fabric, so a dropped push is a dropped input frame, as it would be
-    /// on real hardware.
-    fn padPush(self: *Machine, due: u64, coord: u16) !void {
+    /// A pushing device's turn (the pad): ask the device for its next push,
+    /// route it as an ordinary fire-and-forget reply, and reschedule until
+    /// the device says the stream is spent (`again` == 0). Same PTT
+    /// capability, same fault-injected fabric — a dropped push is a dropped
+    /// input frame, as it would be on real hardware.
+    fn devicePush(self: *Machine, due: u64, coord: u16) !void {
         const ep = self.devices.getPtr(coord) orelse return;
-        const pad = switch (ep.dev) {
-            .pad => |*p| p,
-            else => return,
-        };
-        if (pad.index >= pad.trace.len) return; // the trace is spent
-        const buttons = pad.trace[pad.index];
-        pad.index += 1;
-        pad.pushed += 1;
-        var data: [16]u8 = undefined;
-        std.mem.writeInt(u64, data[0..8], pad.tag, .little);
-        std.mem.writeInt(u64, data[8..16], buttons, .little);
-        var r = dev.Reply{ .window = pad.window };
-        r.data.appendSlice(&data) catch return;
-        try self.deviceReply(ep, due, r);
-        if (pad.index < pad.trace.len)
-            try self.events.add(.{ .due = due + pad.interval, .seq = self.nextSeq(), .kind = .{ .pad = .{ .coord = coord } } });
+        if (ep.iface.vt.push == null) return;
+        const out = ep.iface.push() orelse return; // the stream is spent
+        try self.deviceReply(ep, due, out.reply);
+        if (out.again > 0)
+            try self.events.add(.{ .due = due + out.again, .seq = self.nextSeq(), .kind = .{ .push = .{ .coord = coord } } });
     }
 
     /// Fire a device reply through the device's PTT: same capability
@@ -1554,8 +1380,8 @@ pub const Machine = struct {
             .deliver => |gram| try self.deliver(ev.due, gram),
             .ack => |a| try self.completeSend(a.send_id, a.status, a.byte_count),
             .timeout => |t| try self.completeSend(t.send_id, .timeout, 0),
-            .accel => |a| try self.accelComplete(ev.due, a.id),
-            .pad => |pd| try self.padPush(ev.due, pd.coord),
+            .complete => |c| try self.deviceComplete(ev.due, c.coord),
+            .push => |pd| try self.devicePush(ev.due, pd.coord),
         }
     }
 

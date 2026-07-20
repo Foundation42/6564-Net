@@ -1823,3 +1823,41 @@ bird is mortal, so lapping the field would need a full TAS solve of a
 90-frame varied-gap run, not a hover. The *field* still recycles — that is
 the `where` unit test's job (a wrap `→ 830`), and it stands. Frozen table
 unmoved (this increment is joey.joe only). 158 tests.
+
+## Device extraction — the peripheral row behind one vtable
+
+The row grew citizen by citizen (console, then entropy/rtc/block, then net,
+then the matmul accelerator, the display, the pad), and each arrived where it
+was easiest to bolt on: sinks and askers as a `dev.Device` **union** the
+machine switched over, the accelerator and display as a separate `Accel`
+**struct** in a second registry with their own delivery and completion paths,
+the pad as the union again but with a bespoke push path threaded through the
+machine. Three attach shapes, two registries, five attach entry points, and
+every device's behaviour living *inside* machine.zig, switched on kind.
+
+This increment collapses all of it to **one interface**. `dev.Device` is now
+a vtable — `{ptr, vt}`, the `std.mem.Allocator` idiom — with `handle` and the
+two optional shapes the row actually has: `complete` (a grant device is
+handed a mutable byte view of its granted region and does its arithmetic
+there) and `push` (a pushing device streams). The machine keeps one
+`devices` map, one `deliverToDevice`, one completion fence, one push tick; it
+never learns a device's type. The matmul and display moved *out* of
+machine.zig and onto the row as ordinary device structs; the pad's
+subscription and the accelerator's grant became two return values from
+`handle`, not two code paths in the core. `attachDevice` is generic over any
+device value — box it, record a destructor, keep the interface — so an
+external device (a real renderer) attaches with **zero** machine or union
+edits. This is §7.5's polyfill principle made structural: the machine can no
+longer special-case a device because there is nowhere left to do it.
+
+The proof is that nothing moved. The reference machine's crown jewel is
+bit-identical replay, and the refactor is behaviour-preserving to the bit:
+the joey golden is unchanged (58 frames, 5 points, 8 tones, `cause = 2`,
+30 pad pushes), the matmul twins still agree to the bit (in-proc `pulls = 0`,
+remote `pulls > 0`), web still fetches its 869 bytes, and the frozen baseline
+table is unmoved. The one care taken was `nextSeq()` ordering — a submit
+schedules its completion *before* the ack (the grant is the fence), a
+subscription starts its stream *after* it (the pad's original order) — because
+the event-queue tie-break is load-bearing and a reorder there would diverge a
+replay. **158 tests, green.** machine.zig: −150 net lines, two registries
+gone; the row is now open for the device that renders joey-bird for real.

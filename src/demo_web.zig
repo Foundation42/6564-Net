@@ -45,9 +45,9 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
     });
     defer m.deinit();
 
-    try m.attachDevice(console_coord, 0x6564, .{ .console = dev.Console.init(alloc) });
-    if (opts.echo) m.device(console_coord).?.console.echo = true;
-    try m.attachDevice(net_coord, 0x6564, .{ .net = dev.Net.init(alloc) });
+    try m.attachDevice(console_coord, 0x6564, dev.Console.init(alloc));
+    if (opts.echo) m.deviceAs(console_coord, dev.Console).?.echo = true;
+    try m.attachDevice(net_coord, 0x6564, dev.Net.init(alloc));
 
     for ([_]struct { slot: u16, coord: u16 }{
         .{ .slot = 0, .coord = console_coord },
@@ -131,7 +131,7 @@ pub fn simulate(alloc: std.mem.Allocator, opts: Options) !Outcome {
 
     return .{
         .reason = reason,
-        .text = try alloc.dupe(u8, m.device(console_coord).?.console.out.items),
+        .text = try alloc.dupe(u8, m.deviceAs(console_coord, dev.Console).?.out.items),
         .cycles = m.cores[0].clock,
         .stats = m.stats,
     };

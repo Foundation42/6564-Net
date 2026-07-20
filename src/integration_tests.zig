@@ -1430,7 +1430,7 @@ test "A4 movement 1: the RBC rejects a lying dialect claim, compiler or no compi
             .ram_size = 0x8000,
         });
         defer m.deinit();
-        try m.attachDevice(0xFF00, 0, .{ .console = @import("dev.zig").Console.init(testing.allocator) });
+        try m.attachDevice(0xFF00, 0, @import("dev.zig").Console.init(testing.allocator));
         m.setPtt(0, 0, .{
             .prefix_hi = 0xfd65_6400_0000_0000,
             .prefix_lo = ring.PttEntry.loFrom(0xFF00, 0, 0),
@@ -1469,11 +1469,11 @@ test "A4 movement 1: the RBC rejects a lying dialect claim, compiler or no compi
             // The claim says msg, the endpoint IS raw: rejected, and the
             // console never heard a byte.
             try testing.expectEqual(ring.Status.reject_capability, status);
-            try testing.expectEqual(@as(usize, 0), m.device(0xFF00).?.console.out.items.len);
+            try testing.expectEqual(@as(usize, 0), m.deviceAs(0xFF00, @import("dev.zig").Console).?.out.items.len);
         } else {
             // Same program, honest endpoint: through it goes.
             try testing.expectEqual(ring.Status.ok, status);
-            try testing.expectEqual(@as(usize, 8), m.device(0xFF00).?.console.out.items.len);
+            try testing.expectEqual(@as(usize, 8), m.deviceAs(0xFF00, @import("dev.zig").Console).?.out.items.len);
         }
     }
 }
@@ -2577,14 +2577,14 @@ pub const matmul_asm =
     \\        HLT
 ;
 
-fn accelMachine(kind: anytype, revoke_line: []const u8) !Machine {
+fn accelMachine(remote: bool, revoke_line: []const u8) !Machine {
     var m = try Machine.init(testing.allocator, .{
         .cores = 1,
         .contexts_per_core = 1,
         .link = .{ .loss_ppm4k = 0, .dup_ppm4k = 0 },
     });
     errdefer m.deinit();
-    try m.attachAccel(0xFF05, 0xACCE, kind);
+    try m.attachDevice(0xFF05, 0xACCE, @import("dev.zig").Matmul{ .remote = remote });
     m.setPtt(0, 3, .{
         .prefix_hi = 0xfd65_6400_0000_0000,
         .prefix_lo = ring.PttEntry.loFrom(0xFF05, 0, 0),
@@ -2643,8 +2643,8 @@ fn matmulMirror() [16]f64 {
 test "item 6: the matmul completes through a granted region — both siliconsindistinguishable" {
     const mirror = matmulMirror();
     var pulls: [2]u64 = undefined;
-    inline for (.{ .inproc, .remote }, 0..) |kind, ki| {
-        var m = try accelMachine(kind, "");
+    inline for (.{ false, true }, 0..) |remote, ki| {
+        var m = try accelMachine(remote, "");
         defer m.deinit();
         const ctx = &m.cores[0].contexts[0];
         try testing.expectEqual(machine.CtxState.halted, ctx.state);
@@ -2670,7 +2670,7 @@ test "item 6: revocation between grant and completion — reject, never a scribb
     // The transport ack IS the acceptance: wait for it (tag 2), then
     // kill the token while the remote implementation is still pulling.
     // Its late DMA re-checks the live descriptor and reject-completes.
-    var m = try accelMachine(.remote,
+    var m = try accelMachine(true,
         \\wack:   LSTN 1
         \\        CQPOP 1
         \\        BEQ wack
@@ -2700,7 +2700,7 @@ test "item 6: saturation is backpressure — a busy accelerator rejects, corrupt
     // Two asks back-to-back at a depth-one unit (the remote polyfill,
     // whose long flight guarantees the overlap): the second is
     // reject-completed at the sender, the first completes exactly.
-    var m = try accelMachine(.remote,
+    var m = try accelMachine(true,
         \\        LDA #1
         \\        STA !$2400
         \\        LDA ##$FF00030000000000
@@ -4088,7 +4088,7 @@ test "a device demands its token like any ring: wrong token, reject_capability" 
         .max_cycles = 100_000,
     });
     defer m.deinit();
-    try m.attachDevice(0xFF00, 0x6564, .{ .console = dev6564.Console.init(testing.allocator) });
+    try m.attachDevice(0xFF00, 0x6564, dev6564.Console.init(testing.allocator));
     m.setPtt(0, 0, .{
         .prefix_lo = ring.PttEntry.loFrom(0xFF00, 0, 0),
         .rights = .{ .send = true },
@@ -4126,7 +4126,7 @@ test "a device demands its token like any ring: wrong token, reject_capability" 
         (word0 >> 8) & 0xFF,
     );
     // Nothing reached the device.
-    try testing.expectEqual(@as(usize, 0), m.device(0xFF00).?.console.out.items.len);
+    try testing.expectEqual(@as(usize, 0), m.deviceAs(0xFF00, dev6564.Console).?.out.items.len);
     try testing.expectEqual(@as(u64, 0), m.stats.dev_deliveries);
 }
 

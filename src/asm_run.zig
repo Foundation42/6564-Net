@@ -380,13 +380,13 @@ pub fn simulateSystem(
 
     for (devices.items) |*d| {
         switch (d.coord) {
-            0xFF00 => try m.attachDevice(d.coord, token, .{ .console = dev.Console.init(alloc) }),
-            0xFF01 => try m.attachDevice(d.coord, token, .{ .entropy = dev.Entropy.init(opts.seed ^ 0xE47) }),
-            0xFF02 => try m.attachDevice(d.coord, 0, .{ .rtc = .{} }),
-            0xFF03 => try m.attachDevice(d.coord, token, .{ .block = try dev.Block.init(alloc, 8, 64) }),
-            0xFF04 => try m.attachDevice(d.coord, token, .{ .net = dev.Net.init(alloc) }),
-            0xFF05 => try m.attachAccel(d.coord, token, .inproc),
-            0xFF06 => try m.attachAccel(d.coord, token, .remote),
+            0xFF00 => try m.attachDevice(d.coord, token, dev.Console.init(alloc)),
+            0xFF01 => try m.attachDevice(d.coord, token, dev.Entropy.init(opts.seed ^ 0xE47)),
+            0xFF02 => try m.attachDevice(d.coord, 0, dev.Rtc{}),
+            0xFF03 => try m.attachDevice(d.coord, token, try dev.Block.init(alloc, 8, 64)),
+            0xFF04 => try m.attachDevice(d.coord, token, dev.Net.init(alloc)),
+            0xFF05 => try m.attachDevice(d.coord, token, dev.Matmul{ .remote = false }),
+            0xFF06 => try m.attachDevice(d.coord, token, dev.Matmul{ .remote = true }),
             else => unreachable,
         }
     }
@@ -755,7 +755,7 @@ pub fn simulateSystem(
     var console: ?[]u8 = null;
     for (devices.items) |*d| {
         if (d.coord == 0xFF00) {
-            console = try alloc.dupe(u8, m.device(d.coord).?.console.out.items);
+            console = try alloc.dupe(u8, m.deviceAs(d.coord, dev.Console).?.out.items);
             break;
         }
     }

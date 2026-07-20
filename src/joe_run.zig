@@ -447,17 +447,17 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
 
     for (devices.items) |*d| {
         switch (d.coord) {
-            0xFF00 => try m.attachDevice(d.coord, d.token, .{ .console = dev.Console.init(alloc) }),
-            0xFF01 => try m.attachDevice(d.coord, d.token, .{ .entropy = dev.Entropy.init(opts.seed ^ 0xE47) }),
-            0xFF02 => try m.attachDevice(d.coord, d.token, .{ .rtc = .{} }),
+            0xFF00 => try m.attachDevice(d.coord, d.token, dev.Console.init(alloc)),
+            0xFF01 => try m.attachDevice(d.coord, d.token, dev.Entropy.init(opts.seed ^ 0xE47)),
+            0xFF02 => try m.attachDevice(d.coord, d.token, dev.Rtc{}),
             // A sector must come home behind the echoed tag: 8 + 48 fits
             // joe's 64-byte landing buffer, 8 + 64 would not.
-            0xFF03 => try m.attachDevice(d.coord, d.token, .{ .block = try dev.Block.init(alloc, 8, 48) }),
-            0xFF04 => try m.attachDevice(d.coord, d.token, .{ .net = dev.Net.init(alloc) }),
-            0xFF05 => try m.attachAccel(d.coord, d.token, .inproc),
-            0xFF06 => try m.attachAccel(d.coord, d.token, .remote),
-            0xFF07 => try m.attachDisplay(d.coord, d.token, display_period),
-            0xFF08 => try m.attachDevice(d.coord, d.token, .{ .apu = .{} }),
+            0xFF03 => try m.attachDevice(d.coord, d.token, try dev.Block.init(alloc, 8, 48)),
+            0xFF04 => try m.attachDevice(d.coord, d.token, dev.Net.init(alloc)),
+            0xFF05 => try m.attachDevice(d.coord, d.token, dev.Matmul{ .remote = false }),
+            0xFF06 => try m.attachDevice(d.coord, d.token, dev.Matmul{ .remote = true }),
+            0xFF07 => try m.attachDevice(d.coord, d.token, dev.Display{ .period = display_period }),
+            0xFF08 => try m.attachDevice(d.coord, d.token, dev.Apu{}),
             0xFF09 => try m.attachPad(d.coord, d.token, opts.pad_trace, pad_interval),
             else => unreachable,
         }
@@ -683,19 +683,25 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     var apu_sum: u64 = 0;
     var pad_pushed: u64 = 0;
     for (devices.items) |*d| {
-        if (m.device(d.coord)) |dv| switch (dv.*) {
-            .console => |*c| console = try alloc.dupe(u8, c.out.items),
-            .apu => |*a| {
+        // Read device state back through its concrete type — the row's
+        // coord→type map is fixed, so the caller names what it attached.
+        switch (d.coord) {
+            0xFF00 => if (m.deviceAs(d.coord, dev.Console)) |c| {
+                console = try alloc.dupe(u8, c.out.items);
+            },
+            0xFF07 => if (m.deviceAs(d.coord, dev.Display)) |disp| {
+                display_frames = disp.frames;
+                display_checksum = disp.checksum;
+            },
+            0xFF08 => if (m.deviceAs(d.coord, dev.Apu)) |a| {
                 apu_tones = a.tones;
                 apu_last = a.last;
                 apu_sum = a.sum;
             },
-            .pad => |*pd| pad_pushed = pd.pushed,
+            0xFF09 => if (m.deviceAs(d.coord, dev.Pad)) |pd| {
+                pad_pushed = pd.pushed;
+            },
             else => {},
-        };
-        if (m.displayStats(d.coord)) |ds| {
-            display_frames = ds.frames;
-            display_checksum = ds.checksum;
         }
     }
     return .{

@@ -107,12 +107,12 @@ pub const Event = struct {
         ack: struct { send_id: u64, status: ring.Status, byte_count: u32 },
         /// Sender-side timeout check for a send that may have died en route.
         timeout: struct { send_id: u64 },
-        /// An accelerator finishes a granted job (machine-side table
-        /// holds the job; the event carries only its id).
-        accel: struct { id: u64 },
-        /// A pad pushes its next input frame (the device at `coord` holds
-        /// the trace and cursor; the event only says whose turn it is).
-        pad: struct { coord: u16 },
+        /// A grant device's completion fence fires (§7.6–7.7): the device at
+        /// `coord` holds the in-flight job; the event only says whose fence.
+        complete: struct { coord: u16 },
+        /// A pushing device streams its next frame (the device at `coord`
+        /// holds the cursor; the event only says whose turn it is).
+        push: struct { coord: u16 },
     };
 
     pub fn order(_: void, a: Event, b: Event) std.math.Order {
