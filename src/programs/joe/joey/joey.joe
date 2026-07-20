@@ -64,13 +64,19 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
             flap_held = buttons
             y = y + vy
 
-            // the world update, Roc's four loops as three vector lines:
+            // the world update, Roc's four loops as four vector lines:
             // move every pipe one step, mask the ones now at the player
-            // (x = 20), and sum the mask — the score is a popcount.
+            // (x = 20) and sum the mask — the score is a popcount — then
+            // recycle: the same 1.0/0.0 mask wraps any pipe that has run
+            // off the left edge back to the right, +160 (eight lanes × 20
+            // spacing), so the phase survives and the pipes are endless.
+            // `where` is a blend, not a VSEL — the mask that counts (VRADD)
+            // now also chooses, and the $?7 column stays spent whole.
             pipe_x = pipe_x - 2.0
             passed = pipe_x == 20.0
             let gained = int(passed.reduce(+))
             score += gained
+            pipe_x = where(pipe_x <= 0.0, pipe_x + 160.0, pipe_x)
             if gained > 0 {
                 send apu, Tone{2}             // POINT_TONE
             }

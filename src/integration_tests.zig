@@ -969,6 +969,45 @@ test "Tier 1 vectors: a lanewise compare masks, and the mask counts (VFCMP)" {
     try testing.expectEqual(@as(u64, 3), o.varOf("c", "ge").?);
 }
 
+test "Tier 1 vectors: `where` is lanewise select — the mask that counts now chooses" {
+    // VSEL never landed: the $?7 vector column is spent whole (VFCMP took
+    // the last slot). It didn't need to. `where(cond, a, b)` lowers to the
+    // 1.0/0.0 mask VFCMP already makes and a blend `b + mask·(a − b)` — the
+    // same mask surface that popcounts (VRADD) now also selects. Two proofs:
+    // (1) the pipe-recycle wrap — take `xs + 160` where a lane has run off
+    // the left edge (xs <= 0), else keep it; and (2) a select between two
+    // INDEPENDENT vectors, proving it is a true choose, not a masked add.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\actor Chooser() {
+        \\    var xs vec
+        \\    var wrapped vec
+        \\    var flags vec
+        \\    var hi vec
+        \\    var lo vec
+        \\    var picked vec
+        \\    var wsum u64 = 0
+        \\    var psum u64 = 0
+        \\    // recycle: two lanes at 0.0 wrap by +160, the six others hold.
+        \\    xs = [40.0, 20.0, 0.0, 80.0, 200.0, 0.0, 10.0, 160.0]
+        \\    wrapped = where(xs <= 0.0, xs + 160.0, xs)
+        \\    // [40, 20, 160, 80, 200, 160, 10, 160] = 830
+        \\    wsum = int(wrapped.reduce(+))
+        \\    // select between two whole vectors: even lanes take hi, odd lo.
+        \\    flags = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+        \\    hi = [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+        \\    lo = [7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0]
+        \\    picked = where(flags >= 0.5, hi, lo)
+        \\    // [100, 7, 100, 7, 100, 7, 100, 7] = 428
+        \\    psum = int(picked.reduce(+))
+        \\    halt ok
+        \\}
+        \\system { c = Chooser() on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 830), o.varOf("c", "wsum").?);
+    try testing.expectEqual(@as(u64, 428), o.varOf("c", "psum").?);
+}
+
 test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     // The bird, in the flesh, on the device row it was written against.
     // The display is the frame clock (each `Present` waits on the last
@@ -1005,6 +1044,29 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
         o.varOf("game", "score").?,
         o.varOf("ref", "final_score").?,
     );
+}
+
+test "joey-bird: the pipes are endless — a longer-lived bird laps the field (where)" {
+    // With the old eight fixed pipes the score capped at eight: each pipe
+    // crossed the player once and was gone. `where` recycles a pipe off the
+    // left edge back to the right (+160, phase-preserving), so a bird kept
+    // aloft long enough laps the field and scores again. This trace flaps
+    // roughly every sixteen frames — enough upward drift to stay off the
+    // floor for the whole recording (there is no ceiling to die against) —
+    // and the score climbs past eight, which only recycling can produce.
+    // Observed: she survives 196 of the 208 recorded frames and scores 19,
+    // where the old fixed field capped at eight. The assertion stays an
+    // inequality — it is recycling that is under test, not the physics.
+    var trace: [208]u64 = .{0} ** 208;
+    var i: usize = 0;
+    while (i < trace.len) : (i += 16) trace[i] = 1;
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        @embedFile("programs/joe/joey/joey.joe"),
+        .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },
+    );
+    defer o.deinit();
+    // Past the eight-pipe cap: the field wrapped and scored a second time.
+    try testing.expect(o.varOf("game", "score").? > 8);
 }
 
 test "A4.9 capability-passing spawn: the Cabinet spawns the bird, lending the device row" {

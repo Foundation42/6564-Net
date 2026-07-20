@@ -274,6 +274,13 @@ const Expr = union(enum) {
     permute: struct { base: *Expr, mask: u64 },
     /// `f64(e)` / `int(e)` — the explicit conversions (ITOF / FTOI).
     cast: struct { to_f64: bool, e: *Expr },
+    /// `where(cond, a, b)` — lanewise select. Each lane takes a's value
+    /// where cond's mask is nonzero, else b's. Lowered to VFCMP's 1.0/0.0
+    /// mask and a blend `b + mask·(a − b)` — no dedicated VSEL, because the
+    /// $?7 vector column is spent whole and the mask that counts (VRADD)
+    /// now also chooses. Exact whenever a−b is representable, which
+    /// integer-valued lanes (pipe coordinates) always are.
+    select: struct { cond: *Expr, a: *Expr, b: *Expr },
     /// `grant frame` as a send argument (item 6): stages the region's
     /// descriptor slot and token, and flips the compile-time type-state.
     grantref: []const u8,
@@ -1550,6 +1557,19 @@ const Parser = struct {
                 const name = self.tok.text;
                 try self.advance();
                 if (self.tok.kind == .lparen) {
+                    // `where(cond, a, b)` — lanewise select. The mask
+                    // surface's second use: the 1.0/0.0 mask that counts
+                    // (VRADD) now chooses (a blend, no VSEL).
+                    if (std.mem.eql(u8, name, "where")) {
+                        try self.advance(); // (
+                        const cond = try self.parseExpr();
+                        _ = try self.expect(.comma, ",");
+                        const a = try self.parseExpr();
+                        _ = try self.expect(.comma, ",");
+                        const b = try self.parseExpr();
+                        _ = try self.expect(.rparen, ")");
+                        return self.mkExpr(.{ .select = .{ .cond = cond, .a = a, .b = b } });
+                    }
                     // `f64(e)` / `int(e)` — the explicit conversions
                     if (std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "int")) {
                         try self.advance();
@@ -2508,6 +2528,7 @@ const Gen = struct {
             .float => return .f64_,
             .vlit, .permute => return .vec_,
             .reduce => return .f64_,
+            .select => |s| return self.exprType(s.a),
             .cast => |c| return if (c.to_f64) .f64_ else .u64_,
             .count, .grantref, .paylen => return .u64_,
             .index => |ix| {
@@ -2667,6 +2688,21 @@ const Gen = struct {
                 // predicate last so VFCMP reads it, not the operand.
                 if (pred) |p| try self.w("        LDA #{d}", .{p});
                 try self.w("        {s} {d}, {d}", .{ mn, d, d + 1 });
+            },
+            .select => |s| {
+                // Lanewise select as a blend: r = b + mask·(a − b). cond is
+                // a comparison, so its lanes are 1.0 (take a) or 0.0 (take
+                // b) — no VSEL, the mask that counts now chooses. a, b and
+                // the mask hold in V[d], V[d+1], V[d+2] (evaluated low-to-
+                // high so each survives the next); the blend is three ops.
+                if (d > 4)
+                    return self.fail(0, "where() nests too deep for the vector file (v1)", Error.Unsupported);
+                try self.vecEvalInto(s.a, d); // V[d]   ⟵ a
+                try self.vecEvalInto(s.b, d + 1); // V[d+1] ⟵ b
+                try self.vecEvalInto(s.cond, d + 2); // V[d+2] ⟵ mask
+                try self.w("        VFSUB {d}, {d}", .{ d, d + 1 }); // a − b
+                try self.w("        VFMUL {d}, {d}", .{ d, d + 2 }); // · mask
+                try self.w("        VFADD {d}, {d}", .{ d, d + 1 }); // + b
             },
             else => return self.fail(0, "not a vector expression", Error.Semantics),
         }
@@ -2828,7 +2864,7 @@ const Gen = struct {
                     .min => "VRMIN",
                 }});
             },
-            .vlit, .permute => return self.fail(0, "a vector value needs a vec home", Error.Semantics),
+            .vlit, .permute, .select => return self.fail(0, "a vector value needs a vec home", Error.Semantics),
             .grantref => return self.fail(0, "`grant` rides inside a send's braces", Error.Semantics),
             .field => |f| {
                 if (self.recordSlot(f.base, f.name)) |slot| {

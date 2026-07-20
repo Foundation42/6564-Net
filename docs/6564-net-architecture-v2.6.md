@@ -842,6 +842,19 @@ first workload" — the SoA pipes (§10), where eight obstacles are one
 vector, moved with a lanewise subtract and scored with a lanewise
 compare summed to a count.
 
+**No `VSEL` — the column stays spent whole.** `VFCMP` took the last
+slot, so a lanewise *select* has no seat at the vector table. It does
+not need one. The `1.0`/`0.0` mask that counts also **chooses**:
+`where(cond, a, b)` is the blend `b + mask·(a − b)`, three lanewise ops
+(`VFSUB/VFMUL/VFADD`) over a mask that is exactly 1.0 or 0.0, so each
+lane takes `a` or `b` intact — exact whenever `a − b` is representable,
+which integer-valued lanes always are. joe compiles the `where` builtin
+to precisely this (§ the joe amendment), and the SoA pipes use it to
+recycle an obstacle that has run off the left edge back to the right,
+endlessly, with no new silicon. The mask surface pays rent twice — once
+to count, once to select — and the sixteen-slot `$?7` column is
+complete: the same discipline as the base page's spent columns, held.
+
 ### 8.2 MAC — Adopted as Optional, with Its Numbers (v2.6)
 
 The `$?F` column's one-byte vectored calls (`MAC n` = JSR through the

@@ -1681,3 +1681,51 @@ because respawn wants a lanewise select (`VSEL`, the mask surface's
 *second* half) to reset off-screen lanes. Both are lanewise vector work
 on the same footing this laid; neither is a gap in the machine or the
 language's shape, only surface still to spend.
+
+## Endless pipes — `where` is a select, and `VSEL` never had to land (2026-07-20)
+
+The last entry said respawn wanted `VSEL`. It didn't. The `$?7` vector
+column was **spent whole** — `VFCMP` took the sixteenth slot — so a
+lanewise select had no seat at the table, and it turned out not to need
+one. The `1.0`/`0.0` mask that `VRADD` counts also **chooses**:
+`where(cond, a, b)` is the blend `b + mask·(a − b)`, three lanewise ops
+(`VFSUB/VFMUL/VFADD`) over a mask that is exactly 1.0 or 0.0, so each
+lane takes `a` or `b` *intact*. Exact whenever `a − b` is representable —
+integer-valued pipe coordinates always are. The mask surface pays rent
+twice: once to count (the score), once to select (the respawn). No new
+silicon; the column stays complete.
+
+In joe, `where` is one `Expr` variant, one parser arm (a soft keyword
+beside `f64`/`int`), one `exprType`, and one `vecEvalInto` case that
+evaluates `a`, `b`, mask into `V[d..d+2]` low-to-high so each survives
+the next, then emits the three-op blend. joey-bird's Game grows a fourth
+vector line: `pipe_x = where(pipe_x <= 0.0, pipe_x + 160.0, pipe_x)` —
+a pipe that has run off the left edge wraps back to the right by +160
+(eight lanes × 20 spacing), phase-preserving, so the `== 20.0` scoring
+keeps firing. The field is endless.
+
+| run | frames | score | note |
+|---|---|---|---|
+| golden trace (`sim6564 joey`) | 83 | 8 | unchanged — she dies before the field laps |
+| long trace (208 frames, flap every 16) | 196 | **19** | the field wrapped; the score passed the old eight-cap |
+
+The golden is behavior-preserved to the bit (83 frames, score 8): in an
+83-frame life the eighth pipe crosses the player at frame 80, and the
+floor kills her at 83 before any pipe completes a second lap — the
+recycle *runs* but does not yet show. Kept aloft to 196 frames she laps
+the field and scores 19, which only recycling can produce; the test
+asserts `> 8` (recycling is under test, not the physics). A unit test
+pins `where` directly: a wrap `[40,20,0,80,200,0,10,160] → 830` and a
+select between two whole vectors `→ 428`. Frozen table unmoved — a joe
+builtin that lowers to existing ops touches no program that does not
+write it. 157 tests.
+
+**What is still a stub, honestly.** Collision — the pixel-peek — is the
+one brick left before joey is a game you can lose: a byte-region
+framebuffer (`u8` regions, the surface `v1` regions do not yet have),
+the world drawn into it, and the bird reading back the pixel under her
+own position. That is the next increment. Double buffering waits for a
+real external display to make its latency-hiding observable — in the
+current discrete sim, region type-state already forbids tearing, so it
+is plumbing whose benefit switches on with the device-extraction work,
+not before.

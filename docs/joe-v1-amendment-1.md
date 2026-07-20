@@ -58,6 +58,7 @@ v = [1.0, 2.0, 3.0, 4.0]      // vector literal
 w = v * 2.0                    // element-wise, scalar broadcast
 z = v + w                      // element-wise add
 m = v > 3.0                    // compare → mask vector
+p = where(v > 3.0, v, w)       // lanewise select: v where the mask holds, else w
 
 sum = v.reduce(+)              // reduction tree
 top = v.reduce(max)
@@ -95,6 +96,7 @@ vexpr     := "[" expr ("," expr)* "]"                    // vector literal
            | expr "." "reduce" "(" rop ")"
            | expr "." "map" "(" purefn ")"
            | expr "." "permute" "(" vexpr ")"
+           | "where" "(" expr "," expr "," expr ")"        // lanewise select (mask, a, b)
            | "gather" "(" expr "," vexpr ")"
 scatterst := "scatter" "(" expr "," vexpr "," expr ")"
 vop       := "+" | "-" | "*" | "/" | "==" | "<" | ">" | "&" | "|" | "^"
@@ -109,6 +111,7 @@ rop       := "+" | "*" | "min" | "max" | "&" | "|" | "^"
 | self-send loop | `SEND` to own PTT slot; one park per slice; watchdog-friendly by construction |
 | vector literal / element-wise op | Tier-1 vector unit ops (extended page), worst-case cycles in ISA table |
 | `reduce` | in-core reduction tree, O(log n) |
+| `where(cond, a, b)` | `VFCMP` mask + blend `b + mask·(a − b)` (`VFSUB/VFMUL/VFADD`) — no `VSEL`, the mask that counts chooses; exact when `a − b` is representable |
 | `map(purefn)` | SIMD if lanes fit, else unrolled scalar — never fork, never peripheral |
 | `gather` / `scatter` | region-typed indexed load/store |
 | handler bound check | compile-time cycle sum vs base budget; `bounded N` mandatory iff exceeded, rejected if `N` < computed bound |
