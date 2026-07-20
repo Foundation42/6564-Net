@@ -944,6 +944,31 @@ test "device row: the pad pushes, the actor latches — input as a subscription"
     try testing.expectEqual(@as(u64, 6), o.varOf("g", "latched").?);
 }
 
+test "Tier 1 vectors: a lanewise compare masks, and the mask counts (VFCMP)" {
+    // The deferred mask surface (A1.4 left it for "its first workload" —
+    // the SoA pipes). `xs == 20.0` sets a 1.0/0.0 lane mask, `.reduce(+)`
+    // sums it, `int(...)` is the popcount; every predicate rides one op
+    // with the comparison in A. Four lanes equal 20; three are >= 25.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\actor Counter() {
+        \\    var xs vec
+        \\    var m vec
+        \\    var eq u64 = 0
+        \\    var ge u64 = 0
+        \\    xs = [10.0, 20.0, 20.0, 30.0, 20.0, 40.0, 20.0, 50.0]
+        \\    m = xs == 20.0
+        \\    eq = int(m.reduce(+))
+        \\    m = xs >= 25.0
+        \\    ge = int(m.reduce(+))
+        \\    halt ok
+        \\}
+        \\system { c = Counter() on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 4), o.varOf("c", "eq").?);
+    try testing.expectEqual(@as(u64, 3), o.varOf("c", "ge").?);
+}
+
 test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     // The bird, in the flesh, on the device row it was written against.
     // The display is the frame clock (each `Present` waits on the last
@@ -963,14 +988,15 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     // (the display counted them), played tones (flaps and the death), and
     // died on the floor — the referee heard the final score exactly once.
     // Golden values: the run is deterministic, so these are exact. Input
-    // is what kept the bird alive — with these seven flaps it survived 84
-    // frames and scored 10; the no-input run (the CLI default) falls in 40
-    // and scores 5. Eighteen tones = 7 flaps + 10 points + 1 death.
-    try testing.expectEqual(@as(u64, 84), o.varOf("game", "t").?);
-    try testing.expectEqual(@as(u64, 84), o.display_frames);
+    // is what kept the bird alive — with these seven flaps it survived 83
+    // frames and passed 8 pipes; the no-input run (the CLI default) falls
+    // in 40 and passes 4. Sixteen tones = 7 flaps + 8 points + 1 death.
+    // The score is now the SoA-vector popcount, one point per pipe crossed.
+    try testing.expectEqual(@as(u64, 83), o.varOf("game", "t").?);
+    try testing.expectEqual(@as(u64, 83), o.display_frames);
     try testing.expectEqual(@as(u64, 7), o.varOf("game", "flaps").?);
-    try testing.expectEqual(@as(u64, 10), o.varOf("game", "score").?);
-    try testing.expectEqual(@as(u64, 18), o.apu_tones);
+    try testing.expectEqual(@as(u64, 8), o.varOf("game", "score").?);
+    try testing.expectEqual(@as(u64, 16), o.apu_tones);
     try testing.expectEqual(@as(u64, 30), o.pad_pushed);
     // The bird hit the floor and told the referee, exactly once.
     try testing.expectEqual(@as(u64, 1), o.varOf("ref", "overs").?);

@@ -167,6 +167,10 @@ pub const Mnemonic = enum {
     vrmax, // VRMAX n — A ⟵ lanewise max, lane 0 bias on ties, NaN propagates
     vrmin,
     vperm, // VPERM d, s — V[d].lane[i] ⟵ V[s].lane[A.byte[i] & 7]
+    vfcmp, // VFCMP d, s — lanewise f64 compare (predicate in A: 0 eq, 1 ne,
+    //   2 lt, 3 le, 4 gt, 5 ge); V[d].lane ⟵ 1.0 if it holds else 0.0. The
+    //   1.0/0.0 mask counts by VRADD — the deferred mask surface, arriving
+    //   with its first workload (the SoA pipes).
     // One-byte vectored calls through the per-context MACTAB (near page
     // $F80–$FFF). Semantics are exactly JSR [MACTAB + n*8]; the slot index
     // is the opcode's high nibble. Pre-normative — see the MAC & chains
@@ -393,7 +397,7 @@ pub const xtable = [_]Encoding{
     x(.vand, .desc, 0x87, 3),   x(.vora, .desc, 0x97, 3),
     x(.veor, .desc, 0xA7, 3),   x(.vradd, .desc, 0xB7, 8),
     x(.vrmax, .desc, 0xC7, 8),  x(.vrmin, .desc, 0xD7, 8),
-    x(.vperm, .desc, 0xE7, 3),
+    x(.vperm, .desc, 0xE7, 3),  x(.vfcmp, .desc, 0xF7, 6),
 };
 
 /// Near-page base of the 16-slot macro vector table (MACTAB).

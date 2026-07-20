@@ -1636,3 +1636,48 @@ convention — "must run before drawing the player" — is a region type-state
 the compiler enforces. What is left is not machine or language: it is the
 bird's own richness — the SoA-vector pipes, the sprite pages, the byte
 framebuffer — a program to write on a foundation that is finished.
+
+## The SoA-vector pipes: the bird scores by a lanewise compare
+
+The mask surface A1.4 deferred, arriving with the workload it was left
+for. The sketch (§6.1) called the pipes "the item-5 workload in
+miniature": Roc's `List(Pipe)` with its update loop, append and bounds
+filter becomes eight lanes of one vector, moved with a lanewise subtract
+and scored with a lanewise compare summed to a count — "a program waiting
+for the syntax." The syntax is now here.
+
+One new opcode: `VFCMP` on the vector column's last free slot (`$F7`), a
+lanewise f64 compare with the predicate in A, writing a `1.0`/`0.0` mask
+per lane. The `1.0`/`0.0` shape means `VRADD` counts it — a popcount for
+free — so `(pipe_x == PLAYER_X).reduce(+)` is the whole scoring
+expression, no dedicated population-count. In joe it rode into
+`vecEvalInto` beside the arithmetic ops (`==`, `>=`, … lower to `VFCMP`
+with the predicate loaded last, after the broadcast clobbers A); nothing
+else moved.
+
+joey-bird's Game now carries `var pipe_x vec` — eight pipes at
+`[40, 60, … 180]` — and each frame runs the world update as three vector
+lines: `pipe_x = pipe_x - 2.0`, `passed = pipe_x == 20.0`,
+`score += int(passed.reduce(+))`. The score is a real popcount of pipes
+crossed, not a survival timer.
+
+| run | frames | flaps | pipes passed (score) |
+|---|---|---|---|
+| no input (`… joey.joe 0`) | 40 | 0 | 4 |
+| with input (`sim6564 joey`) | 83 | 7 | 8 |
+
+Determinism holds to the value — the golden test pins 83 frames, 7 flaps,
+score 8, 16 tones (7 flaps + 8 points + 1 death). A standalone check
+proves the op directly: `[10,20,20,30,20,40,20,50] == 20` counts 4, `>=25`
+counts 3. Frozen table unmoved an eleventh time — a new opcode at an
+unused slot touches nothing that does not reach for it. 155 tests.
+
+**What is still a stub, honestly.** The pipes score but do not yet kill:
+collision is the sketch's pixel-peek against the framebuffer (read your
+own region, world drawn, player not — the ordering the region type-state
+already enforces), and a byte-region framebuffer is the surface that
+does not exist yet. And the pipes are finite — eight, scrolling once —
+because respawn wants a lanewise select (`VSEL`, the mask surface's
+*second* half) to reset off-screen lanes. Both are lanewise vector work
+on the same footing this laid; neither is a gap in the machine or the
+language's shape, only surface still to spend.

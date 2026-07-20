@@ -2149,6 +2149,29 @@ pub const Machine = struct {
                     };
                 }
             },
+            .vfcmp => {
+                // Lanewise f64 compare, predicate in A. Each lane becomes a
+                // 1.0/0.0 mask that VRADD counts — NaN compares false except
+                // `ne`, exactly as IEEE and the scalar FCMP already do.
+                const d = (desc_slot >> 3) & 7;
+                const s = desc_slot & 7;
+                const pred: u3 = @truncate(ctx.a);
+                const vs = core.v[s];
+                for (&core.v[d], vs) |*lane, ms| {
+                    const a: f64 = @bitCast(lane.*);
+                    const m: f64 = @bitCast(ms);
+                    const hit = switch (pred) {
+                        0 => a == m,
+                        1 => a != m,
+                        2 => a < m,
+                        3 => a <= m,
+                        4 => a > m,
+                        5 => a >= m,
+                        else => false,
+                    };
+                    lane.* = @bitCast(@as(f64, if (hit) 1.0 else 0.0));
+                }
+            },
             .vradd => {
                 // The spec'd tree, exactly: ((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7)).
                 // Reduction order is part of the contract (§5's bar says

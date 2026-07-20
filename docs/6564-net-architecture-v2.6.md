@@ -831,6 +831,17 @@ dot product runs **6.4×** the scalar loop, both bit-exact against
 their own declared orders — and honestly different from each other,
 because they *are* different declared orders.
 
+The column's last slot, `$F7`, is **`VFCMP`**: a lanewise f64 compare
+whose predicate rides in A (eq/ne/lt/le/gt/ge), writing a `1.0`/`0.0`
+mask per lane — NaN compares false except `ne`, exactly as the scalar
+`FCMP` dialect and IEEE. The `1.0`/`0.0` shape is deliberate: a mask
+that `VRADD` counts is a popcount, so `(v == x).reduce(+)` is the
+`count_if` a game's scoring loop wants, without a dedicated
+population-count op. This is the mask surface A1.4 deferred "for its
+first workload" — the SoA pipes (§10), where eight obstacles are one
+vector, moved with a lanewise subtract and scored with a lanewise
+compare summed to a count.
+
 ### 8.2 MAC — Adopted as Optional, with Its Numbers (v2.6)
 
 The `$?F` column's one-byte vectored calls (`MAC n` = JSR through the

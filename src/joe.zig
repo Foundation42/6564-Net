@@ -2630,12 +2630,24 @@ const Gen = struct {
                 try self.w("        VPERM {d}, {d}", .{ d, d });
             },
             .bin => |b| {
+                // A comparison lanewise-produces a 1.0/0.0 mask (VFCMP,
+                // predicate in A); `(v == x).reduce(+)` then counts it —
+                // the SoA-pipe scoring, the mask surface's first workload.
+                const pred: ?u8 = switch (b.op) {
+                    .eq => 0,
+                    .ne => 1,
+                    .lt => 2,
+                    .le => 3,
+                    .gt => 4,
+                    .ge => 5,
+                    else => null,
+                };
                 const mn: []const u8 = switch (b.op) {
                     .add => "VFADD",
                     .sub => "VFSUB",
                     .mul => "VFMUL",
                     .div => "VFDIV",
-                    else => return self.fail(0, "vec ops are + - * / (v1; masks ride with their first workload)", Error.Unsupported),
+                    else => if (pred != null) "VFCMP" else return self.fail(0, "vec ops are + - * / and comparisons (v1)", Error.Unsupported),
                 };
                 const lt = self.exprType(b.l);
                 const rt = self.exprType(b.r);
@@ -2651,6 +2663,9 @@ const Gen = struct {
                     try self.w("        VBCA {d}", .{d});
                     try self.vecEvalInto(b.r, d + 1);
                 }
+                // The broadcast above clobbers A with the scalar; load the
+                // predicate last so VFCMP reads it, not the operand.
+                if (pred) |p| try self.w("        LDA #{d}", .{p});
                 try self.w("        {s} {d}, {d}", .{ mn, d, d + 1 });
             },
             else => return self.fail(0, "not a vector expression", Error.Semantics),

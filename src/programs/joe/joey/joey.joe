@@ -32,8 +32,16 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
     var buttons u64 = 0              // the latched pad state
     var flap_held u64 = 1            // swallow the starting press (Roc's last_flap: True)
     var score u64 = 0
-    var since u64 = 0                // frames since the last point
     var flaps u64 = 0
+
+    // The pipes: eight of them, as a single vector — Roc's List(Pipe) as
+    // SoA lanes (sketch §6.1, the item-5 workload in miniature). They
+    // scroll left together, one vector subtract a frame, and a pipe scores
+    // when its x reaches the player: a lanewise compare to a mask, summed.
+    var pipe_x vec                   // the eight pipe positions
+    var passed vec                   // 1.0 in each lane that just crossed
+
+    pipe_x = [40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]
 
     send pad, Poll{}                          // subscribe to input
     send display, Present{grant frame}        // the clock starts here
@@ -56,11 +64,14 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
             flap_held = buttons
             y = y + vy
 
-            // survive to score — a stand-in for passing a pipe.
-            since += 1
-            if since >= 8 {
-                score += 1
-                since = 0
+            // the world update, Roc's four loops as three vector lines:
+            // move every pipe one step, mask the ones now at the player
+            // (x = 20), and sum the mask — the score is a popcount.
+            pipe_x = pipe_x - 2.0
+            passed = pipe_x == 20.0
+            let gained = int(passed.reduce(+))
+            score += gained
+            if gained > 0 {
                 send apu, Tone{2}             // POINT_TONE
             }
 
