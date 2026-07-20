@@ -1367,3 +1367,51 @@ Still open, and the next increment: the *dynamic* spawn — naming a child
 started inside a `serve` handler rather than the actor body — so the
 Cabinet can hand the frame to a screen it starts on a transition, not
 only at boot. Same name, later in time.
+
+## A4.8 — the dynamic spawn: the same name, later in time
+
+A4.7 named children at boot; A4.8 lets a `spawn` live inside a `serve`
+handler, so a transition can start the next screen — the shape rocci's
+Cabinet needs. No new opcode and no machine change: `SPWN` already
+reused a fixed context and bumped its generation on restart. The whole
+increment is in the compiler — a spawn's record index is now fixed by
+statement identity in one canonical walk (body, then handler bodies,
+recursing into nested blocks), so a `SPWN` reached through the case
+ladder reads the slot the loader staged for that exact site, regardless
+of emission order.
+
+| claim | outcome |
+|---|---|
+| a screen spawned mid-`serve` can be named and lent the estate | ✓ Cabinet spawns in a `Kick` handler, grants the frame down, heir reads `6564` |
+| one spawn site, fired twice, reuses one context | ✓ `SPWN` bumps `gen`; near page (and its RX ring) survives |
+| the parent's capability outlives the incarnation bump | ✓ `send screen, Ping` lands on both lives; two Done reports (`cycles=2`) |
+| body-spawn programs are untouched | ✓ supervise.joe byte-identical (crashes=2 hangs=1 lost=2, 5,366 cy) |
+| the frozen ASM baseline is unmoved | ✓ 2820 B / 171,532 instr / 479,275 cy / 13,281 switches, a fifth time |
+
+148 tests.
+
+**Why the index had to change.** When every spawn lived in the body, its
+record slot could be counted in body order, because that was also the
+emission order. A handler spawn breaks the coincidence — the emitter
+reaches handlers through region dispatch, then the case ladder, then the
+timer body, an order no single source walk reproduces. So the slot is
+fixed by the statement's identity (its pointer), assigned once and looked
+up wherever the `SPWN` emits. *When a thing can appear in more than one
+place, stop numbering it by where you happen to find it.*
+
+**Why repeated spawns are safe.** A screen halts synchronously inside its
+own burst, so it is dead before the Cabinet processes the message that
+triggers the next spawn — the successor never restarts a living context.
+And the ready-handshake is per-life, not per-boot: each incarnation
+re-runs init, re-claims its descriptor slots, and re-announces itself,
+because a restart resets the ring's contents while preserving the ring.
+The capability is stable across lives; the estate's landing slot is
+claimed afresh each life. *The house keeps its address while its tenants
+come and go, and every new tenant still has to unpack before you hand
+them the keys.*
+
+With this, the Cabinet is expressible end to end — a boot screen,
+transitions that spawn the next, a frame lent down each life and returned
+by death. rocci-bird is no longer waiting on the language; what it waits
+on now is a device row (display, pad, APU) and the PresentDone frame
+clock — machine work, not language work.

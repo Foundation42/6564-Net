@@ -1776,7 +1776,6 @@ const Gen = struct {
     asks_devices: bool = false,
     timer_period: u64 = 0,
     spawn_count: u16 = 0,
-    spawn_seen: u16 = 0,
 
     /// A1.3 accounting: running cycle total of everything emitted, the
     /// data-dependent flag for the burst in progress, the bursts and
@@ -1806,6 +1805,13 @@ const Gen = struct {
     /// Spawn index (declaration order) → the near slot holding that
     /// child's capability, for the named ones. What the loader stages.
     childcap_of: std.AutoHashMap(u16, u16),
+    /// Every spawn statement in the actor, in canonical (lexical) order —
+    /// the source of truth for spawn_count, record indices and SpawnOut.
+    spawn_list: std.ArrayList(*const Stmt),
+    /// A spawn statement → its record index, so a `SPWN` in a handler
+    /// reads the same record slot the loader staged, regardless of the
+    /// order the emitter happens to reach it (A4.8).
+    spawn_idx: std.AutoHashMap(*const Stmt, u16),
     /// Consts staged so far: name → string label. Lazily registered on
     /// first use, so an unreferenced const costs an actor nothing.
     const_labels: std.StringHashMap(usize),
@@ -2025,9 +2031,13 @@ const Gen = struct {
         }
         // A1.3: the strictest watchdog any spawn site imposes on this
         // actor is the budget its bursts must fit (0 = nobody counting).
+        // A spawn site can now be in a handler (A4.7), so both halves of
+        // every other actor are scanned, not just its body.
         for (self.prog.actors) |a| {
-            for (a.body) |s| {
-                if (s != .spawn) continue;
+            var sites = std.ArrayList(*const Stmt).init(self.arena);
+            try collectSpawns(a.body, &sites);
+            for (a.handlers) |*h| try collectSpawns(handlerBody(h), &sites);
+            for (sites.items) |s| {
                 if (!std.mem.eql(u8, s.spawn.actor, self.actor.name)) continue;
                 if (s.spawn.watchdog == 0) continue;
                 self.watchdog = if (self.watchdog == 0)
@@ -2036,28 +2046,29 @@ const Gen = struct {
                     @min(self.watchdog, s.spawn.watchdog);
             }
         }
-        for (self.actor.body) |s| {
-            if (s == .spawn) self.spawn_count += 1;
-        }
+        // Canonical spawn order: the actor's body, then each handler's
+        // body, recursing into nested blocks. This one walk fixes the
+        // record index for every consumer — the emitter, the child-cap
+        // slots, and the SpawnOut the loader reads — so a `SPWN` reads the
+        // record slot that was staged for it no matter where it lives.
+        try collectSpawns(self.actor.body, &self.spawn_list);
+        for (self.actor.handlers) |*h| try collectSpawns(handlerBody(h), &self.spawn_list);
+        self.spawn_count = @intCast(self.spawn_list.items.len);
+        for (self.spawn_list.items, 0..) |s, k| try self.spawn_idx.put(s, @intCast(k));
         // A named child's capability lives after the spawn records: one
         // near slot per `spawn … as name`, holding the supervisor's window
         // to the child's RX ring. Unnamed spawns reserve nothing, so a
         // program that never names a child keeps its old near layout — the
         // exit-only supervisor is byte-for-byte what it was.
         var aoff: u16 = self.spawn_base + self.spawn_count * 48;
-        {
-            var k: u16 = 0;
-            for (self.actor.body) |s| {
-                if (s != .spawn) continue;
-                if (s.spawn.bind) |name| {
-                    if (self.slots.contains(name))
-                        return self.fail(s.spawn.line, "a spawned child's name is already in use", Error.Semantics);
-                    try self.slots.put(name, aoff); // `grant`/`send` resolve here
-                    try self.child_caps.put(name, {});
-                    try self.childcap_of.put(k, aoff);
-                    aoff += 8;
-                }
-                k += 1;
+        for (self.spawn_list.items, 0..) |s, k| {
+            if (s.spawn.bind) |name| {
+                if (self.slots.contains(name))
+                    return self.fail(s.spawn.line, "a spawned child's name is already in use", Error.Semantics);
+                try self.slots.put(name, aoff); // `grant`/`send` resolve here
+                try self.child_caps.put(name, {});
+                try self.childcap_of.put(@intCast(k), aoff);
+                aoff += 8;
             }
         }
         for (self.actor.params) |p| {
@@ -2178,6 +2189,40 @@ const Gen = struct {
             }
         }
         return false;
+    }
+
+    /// The body of any handler kind — every one carries statements.
+    fn handlerBody(h: *const Handler) []Stmt {
+        return switch (h.*) {
+            .case => |c| c.body,
+            .after => |a| a.body,
+            .exit_case => |e| e.body,
+            .handoff_case => |x| x.body,
+        };
+    }
+
+    /// Every `spawn` in a statement list, in lexical order, as stable
+    /// pointers into the arena — recursing into nested blocks so a spawn
+    /// buried in an `if` or a `for` is still counted. Amendment 4.8's
+    /// dynamic spawn: a spawn may live in a handler now, not only in the
+    /// actor body, so the record index a `SPWN` reads must be assigned by
+    /// identity (the statement pointer) rather than by emission order,
+    /// which threads through region dispatch, the case ladder and the
+    /// timer body in a sequence no single walk reproduces.
+    fn collectSpawns(list: []const Stmt, out: *std.ArrayList(*const Stmt)) Error!void {
+        for (list) |*s| {
+            switch (s.*) {
+                .spawn => out.append(s) catch return Error.OutOfMemory,
+                .if_ => |i| {
+                    try collectSpawns(i.then, out);
+                    try collectSpawns(i.els, out);
+                },
+                .bounded => |b| try collectSpawns(b.body, out),
+                .for_range => |f| try collectSpawns(f.body, out),
+                .for_group => |f| try collectSpawns(f.body, out),
+                else => {},
+            }
+        }
     }
 
     /// Does this statement list grant the named region anywhere?
@@ -3751,10 +3796,13 @@ const Gen = struct {
                 try self.w("        BRA L{d}", .{self.quiesce_label});
             },
             .spawn => |sp| {
-                if (self.in_handler)
-                    return self.fail(sp.line, "v1: spawn lives in the actor body, before serve", Error.Unsupported);
-                const rec = self.spawnRec(self.spawn_seen);
-                self.spawn_seen += 1;
+                // A4.8: a spawn may live in a handler now, not only the
+                // body. Its record index is fixed by identity (set in
+                // setup), so a handler `SPWN` reads the slot the loader
+                // staged for this exact site — the child's context, and
+                // thus its RX ring and the parent's capability to it,
+                // survive every incarnation the site starts.
+                const rec = self.spawnRec(self.spawn_idx.get(s).?);
                 try self.w("; spawn {s} restarts {d} watchdog {d}", .{ sp.actor, sp.restarts, sp.watchdog });
                 try self.w("        LDA {s}", .{try self.imm(sp.restarts)});
                 try self.w("        STA ${X}", .{rec + 40});
@@ -5628,6 +5676,8 @@ pub fn compile(
         .records = .init(arena),
         .child_caps = .init(arena),
         .childcap_of = .init(arena),
+        .spawn_list = .init(arena),
+        .spawn_idx = .init(arena),
         .const_labels = std.StringHashMap(usize).init(arena),
         .strings = .init(arena),
         .arrays = .init(arena),
@@ -5677,20 +5727,20 @@ pub fn compile(
             });
         }
     }
+    // Canonical spawn order (body then handlers), the same walk that fixed
+    // every record index — so SpawnOut[k] is the site a `SPWN` reads at
+    // spawnRec(k), whether that spawn lives in the body or a handler.
     var spawns = std.ArrayList(SpawnOut).init(alloc);
     errdefer spawns.deinit();
-    var k: u16 = 0;
-    for (actor.body) |s| {
-        if (s != .spawn) continue;
+    for (gen.spawn_list.items, 0..) |s, k| {
         try spawns.append(.{
             .actor = try alloc.dupe(u8, s.spawn.actor),
-            .rec_off = gen.spawnRec(k),
+            .rec_off = gen.spawnRec(@intCast(k)),
             .restarts = s.spawn.restarts,
             .watchdog = s.spawn.watchdog,
             .args = try alloc.dupe(u64, s.spawn.args),
-            .cap_off = gen.childcap_of.get(k),
+            .cap_off = gen.childcap_of.get(@intCast(k)),
         });
-        k += 1;
     }
     return .{
         .alloc = alloc,

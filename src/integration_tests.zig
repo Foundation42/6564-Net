@@ -735,6 +735,103 @@ test "A4 movement 3: a supervisor lends the estate down to the child it named" {
     try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
 }
 
+test "A4.7 dynamic spawn: a screen started mid-serve, and lent the estate" {
+    // The shape rocci actually needs. This morning's Cabinet spawned its
+    // heir at boot; a real Cabinet spawns the next screen on a transition,
+    // inside a `serve` handler. Here the Cabinet kicks itself, spawns the
+    // screen in the `Kick` case — not the actor body — names it, and lends
+    // it the frame once the screen reports ready. The child is born at
+    // handler time, into a context the loader reserved for that spawn
+    // site, and the capability aimed at it was staged before it ever ran.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Kick { n u64 }
+        \\message Ready { x u64 }
+        \\actor Screen(tick u64) {
+        \\    var frame region [64]u64
+        \\    var got u64 = 0
+        \\    send boss, Ready{1}
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as frame
+        \\            got = frame[0]
+        \\            halt ok
+        \\    }
+        \\}
+        \\actor Cabinet() {
+        \\    var frame region [64]u64
+        \\    send self, Kick{0}
+        \\    serve {
+        \\        case Kick(k):
+        \\            spawn Screen(1) as screen restarts 0 watchdog 0
+        \\        case Ready(r):
+        \\            frame[0] = 6564
+        \\            grant frame to screen
+        \\            halt ok
+        \\    }
+        \\}
+        \\system { cab = Cabinet() on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 1), o.stats.grants);
+    try testing.expectEqual(@as(u64, 6564), o.varOf("cab/Screen#0", "got").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab").?.state);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
+}
+
+test "A4.7 dynamic spawn: one site, two incarnations, one capability" {
+    // The incarnation question, answered by test. The Cabinet has a single
+    // spawn site — `case Kick: spawn Screen(1) as screen` — and fires it
+    // twice. SPWN reuses the one context the loader reserved for that site,
+    // bumping the generation; the child's RX ring lives in the near page,
+    // which the restart does not move, so the parent's capability to
+    // `screen` stays valid across the bump. The proof is that `send
+    // screen, Ping` lands on BOTH lives: each incarnation hears 6564,
+    // reports Done, and dies, and the second Done could not arrive if the
+    // second `send` had gone nowhere. The old life is always dead before
+    // the next SPWN, because the child halts synchronously inside its own
+    // burst — the successor never restarts a living context.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Kick { n u64 }
+        \\message Ready { life u64 }
+        \\message Ping { v u64 }
+        \\message Done { life u64 }
+        \\actor Screen(life u64) {
+        \\    var heard u64 = 0
+        \\    send boss, Ready{life}
+        \\    serve {
+        \\        case Ping(p):
+        \\            heard = p.v
+        \\            send boss, Done{life}
+        \\            halt ok
+        \\    }
+        \\}
+        \\actor Cabinet() {
+        \\    var cycles u64 = 0
+        \\    send self, Kick{0}
+        \\    serve {
+        \\        case Kick(k):
+        \\            spawn Screen(1) as screen restarts 0 watchdog 0
+        \\        case Ready(r):
+        \\            send screen, Ping{6564}
+        \\        case Done(d):
+        \\            cycles += 1
+        \\            if cycles < 2 {
+        \\                send self, Kick{0}
+        \\            } else {
+        \\                halt ok
+        \\            }
+        \\    }
+        \\}
+        \\system { cab = Cabinet() on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    // Two lives, each addressed down the same capability and each heard.
+    try testing.expectEqual(@as(u64, 2), o.varOf("cab", "cycles").?);
+    try testing.expectEqual(@as(u64, 6564), o.varOf("cab/Screen#0", "heard").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab").?.state);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability
