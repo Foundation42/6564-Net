@@ -1,183 +1,263 @@
-// joey.joe — the bird, in the flesh. rocci-bird runs on a platform that
-// calls her; joey-bird runs on joe, where nobody calls at all. This is
-// the reimagining sketch's §4 Game actor, on the device row it was
-// written against: the display is the frame clock, the pad pushes input
-// the bird latches, the APU takes the flap and the death. Nobody calls
-// this actor sixty times a second — the display writes back, the pad
-// speaks up, and the bird decides.
+// joey.joe — the bird, rendered for real. She was born on a device row
+// (rocci §1): the display is her frame clock, the pad her input, the APU
+// her voice. This version adds the sixth citizen the northstar demanded —
+// the PPU (§7.9) — and with it she stops laying down pixels and starts
+// describing a scene.
 //
-// The frame loop is backpressure: `send display, Present{grant frame}`
-// hands the framebuffer to the glass, and `case done(frame)` is vblank —
-// the frame is ours again, one tick later. The bird cannot draw faster
-// than the display returns its region, and every crash is just another
-// coin (probate hands the estate to the successor; here the bird simply
-// tells the referee its score and dies).
+// The frame is now a real 2D framebuffer (64×48), and the loop is a two-
+// stage pipeline against two devices:
 //
-// Determinism is total: the only nondeterminism is input, input is
-// messages, and the pad's trace is a recording — the same seed and the
-// same trace replay the same game, bit for bit. TAS as a corollary.
+//   build a display list  →  send ppu   (the PPU composites the scene)
+//   case done(frame)      →  send display (the glass shows it)
+//   case done(frame)      →  advance the game, build the next list
+//
+// The core never touches a pixel: it writes ~20 drawing commands (a CLEAR,
+// two rectangles per pipe, the ground, one bird sprite) into the region and
+// hands it to the PPU, which rasterises tiles and sprites the way a 6502's
+// NES did beside it. That keeps the core's per-frame cost small, so the
+// frame clock stays honest — the whole reason rasterisation is device work.
+//
+// Collision stays exact and in the core: a pipe is over the bird's column
+// (a lanewise compare, summed) and her height is outside its gap. Same
+// verdict the pixel-peek gave, computed from the state that drew the scene.
+//
+// Determinism is total: input is the only nondeterminism, it arrives as
+// messages, and a fixed trace replays the same flight bit for bit (rocci §4).
 
+message Paint { r grant, fboff u64, dims u64, dloff u64, shoff u64 }
 message Present { f grant }
 message Pad { buttons u64 }
 message Poll -> Pad {}
 message Tone { n u64 }
 message Over { score u64 }
 
-actor Game(display addr, pad addr, apu addr, ref addr) {
-    // The framebuffer is now a REAL one: a byte per row of the player's
-    // column, 0..134 (the floor). Each frame the bird draws the world into
-    // it — a pipe body is solid, the gap is open — and draws itself NOT AT
-    // ALL, then reads back the byte under its own height. That read is the
-    // collision (sketch §5, the pixel-peek): the region type-state forbids
-    // reading a granted frame, so the draw, the peek and the present are one
-    // ordered burst. `region [135]u8` lands in RAM as bytes, drawn with STB
-    // and read with LDB — the byte memory the 64-bit machine grew for this.
-    var frame region [135]u8         // the player's column, granted each vblank
+actor Game(display addr, pad addr, apu addr, ppu addr, ref addr) {
+    // The region holds three things at fixed offsets, the way the matmul
+    // accelerator packs A/B/C: the framebuffer (0..3072, 64×48 bytes), the
+    // sprite sheet (3072.., written once), and the display list (3584..,
+    // rewritten every frame). The PPU reads sheet + list and writes the
+    // framebuffer; the display then scans the framebuffer to the glass.
+    var frame region [4096]u8
 
-    var t u64 = 0                    // frame counter
-    var y f64 = 40.0                 // the bird's height
-    var vy f64 = 0.0                 // its vertical velocity
-    var buttons u64 = 0              // the latched pad state
-    var flap_held u64 = 1            // swallow the starting press (Roc's last_flap: True)
+    var phase u64 = 0                // 0 = PPU compositing, 1 = display showing
+    var t u64 = 0
+    var y f64 = 40.0
+    var vy f64 = 0.0
+    var buttons u64 = 0
+    var flap_held u64 = 1
     var score u64 = 0
     var flaps u64 = 0
-    var cause u64 = 0                // how the game ended: 1 floor, 2 pipe
-    var gtop u64 = 0                 // the open gap's top row, this frame
-    var gbot u64 = 0                 // and its bottom row (exclusive)
+    var cause u64 = 0
+    var gtop u64 = 0
+    var gbot u64 = 0
+    var dead u64 = 0
 
-    // The pipes: eight of them, as a single vector — Roc's List(Pipe) as
-    // SoA lanes (sketch §6.1, the item-5 workload in miniature). They
-    // scroll left together, one vector subtract a frame, and a pipe scores
-    // when its x reaches the player: a lanewise compare to a mask, summed.
-    var pipe_x vec                   // the eight pipe positions
-    var passed vec                   // 1.0 in each lane that just crossed
-    var atcol vec                    // 1.0 in each lane now over the player
-    var atcol2 vec                   // scratch for the second half of the band
-    var gap_y vec                    // each pipe's gap centre — its own lane
+    // The pipes: eight, as SoA vector lanes (rocci §6.1) — x and gap centre.
+    var pipe_x vec
+    var passed vec
+    var atcol vec
+    var atcol2 vec
+    var gap_y vec
+
+    // The scene builder's scratch: the pipe vectors spilled to memory so a
+    // loop can walk their lanes (the VST/VLD joe grew for exactly this), and
+    // the display-list write cursor and the per-pipe fb coordinates.
+    var xs region [8]f64
+    var gs region [8]f64
+    var cur u64 = 0
+    var fbx u64 = 0
+    var gfb u64 = 0
+    var gt u64 = 0
+    var gb u64 = 0
+    var byf u64 = 0
 
     pipe_x = [40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]
-    // Each pipe carries its own gap height, a second SoA attribute beside
-    // its x. The gap rides with the lane, so when a pipe recycles off the
-    // left edge (the `where` wrap) its gap comes back around with it — the
-    // bird sees the same eight gaps repeat, high and low, and must climb and
-    // dive to match. This is the List(Pipe) of the Roc, two fields wide.
     gap_y = [22.0, 13.0, 15.0, 30.0, 56.0, 30.0, 74.0, 50.0]
 
-    send pad, Poll{}                          // subscribe to input
-    send display, Present{grant frame}        // the clock starts here
+    // ── the bird sprite, painted into sheet slot 0 ($C00) once. 0xFF is
+    //    transparent; 3 body, 4 beak, 5 eye. An 8×8 yolk with a face. ──
+    for i in 0..64 { frame[3072 + i] = 255 }
+    frame[3082] = 3
+    frame[3083] = 3
+    frame[3084] = 3
+    frame[3089] = 3
+    frame[3090] = 3
+    frame[3091] = 3
+    frame[3092] = 3
+    frame[3093] = 3
+    frame[3097] = 3
+    frame[3098] = 3
+    frame[3099] = 3
+    frame[3100] = 5
+    frame[3101] = 3
+    frame[3102] = 4
+    frame[3105] = 3
+    frame[3106] = 3
+    frame[3107] = 3
+    frame[3108] = 3
+    frame[3109] = 3
+    frame[3110] = 3
+    frame[3113] = 3
+    frame[3114] = 3
+    frame[3115] = 3
+    frame[3116] = 3
+    frame[3117] = 3
+    frame[3122] = 3
+    frame[3123] = 3
+    frame[3124] = 3
+
+    // ── a minimal first list (clear the sky, END), then start the clock ──
+    frame[3584] = 1
+    frame[3585] = 0
+    frame[3592] = 0
+
+    send pad, Poll{}
+    send ppu, Paint{grant frame, 0, $300040, $E00, $C00}
 
     serve {
         case Pad(p):
-            buttons = p.buttons               // latch; edges belong to frame time
+            buttons = p.buttons
 
-        case done(frame):                     // vblank: the frame is ours again
-            t += 1
-
-            // a flap is a rising edge: pressed now, not pressed last frame.
-            if buttons != 0 && flap_held == 0 {
-                vy = 0.0 - 2.2
-                flaps += 1
-                send apu, Tone{1}             // FLAP_TONE
+        case done(frame):
+            if phase == 0 {
+                // the PPU finished compositing — show it
+                phase = 1
+                send display, Present{grant frame}
             } else {
-                vy = vy + 0.12                // gravity: same napkin as the Roc
-            }
-            flap_held = buttons
-            y = y + vy
+                // vblank: the glass is done, advance the game and recompose
+                phase = 0
+                t += 1
 
-            // the world update, Roc's four loops as four vector lines:
-            // move every pipe one step, mask the ones now at the player
-            // (x = 20) and sum the mask — the score is a popcount — then
-            // recycle: the same 1.0/0.0 mask wraps any pipe that has run
-            // off the left edge back to the right, +160 (eight lanes × 20
-            // spacing), so the phase survives and the pipes are endless.
-            // `where` is a blend, not a VSEL — the mask that counts (VRADD)
-            // now also chooses, and the $?7 column stays spent whole.
-            pipe_x = pipe_x - 2.0
-            passed = pipe_x == 20.0
-            let gained = int(passed.reduce(+))
-            score += gained
-            pipe_x = where(pipe_x <= 0.0, pipe_x + 160.0, pipe_x)
-            if gained > 0 {
-                send apu, Tone{2}             // POINT_TONE
-            }
-
-            // Is a pipe over the player's column right now? A pipe spans a
-            // band six wide around x = 20; two lanewise compares ANDed (the
-            // product of two 1.0/0.0 masks) mark the lanes inside it, and the
-            // sum is 0 (open sky) or 1 (a pipe is here). Spacing is 20 and
-            // the band is 12, so at most one lane ever counts.
-            atcol = pipe_x > 14.0
-            atcol2 = pipe_x < 26.0
-            atcol = atcol * atcol2
-            let blocked = int(atcol.reduce(+))
-
-            // Which gap does the pipe over the column carry? The mask has one
-            // lane set (spacing 20 > band 12), so masking gap_y by it and
-            // summing plucks out that one pipe's gap centre — a lanewise
-            // gather written as a multiply and a reduce. Zero when no pipe is
-            // over the column, which the draw below treats as all-open.
-            atcol = atcol * gap_y
-            let gap = int(atcol.reduce(+))
-            // The open band is the gap centre ± 18, clamped at the ceiling so
-            // a high gap opens to the top of the screen (and integer subtract
-            // never underflows). No pipe → gap = 0 → an empty band the draw
-            // fills with blocked = 0 anyway: all open.
-            gbot = gap + 18
-            gtop = 0
-            if gap >= 18 {
-                gtop = gap - 18
-            }
-
-            // Draw the world into the column: the band [gtop, gbot) is open
-            // sky, every other row is pipe body when a pipe is over the
-            // column. The bird is NOT drawn — that omission is the whole
-            // point of the peek that follows. 135 STBs, one region, no player
-            // in it.
-            for r in 0..135 {
-                if r >= gtop && r < gbot {
-                    frame[r] = 0
+                // a flap is a rising edge; otherwise gravity.
+                if buttons != 0 && flap_held == 0 {
+                    vy = 0.0 - 2.2
+                    flaps += 1
+                    send apu, Tone{1}
                 } else {
-                    frame[r] = blocked
+                    vy = vy + 0.12
                 }
-            }
+                flap_held = buttons
+                y = y + vy
 
-            // the floor: the bird dies, and the actor dies with it — but
-            // first it tells the referee where the game ended.
-            if y >= 134.0 {
-                cause = 1
-                send apu, Tone{9}             // DEATH_TONE
-                send ref, Over{score}
-                halt ok
-            }
+                // the pipes scroll, score, and recycle (the `where` wrap).
+                pipe_x = pipe_x - 2.0
+                passed = pipe_x == 20.0
+                let gained = int(passed.reduce(+))
+                score += gained
+                pipe_x = where(pipe_x <= 0.0, pipe_x + 160.0, pipe_x)
+                if gained > 0 {
+                    send apu, Tone{2}
+                }
 
-            // the pixel-peek: read back the byte under the bird's height. A
-            // solid byte means a pipe body is exactly where the bird is —
-            // collision, read from the world she never appears in. Guarded by
-            // y >= 0 because above the screen there is nothing to read (and no
-            // ceiling to die against).
-            if y >= 0.0 {
-                let hit = frame[int(y)]
-                if hit != 0 {
-                    cause = 2
-                    send apu, Tone{9}         // DEATH_TONE
+                // collision, exact and in the core: is a pipe over the bird's
+                // column (x = 20), and which gap does it carry? A lanewise
+                // band compare, then a masked gather — the same state that
+                // draws the scene decides the death.
+                atcol = pipe_x > 14.0
+                atcol2 = pipe_x < 26.0
+                atcol = atcol * atcol2
+                let blocked = int(atcol.reduce(+))
+                atcol = atcol * gap_y
+                let gap = int(atcol.reduce(+))
+                gbot = gap + 18
+                gtop = 0
+                if gap >= 18 {
+                    gtop = gap - 18
+                }
+
+                // the floor: she dies, and tells the referee her score.
+                if y >= 134.0 {
+                    cause = 1
+                    send apu, Tone{9}
                     send ref, Over{score}
                     halt ok
                 }
+                // a pipe: blocked, and her height outside the open band.
+                dead = 0
+                if blocked != 0 {
+                    if y < f64(gtop) {
+                        dead = 1
+                    }
+                    if y >= f64(gbot) {
+                        dead = 1
+                    }
+                }
+                if dead != 0 {
+                    cause = 2
+                    send apu, Tone{9}
+                    send ref, Over{score}
+                    halt ok
+                }
+
+                // ── build the display list from the world state ──
+                // Spill the pipe vectors so a loop can read lane i (VST), and
+                // walk the eight pipes emitting two rectangles each. Game
+                // coordinates map to the framebuffer: x ×0.4 (160→64), y
+                // ×0.3556 (135→48). The PPU clips whatever runs off-screen.
+                xs = pipe_x
+                gs = gap_y
+                frame[3584] = 1              // CLEAR
+                frame[3585] = 0              //   to sky
+                cur = 3592
+                for i in 0..8 {
+                    fbx = int(xs[i] * 0.4)
+                    gfb = int(gs[i] * 0.3556)
+                    gt = 0
+                    if gfb >= 7 {
+                        gt = gfb - 7
+                    }
+                    gb = gfb + 7
+                    frame[cur] = 2           // RECT — top pipe
+                    frame[cur + 1] = fbx
+                    frame[cur + 2] = 0
+                    frame[cur + 3] = 6
+                    frame[cur + 4] = gt
+                    frame[cur + 5] = 1
+                    frame[cur + 6] = 0
+                    frame[cur + 7] = 0
+                    cur = cur + 8
+                    frame[cur] = 2           // RECT — bottom pipe
+                    frame[cur + 1] = fbx
+                    frame[cur + 2] = gb
+                    frame[cur + 3] = 6
+                    frame[cur + 4] = 48
+                    frame[cur + 5] = 1
+                    frame[cur + 6] = 0
+                    frame[cur + 7] = 0
+                    cur = cur + 8
+                }
+                frame[cur] = 2               // RECT — the ground
+                frame[cur + 1] = 0
+                frame[cur + 2] = 46
+                frame[cur + 3] = 64
+                frame[cur + 4] = 2
+                frame[cur + 5] = 2
+                frame[cur + 6] = 0
+                frame[cur + 7] = 0
+                cur = cur + 8
+                byf = int(y * 0.3556)
+                frame[cur] = 3               // SPRITE — the bird
+                frame[cur + 1] = 0
+                frame[cur + 2] = 5
+                frame[cur + 3] = byf
+                frame[cur + 4] = 0
+                frame[cur + 5] = 0
+                frame[cur + 6] = 0
+                frame[cur + 7] = 0
+                cur = cur + 8
+                frame[cur] = 0               // END
+
+                send ppu, Paint{grant frame, 0, $300040, $E00, $C00}
             }
 
-            send display, Present{grant frame}   // and the clock ticks again
-
         case failed(frame):
-            // the glass refused the frame — nothing to do but leave.
             send ref, Over{score}
             halt err
     }
 }
 
-// The referee stands in for the Cabinet: it hears the game end and
-// records the final score. (For the Cabinet that actually *spawns* the
-// bird — lending it the device row and inserting a coin on each death —
-// see cabinet.joe next door, which capability-passing spawn made real.)
+// The referee stands in for the Cabinet: it hears the game end and records
+// the final score.
 actor Referee() {
     var final_score u64 = 0
     var overs u64 = 0
@@ -190,9 +270,10 @@ actor Referee() {
 }
 
 system {
-    game = Game(display, pad, apu, ref) on 0
+    game = Game(display, pad, apu, ppu, ref) on 0
     ref = Referee() on 0
     display = Display()
     apu = Apu()
     pad = Pad()
+    ppu = Ppu()
 }

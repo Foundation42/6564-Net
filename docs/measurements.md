@@ -1861,3 +1861,47 @@ subscription starts its stream *after* it (the pad's original order) — because
 the event-queue tie-break is load-bearing and a reorder there would diverge a
 replay. **158 tests, green.** machine.zig: −150 net lines, two registries
 gone; the row is now open for the device that renders joey-bird for real.
+
+## The PPU — joey rendered for real, and the gaps that took
+
+The northstar reached the glass. joey-bird now draws a real 64×48 scene —
+scrolling pipes with per-lane gaps, a sandy ground, and an 8×8 bird sprite
+with an eye and a beak — and `sim6564 joey --watch` paints it to the terminal
+in truecolor half-blocks as she flies. She threads the gaps and clips a pipe
+at frame 52, score 5, above the floor: a real deterministic flight.
+
+The number that forced the design: rasterising ONE 64×48 frame in joe cost
+**~43,000 instructions** — twenty times the entire rest of the game per
+frame — and, because the pad streams on its own timer, that cost warped the
+frame clock itself. So rasterisation became device work (§7.9). The core now
+writes a display list (a CLEAR, two rectangles per pipe, a ground rectangle,
+one bird sprite — about twenty 8-byte commands) and the PPU composites it.
+The whole PPU-rendered joey runs in **73,498 core instructions** across 52
+frames (~1,400 a frame) — FEWER than the old pixel-drawing bird's 128,461,
+even though it now draws a full 2D scene instead of a one-column collision
+strip. Describing a scene is cheaper than drawing one; that is the whole
+point of a picture processor.
+
+Two platform gaps the northstar exposed, both closed at the platform level
+rather than papered over:
+
+- **A vector could not reach memory.** joey's eight pipes are SoA vector
+  lanes, but building a per-pipe display list needs them as addressable
+  scalars. The ISA already had `VLD`/`VST`; joe now spills a vector to an
+  f64 region (`xs = pipe_x`) and fills one back (`v = xs`), so a loop walks
+  the lanes. Every SoA-vector program gets this, not just joey.
+- **The region type-state was too conservative.** A two-stage frame loop —
+  compose on the PPU, then show on the display — grants the same region to
+  two devices in alternation, in the two arms of an `if`. joe carried the
+  first arm's grant-lock into the second and rejected it as a double grant,
+  though the arms are mutually exclusive. Now branches track their locks
+  independently.
+
+The PPU is a §7.6 accelerator, matmul's twin: a grant, a completion fence,
+`deterministic` integer raster (two unit tests: list-order compositing,
+clip-to-framebuffer). TermDisplay is an external device in its own module
+that joins the row through the vtable with no change to the machine — the
+whole promise of the device-vtable refactor, made visible. Determinism holds:
+input is the only nondeterminism, so a fixed trace replays the same flight,
+and `--watch` changes not one bit of the run — it only paces the output to
+human time. **161 tests green.**

@@ -137,7 +137,7 @@ pub const Options = struct {
     /// bit-identical to a headless one.
     watch: ?Watch = null,
 
-    pub const Watch = struct { width: u16, frame_ms: u32 = 50 };
+    pub const Watch = struct { width: u16, height: u16 = 0, frame_ms: u32 = 50 };
 };
 
 pub const VarOut = struct { name: []const u8, value: u64, f64: bool = false };
@@ -472,7 +472,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             0xFF05 => try m.attachDevice(d.coord, d.token, dev.Matmul{ .remote = false }),
             0xFF06 => try m.attachDevice(d.coord, d.token, dev.Matmul{ .remote = true }),
             0xFF07 => if (opts.watch) |wc|
-                try m.attachDevice(d.coord, d.token, term.TermDisplay{ .period = display_period, .width = wc.width, .frame_ms = wc.frame_ms })
+                try m.attachDevice(d.coord, d.token, term.TermDisplay{ .period = display_period, .width = wc.width, .height = wc.height, .frame_ms = wc.frame_ms })
             else
                 try m.attachDevice(d.coord, d.token, dev.Display{ .period = display_period }),
             0xFF08 => try m.attachDevice(d.coord, d.token, dev.Apu{}),

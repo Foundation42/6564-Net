@@ -111,11 +111,13 @@ const usage_text =
     \\      staging and timers are the loader's job (src/joe_run.zig).
     \\      With no file: the built-in pingpong.joe across a lossy fabric.
     \\
-    \\  sim6564 joey [seed]
+    \\  sim6564 joey [seed] [--watch]
     \\      joey-bird: WASM-4 flappy, reimagined as a society of actors on
     \\      the device row. The display is the frame clock (backpressure,
     \\      not a caller), the pad streams input the bird latches, the APU
-    \\      takes the flap and the death (programs/joe/joey/joey.joe).
+    \\      takes the flap and the death; the PPU composites her sprites and
+    \\      pipes (programs/joe/joey/joey.joe). --watch paints her to the
+    \\      terminal in truecolor as she flies.
     \\
     \\  sim6564 cabinet [seed]
     \\      The same bird, but the Cabinet spawns it: capability-passing
@@ -284,7 +286,7 @@ pub fn main() !void {
         // the frame is painted to your terminal (term_display.zig), an
         // external device on the row. 80 = joey's framebuffer width.
         while (args.next()) |s| {
-            if (std.mem.eql(u8, s, "--watch")) opts.watch = .{ .width = 80 } else opts.seed = parseOr(u64, s, "seed");
+            if (std.mem.eql(u8, s, "--watch")) opts.watch = .{ .width = 64, .height = 48 } else opts.seed = parseOr(u64, s, "seed");
         }
         return sim.joe_run.run(alloc, @embedFile("programs/joe/joey/joey.joe"), opts);
     }

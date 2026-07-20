@@ -29,16 +29,26 @@ const palette = [_]Rgb{
     .{ .r = 0x8e, .g = 0xd6, .b = 0xff }, // 0 sky — soft daylight blue
     .{ .r = 0x3a, .g = 0xa0, .b = 0x4a }, // 1 pipe — flappy green
     .{ .r = 0xd8, .g = 0xc0, .b = 0x88 }, // 2 ground — sandy tan
-    .{ .r = 0xff, .g = 0xd8, .b = 0x2a }, // 3 bird — the yolk herself
+    .{ .r = 0xff, .g = 0xd8, .b = 0x2a }, // 3 bird body — the yolk herself
+    .{ .r = 0xff, .g = 0x8a, .b = 0x1e }, // 4 beak — orange
+    .{ .r = 0x22, .g = 0x22, .b = 0x22 }, // 5 eye — near-black
+    .{ .r = 0x2c, .g = 0x7a, .b = 0x38 }, // 6 pipe rim — darker green
+    .{ .r = 0xff, .g = 0xff, .b = 0xff }, // 7 white
 };
+const palette_max: u8 = palette.len - 1;
 
 pub const TermDisplay = struct {
     /// The vblank interval — the frame clock, exactly as the headless
     /// Display's `period`. Backpressure still paces the sim; `frame_ms`
     /// paces the *human* on top of it.
     period: u64,
-    /// Framebuffer width in pixels; height falls out as region.len / width.
+    /// Framebuffer width in pixels. The framebuffer is the first width×height
+    /// bytes of the granted region; anything after it (a PPU sprite sheet and
+    /// display list) is not scanned.
     width: u16,
+    /// Framebuffer height in pixels. 0 means "derive from the region length"
+    /// (a plain framebuffer with nothing after it).
+    height: u16 = 0,
     /// Wall-clock milliseconds to hold each painted frame — output pacing
     /// only, never simulation time.
     frame_ms: u32 = 50,
@@ -75,7 +85,7 @@ pub const TermDisplay = struct {
     fn paint(self: *TermDisplay, region: []const u8) void {
         const w: usize = self.width;
         if (w == 0 or region.len < w) return;
-        const h: usize = region.len / w;
+        const h: usize = if (self.height != 0) @min(self.height, region.len / w) else region.len / w;
         var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
         const out = bw.writer();
         if (!self.cleared) {
@@ -92,8 +102,8 @@ pub const TermDisplay = struct {
             const top = region[y * w ..][0..w];
             const bot = region[(y + 1) * w ..][0..w];
             for (0..w) |x| {
-                const t = palette[@min(top[x], 3)];
-                const b = palette[@min(bot[x], 3)];
+                const t = palette[@min(top[x], palette_max)];
+                const b = palette[@min(bot[x], palette_max)];
                 out.print("\x1b[38;2;{d};{d};{d};48;2;{d};{d};{d}m\u{2580}", .{
                     t.r, t.g, t.b, b.r, b.g, b.b,
                 }) catch return;

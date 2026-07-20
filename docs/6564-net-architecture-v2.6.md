@@ -783,6 +783,49 @@ exempt. The whole three-screen state machine — each screen spawned and
 equipped by the supervisor (Amendment 4.9), each taking the pad in its
 turn — needs nothing the row did not already carry.
 
+### 7.9 The PPU: Rasterisation Is Device Work (v2.6)
+
+The northstar earned another feature. Rendering a scene by writing the
+framebuffer a pixel at a time costs the core about twenty times the rest of
+a frame — and worse, that cost is *inside the frame clock*: every cycle the
+core spends rasterising shifts how the pad's input stream interleaves, so
+software drawing warps the very timing determinism depends on. The platform
+already had the answer for arithmetic (§7.6, the accelerator that does a
+matmul the core only *describes*); the **PPU** is that move for pixels. The
+core writes a compact **display list** — `CLEAR`, `RECT`, `SPRITE` — into a
+granted region; the PPU composites tiles and sprites into the framebuffer
+part of that region; the completion is the release fence. The core's
+per-frame cost drops from tens of thousands of instructions to a few
+hundred, and the frame clock stays honest. The heritage is exact: a 6502 ran
+the NES beside a Picture Processing Unit that did tiles and sprites so the
+CPU never touched a pixel, and the C64 and Amiga gave their 6502-and-kin the
+same gift under other names.
+
+It is an ordinary accelerator (§7.6), matmul's twin. One grant carries a
+region holding, at caller-named offsets, a **sprite sheet** (8×8 bitmaps, a
+value of `0xFF` transparent; written once), a **display list** (rewritten
+each frame), and the **framebuffer** (the output). The list is the z-order —
+sky first, bird last — and each command is a fixed eight bytes so the core
+stamps one out with byte stores. The arithmetic is integer and has no
+reduction to order, so the contract is `deterministic` (§7.5): every
+implementation composites the same bytes, and a fabric-remote or silicon PPU
+would agree with the reference to the pixel. After the completion the core
+may peek the framebuffer for collision (§7.7) and then presents it to the
+display, which scans it out — the classic pipeline where one engine renders
+and the display controller shows, each a device on the row.
+
+Two consequences followed, both platform gaps the northstar exposed and both
+closed rather than worked around. A scene built from SoA vector state (the
+eight pipes) needs its lanes in *addressable* memory to become per-primitive
+commands; the ISA already had vector load/store (`VLD`/`VST`), so the joe
+compiler now spills a vector to an f64 region and fills one back (§A1). And a
+two-stage frame loop grants the same region to two devices in alternation —
+compose, then show — which the region type-state (§6.2) wrongly rejected as a
+double grant; the fix was to make mutually-exclusive `if`-branches track
+their grant-locks independently, since only one arm ever runs. Silicon is an
+optimisation; the northstar keeps finding the places the optimisation was
+missing.
+
 ---
 
 ## 8. Instruction Set Sketch (I/O and Concurrency Subset)

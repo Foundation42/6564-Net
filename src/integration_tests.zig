@@ -1127,21 +1127,20 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
         .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },
     );
     defer o.deinit();
-    // The bird flapped (input reached it and moved it), presented frames
-    // (the display counted them), played tones (flaps, points, and the
-    // death), and died ON A PIPE — the pixel-peek, not the floor. Golden
-    // values: the run is deterministic, so these are exact. Each pipe now
-    // carries its own gap height (an SoA lane), so this is real flappy: she
-    // threads five varied gaps — climbing from y≈22 down to 13, then diving
-    // to 56 — and when the sixth pipe's gap sits high while she is falling
-    // past it, she cannot reach it and clips it at frame 58, height ~87,
+    // She is rendered for real now: each frame she builds a display list and
+    // the PPU composites it (§7.9), so the loop is a two-stage pipeline —
+    // compose, then show — and the frame count and flight differ from the
+    // old pixel-drawing bird. Collision is exact and in the core (a pipe over
+    // her column, her height outside its gap), the same verdict the pixel-
+    // peek gave. Golden values: the run is deterministic, so these are exact.
+    // She threads the varied gaps and clips a pipe at frame 52, height ~77,
     // above the floor (134). `cause = 2` is the pipe; `cause = 1` the floor.
-    // Eight tones = 2 flaps + 5 points + 1 death.
-    try testing.expectEqual(@as(u64, 58), o.varOf("game", "t").?);
-    try testing.expectEqual(@as(u64, 58), o.display_frames);
-    try testing.expectEqual(@as(u64, 2), o.varOf("game", "flaps").?);
+    // Seven tones = 1 flap + 5 points + 1 death.
+    try testing.expectEqual(@as(u64, 52), o.varOf("game", "t").?);
+    try testing.expectEqual(@as(u64, 52), o.display_frames);
+    try testing.expectEqual(@as(u64, 1), o.varOf("game", "flaps").?);
     try testing.expectEqual(@as(u64, 5), o.varOf("game", "score").?);
-    try testing.expectEqual(@as(u64, 8), o.apu_tones);
+    try testing.expectEqual(@as(u64, 7), o.apu_tones);
     try testing.expectEqual(@as(u64, 30), o.pad_pushed);
     // She died on a pipe (cause 2), not the floor (cause 1) — and her
     // height at death proves it: a pipe body, not the ground.
