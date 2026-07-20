@@ -1329,3 +1329,41 @@ Cabinet can pass an estate to any peer it can name and not to the screen
 it just started. A missing capability in supervision, not in transfer —
 a supervisor that can bury a child but not write to one is only half a
 parent.
+
+## A4 movement 3, the other half of the parent — a supervisor names its child
+
+The honest gap above, closed. `spawn Screen(1) as screen` binds a name
+for the spawned child; the loader stages a capability aimed at the
+child's RX ring — the exit link's twin, pointed down — so `grant frame
+to screen` and `send screen, …` reach a successor, not just a wired
+peer. The child gains `send boss, …` to match the `grant … to boss` it
+already had. A whole parent: it can bury a child and write to one.
+
+| claim | outcome |
+|---|---|
+| a supervisor can grant an estate to a child it spawned | ✓ down-grant reaches the named child, one succession recorded |
+| the successor reads what the supervisor wrote | ✓ marker `6564` read through the inherited descriptor two contexts later |
+| unnamed spawns cost nothing | ✓ supervise.joe byte-identical; only a named child reserves a slot |
+| the frozen ASM baseline is untouched | ✓ 2820 B / 171,532 instr / 479,275 cy / 13,281 switches, a fourth time |
+
+146 tests.
+
+**What granting *down* taught us about time.** Up and down are not
+mirror images, because a grant claims a descriptor slot in the grantee's
+table, and the grantee's *existence* differs by direction. A child
+grants up to a supervisor already alive, its table laid out; the grant
+lands in a free slot. A supervisor grants down to a child that may not
+have run yet — claim its slot before its init stages its own regions and
+the child overwrites the inheritance, so `adopt` copies back an empty
+descriptor. Nothing malformed; the same silent signature as the two
+defects the first half found. The discipline rocci already implies
+dissolves it: **a supervisor lends to a child that is already running.**
+The screen announces itself to `boss` once its regions are staged, and
+the Cabinet grants in reply — the request is the child saying the estate
+now has somewhere safe to land. *You cannot inherit a house while you
+are still being built.*
+
+Still open, and the next increment: the *dynamic* spawn — naming a child
+started inside a `serve` handler rather than the actor body — so the
+Cabinet can hand the frame to a screen it starts on a transition, not
+only at boot. Same name, later in time.

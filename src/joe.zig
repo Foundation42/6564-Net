@@ -355,6 +355,12 @@ const Stmt = union(enum) {
         args: []u64, // v1: literal args only
         restarts: u64,
         watchdog: u64,
+        /// `spawn W() as w` — the supervisor's name for the child. Binds a
+        /// capability aimed at the child's RX ring (the exit link's twin,
+        /// pointed down), so probate can reach a successor: obituaries
+        /// flow up, and now a grant can flow back. null = unnamed, the
+        /// old shape — a supervisor that only buries.
+        bind: ?[]const u8,
         line: usize,
     },
 };
@@ -1218,13 +1224,24 @@ const Parser = struct {
             try self.advance(); // )
             var restarts: u64 = 0;
             var watchdog: u64 = 0;
-            if (try self.eatKw("restarts")) restarts = (try self.expect(.int, "restart budget")).value;
-            if (try self.eatKw("watchdog")) watchdog = (try self.expect(.int, "watchdog budget")).value;
+            var bind: ?[]const u8 = null;
+            // `restarts` / `watchdog` / `as` in any order — three clauses,
+            // none required, each read at most once.
+            while (true) {
+                if (try self.eatKw("restarts")) {
+                    restarts = (try self.expect(.int, "restart budget")).value;
+                } else if (try self.eatKw("watchdog")) {
+                    watchdog = (try self.expect(.int, "watchdog budget")).value;
+                } else if (try self.eatKw("as")) {
+                    bind = (try self.expect(.ident, "a name for the child")).text;
+                } else break;
+            }
             return .{ .spawn = .{
                 .actor = actor.text,
                 .args = try args.toOwnedSlice(),
                 .restarts = restarts,
                 .watchdog = watchdog,
+                .bind = bind,
                 .line = line,
             } };
         }
@@ -1782,6 +1799,13 @@ const Gen = struct {
     lets: std.StringHashMap(bool),
     /// Record-shaped variables (A3.4): name → its base slot and shape.
     records: std.StringHashMap(struct { base: u16, rec: *const Record }),
+    /// Names a supervisor gave the children it spawned (`spawn W() as w`).
+    /// Membership makes a name an actor endpoint for the dialect check —
+    /// a spawned joe actor always takes messages, never raw bytes.
+    child_caps: std.StringHashMap(void),
+    /// Spawn index (declaration order) → the near slot holding that
+    /// child's capability, for the named ones. What the loader stages.
+    childcap_of: std.AutoHashMap(u16, u16),
     /// Consts staged so far: name → string label. Lazily registered on
     /// first use, so an unreferenced const costs an actor nothing.
     const_labels: std.StringHashMap(usize),
@@ -1908,6 +1932,12 @@ const Gen = struct {
     /// checked by the RBC at run time instead — the compiler's check is
     /// the EARLY copy of the machine's, never the only one.
     fn targetDialect(self: *Gen, pname: []const u8) ring.Dialect {
+        // A child a supervisor spawned and named is an actor: it takes
+        // messages. The compiler knows this outright — no system-block
+        // wiring to consult, because the child is born, not passed in.
+        // `boss` is likewise always an actor (the supervisor).
+        if (self.child_caps.contains(pname)) return .msg;
+        if (std.mem.eql(u8, pname, "boss")) return .msg;
         const pidx = for (self.actor.params, 0..) |p, i| {
             if (std.mem.eql(u8, p.name, pname)) break i;
         } else return .any;
@@ -2009,9 +2039,27 @@ const Gen = struct {
         for (self.actor.body) |s| {
             if (s == .spawn) self.spawn_count += 1;
         }
-        // Arrays after the spawn records: a near slot for each base
-        // pointer; the elements in the block's RAM array area.
+        // A named child's capability lives after the spawn records: one
+        // near slot per `spawn … as name`, holding the supervisor's window
+        // to the child's RX ring. Unnamed spawns reserve nothing, so a
+        // program that never names a child keeps its old near layout — the
+        // exit-only supervisor is byte-for-byte what it was.
         var aoff: u16 = self.spawn_base + self.spawn_count * 48;
+        {
+            var k: u16 = 0;
+            for (self.actor.body) |s| {
+                if (s != .spawn) continue;
+                if (s.spawn.bind) |name| {
+                    if (self.slots.contains(name))
+                        return self.fail(s.spawn.line, "a spawned child's name is already in use", Error.Semantics);
+                    try self.slots.put(name, aoff); // `grant`/`send` resolve here
+                    try self.child_caps.put(name, {});
+                    try self.childcap_of.put(k, aoff);
+                    aoff += 8;
+                }
+                k += 1;
+            }
+        }
         for (self.actor.params) |p| {
             if (p.ty != .addr_slice) continue;
             try self.arrays.put(p.name, .{ .ptr_slot = aoff, .area = area, .len = abi.group_cap });
@@ -4277,6 +4325,14 @@ const Gen = struct {
             // (dst_core == src_core never rides the mesh).
             self.uses_self = true;
             break :blk self.off_self;
+        } else if (std.mem.eql(u8, sd.target, "boss")) blk: {
+            // A child speaking up to its supervisor — the exit link's
+            // conversational twin. Probate already lets a child GRANT to
+            // `boss`; letting it SEND completes the pair, and it is how a
+            // screen tells the Cabinet it is ready to be lent the frame.
+            // The loader stages `boss` the same window either way.
+            self.uses_boss = true;
+            break :blk self.off_boss;
         } else self.slots.get(sd.target) orelse
             return self.fail(sd.line, "unknown send target", Error.Semantics);
 
@@ -5362,6 +5418,10 @@ pub const SpawnOut = struct {
     restarts: u64,
     watchdog: u64,
     args: []u64,
+    /// The supervisor's near slot for a capability to this child, when it
+    /// was named (`spawn … as w`). The loader mints the PTT entry — aimed
+    /// at the child's RX ring — and stages the window here. null = unnamed.
+    cap_off: ?u16 = null,
 };
 
 pub const Result = struct {
@@ -5566,6 +5626,8 @@ pub fn compile(
         .slots = std.StringHashMap(u16).init(arena),
         .lets = std.StringHashMap(bool).init(arena),
         .records = .init(arena),
+        .child_caps = .init(arena),
+        .childcap_of = .init(arena),
         .const_labels = std.StringHashMap(usize).init(arena),
         .strings = .init(arena),
         .arrays = .init(arena),
@@ -5626,6 +5688,7 @@ pub fn compile(
             .restarts = s.spawn.restarts,
             .watchdog = s.spawn.watchdog,
             .args = try alloc.dupe(u64, s.spawn.args),
+            .cap_off = gen.childcap_of.get(k),
         });
         k += 1;
     }

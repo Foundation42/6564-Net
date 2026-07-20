@@ -155,6 +155,11 @@ const Placed = struct {
     parent: ?usize = null,
     rec_off: u16 = 0,
     watchdog: u64 = 0,
+    /// A named child carries the near slot in its *parent* where the
+    /// loader stages the supervisor's capability to this child (`spawn …
+    /// as w`). 0 = unnamed (these slots live high in the near page, never
+    /// at 0, so 0 is an honest sentinel).
+    cap_off: u16 = 0,
 };
 
 const Group = struct { first: usize, count: usize };
@@ -337,6 +342,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                 .parent = i,
                 .rec_off = s.rec_off,
                 .watchdog = s.watchdog,
+                .cap_off = s.cap_off orelse 0,
             });
         }
         var adiag = asm6564.Diagnostic{};
@@ -549,6 +555,16 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             m.setWatchdog(p.core, p.ctx, p.watchdog);
             m.setWdexCeiling(p.core, p.ctx, p.watchdog);
             m.linkSupervisor(p.core, p.ctx, parent.ctx, ring.slot_cq);
+            if (p.cap_off != 0) {
+                // The exit link's twin: a capability in the *parent's* PTT
+                // space aimed at this child's RX ring, so the supervisor
+                // can grant an estate down (or send) to the child it
+                // named. Core-local, same as the child itself — SPWN keeps
+                // the ctx across respawns, so the name survives a restart.
+                const pnear2 = &m.cores[parent.core].contexts[parent.ctx].near;
+                const slot = try pttFor(&m, &ptt_map, ptt_next, parent.core, ring.PttEntry.loFrom(p.core, p.ctx, ring.slot_rx), joe.abi.token, .msg);
+                std.mem.writeInt(u64, pnear2[p.cap_off..][0..8], ring.windowAddr(slot, 0), .little);
+            }
         }
     }
 

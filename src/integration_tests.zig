@@ -687,6 +687,54 @@ test "A4 movement 3: a region may not leave its memory domain" {
     try testing.expectEqual(@as(u64, 0), o.varOf("arch", "got").?);
 }
 
+test "A4 movement 3: a supervisor lends the estate down to the child it named" {
+    // The honest gap movement 3 left, closed. Probate ran up (a screen to
+    // its Cabinet) and across (the Cabinet to a peer it was wired to), but
+    // never DOWN — `spawn` gave a supervisor no name for its child, so the
+    // Cabinet could bury a screen but not write to one. `spawn Screen(1)
+    // as screen` binds that name, and the estate flows the way A4.4 always
+    // meant it to: the Cabinet holds the frame for the machine's whole
+    // life, spawns a screen, and lends the frame to the screen it just
+    // started — but only once the screen says it is ready. That ordering
+    // is not ceremony: a supervisor cannot lend an estate to a child that
+    // is still being born, because the grant claims a descriptor slot and
+    // the child's own init would overwrite it. So the screen announces
+    // itself to `boss` after its regions are staged, and the Cabinet
+    // grants in reply. The screen signs for the estate and reads what the
+    // Cabinet wrote — a successor, not a peer, receiving an inheritance.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Ready { x u64 }
+        \\actor Screen(tick u64) {
+        \\    var frame region [64]u64
+        \\    var got u64 = 0
+        \\    send boss, Ready{1}
+        \\    serve {
+        \\        case handoff(h):
+        \\            adopt h as frame
+        \\            got = frame[0]
+        \\            halt ok
+        \\    }
+        \\}
+        \\actor Cabinet() {
+        \\    var frame region [64]u64
+        \\    spawn Screen(1) as screen restarts 0 watchdog 0
+        \\    serve {
+        \\        case Ready(r):
+        \\            frame[0] = 6564
+        \\            grant frame to screen
+        \\            halt ok
+        \\    }
+        \\}
+        \\system { cab = Cabinet() on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    // One grant, downward, and the successor read the estate it was lent.
+    try testing.expectEqual(@as(u64, 1), o.stats.grants);
+    try testing.expectEqual(@as(u64, 6564), o.varOf("cab/Screen#0", "got").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab").?.state);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability
