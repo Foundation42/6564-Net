@@ -44,6 +44,13 @@ const joe = @import("joe.zig");
 /// 0, it keeps no secrets — and `answers` marks the devices that reply,
 /// whose own reply window the loader aims back at the asking actor's
 /// RX ring.
+/// The vblank interval a display holds a frame before returning it: the
+/// backpressure that paces the frame loop. A stand-in for real display
+/// timing (there is no wall clock here) — large enough that Present is a
+/// real wait, small enough to keep test cycle counts honest. Parked
+/// cycles are free, so this does not inflate the instruction bill.
+const display_period: u64 = 2000;
+
 const device_table = [_]struct {
     name: []const u8,
     coord: u16,
@@ -64,6 +71,10 @@ const device_table = [_]struct {
     // window; no client can tell, and that is the point.
     .{ .name = "Matmul", .coord = 0xFF05, .dialect = .msg },
     .{ .name = "MatmulRemote", .coord = 0xFF06, .dialect = .msg },
+    // The display (rocci's device row): a granted frame goes in, a
+    // PresentDone (`case done`) comes back one vblank later. The grant is
+    // the pacing; the completion is the frame clock.
+    .{ .name = "Display", .coord = 0xFF07, .dialect = .msg },
 };
 
 const abi_token = joe.abi.token;
@@ -113,6 +124,10 @@ pub const Outcome = struct {
     console: ?[]u8 = null,
     cycles: u64,
     stats: machine.Stats,
+    /// The display's tally (rocci's frame clock): how many frames were
+    /// presented, and the checksum of the last one to reach the glass.
+    display_frames: u64 = 0,
+    display_checksum: u64 = 0,
 
     pub fn deinit(self: *Outcome) void {
         for (self.instances) |inst| {
@@ -394,6 +409,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             0xFF04 => try m.attachDevice(d.coord, d.token, .{ .net = dev.Net.init(alloc) }),
             0xFF05 => try m.attachAccel(d.coord, d.token, .inproc),
             0xFF06 => try m.attachAccel(d.coord, d.token, .remote),
+            0xFF07 => try m.attachDisplay(d.coord, d.token, display_period),
             else => unreachable,
         }
     }
@@ -607,10 +623,15 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         });
     }
     var console: ?[]u8 = null;
+    var display_frames: u64 = 0;
+    var display_checksum: u64 = 0;
     for (devices.items) |*d| {
         if (d.coord == 0xFF00) {
             console = try alloc.dupe(u8, m.device(d.coord).?.console.out.items);
-            break;
+        }
+        if (m.displayStats(d.coord)) |ds| {
+            display_frames = ds.frames;
+            display_checksum = ds.checksum;
         }
     }
     return .{
@@ -620,6 +641,8 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         .console = console,
         .cycles = max_clock,
         .stats = m.stats,
+        .display_frames = display_frames,
+        .display_checksum = display_checksum,
     };
 }
 

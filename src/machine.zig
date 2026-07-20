@@ -272,9 +272,20 @@ pub const DevEndpoint = struct {
 /// apart. Queue depth one: a busy accelerator rejects, and saturation is
 /// backpressure, never corruption.
 pub const Accel = struct {
-    kind: enum { inproc, remote },
+    kind: enum { inproc, remote, display },
     token: u64 = 0,
     busy: bool = false,
+    /// Display state (kind == .display). A display is an accelerator whose
+    /// "work" is to present: it takes a granted frame region, holds it for
+    /// one vblank interval, and returns it — the completion is the frame
+    /// clock, the grant is the pacing (rocci §2). `frames` counts presents;
+    /// `checksum` is the last frame's bytes summed, a headless stand-in for
+    /// a framebuffer that proves the actor's drawing reached the glass;
+    /// `period` is the vblank interval, the backpressure that paces the
+    /// frame loop.
+    frames: u64 = 0,
+    checksum: u64 = 0,
+    period: u64 = 0,
 };
 
 /// One granted matmul in flight: everything re-checked at completion
@@ -452,6 +463,26 @@ pub const Machine = struct {
         try self.accels.put(coord, .{ .kind = kind, .token = token });
     }
 
+    /// A display in the peripheral row: it takes a granted frame region,
+    /// holds it for one vblank `period`, presents it, and returns it. The
+    /// frame clock is backpressure — a second Present before PresentDone
+    /// is refused, so an actor cannot draw faster than the glass returns
+    /// its region (rocci §2). Single-buffered; the double buffer is two
+    /// regions alternating grants, a program's choice, not the display's.
+    pub fn attachDisplay(self: *Machine, coord: u16, token: u64, period: u64) !void {
+        std.debug.assert(coord >= dev.first_core and coord <= dev.last_core);
+        try self.accels.put(coord, .{ .kind = .display, .token = token, .period = period });
+    }
+
+    /// The last frame a display presented: how many, and a checksum of the
+    /// bytes that reached it. Read after a run — the headless proof that
+    /// what the actor drew is what the glass received.
+    pub fn displayStats(self: *Machine, coord: u16) ?struct { frames: u64, checksum: u64 } {
+        const ac = self.accels.getPtr(coord) orelse return null;
+        if (ac.kind != .display) return null;
+        return .{ .frames = ac.frames, .checksum = ac.checksum };
+    }
+
     /// A matmul request arrives (contract, all u64 LE words):
     ///   w0 reserved (joe's tag word — silicon ignores it)
     ///   w1 region desc slot   w2 token presented
@@ -464,6 +495,7 @@ pub const Machine = struct {
     /// saturation is backpressure.
     fn deliverToAccel(self: *Machine, due: u64, gram: mesh.Datagram) !void {
         const ac = self.accels.getPtr(gram.dst_core).?;
+        if (ac.kind == .display) return self.deliverToDisplay(due, gram, ac);
         const reject = struct {
             fn of(m: *Machine, d: u64, g: mesh.Datagram, s: ring.Status) !void {
                 m.stats.rejects += 1;
@@ -525,6 +557,7 @@ pub const Machine = struct {
                 self.stats.accel_pulls += chunks;
                 break :blk 400 + chunks * 200 + flops;
             },
+            .display => unreachable, // routed to deliverToDisplay above
         };
         const id = self.accel_next_id;
         self.accel_next_id += 1;
@@ -533,6 +566,64 @@ pub const Machine = struct {
         self.stats.delivered += 1;
         self.stats.dev_deliveries += 1;
         self.trace("accel ${X} @{d} grant slot{d} {d}x{d}x{d}", .{ gram.dst_core, due, job.slot, job.m, job.k, job.n });
+        try self.ackSender(due, gram, gram.dst_core, .ok, @intCast(gram.payload.len));
+    }
+
+    /// A Present request arrives (all u64 LE words):
+    ///   w0 reserved (joe's tag word — silicon ignores it)
+    ///   w1 region desc slot   w2 token presented
+    /// The whole region is the frame; there are no dimensions to give,
+    /// because a display does not compute, it presents. Grant-on-submit
+    /// sets OWNED; the completion after one vblank interval snapshots the
+    /// frame and is the release fence. `busy` makes the display single-
+    /// buffered: a second Present before PresentDone is backpressure —
+    /// the frame clock refusing to run ahead of the glass.
+    fn deliverToDisplay(self: *Machine, due: u64, gram: mesh.Datagram, ac: *Accel) !void {
+        const reject = struct {
+            fn of(m: *Machine, d: u64, g: mesh.Datagram, s: ring.Status) !void {
+                m.stats.rejects += 1;
+                try m.ackSender(d, g, g.dst_core, s, 0);
+            }
+        }.of;
+        if (ac.token != 0 and ac.token != gram.token)
+            return reject(self, due, gram, .reject_capability);
+        if (ac.busy or gram.payload.len < 24)
+            return reject(self, due, gram, .reject_no_buffer);
+        const pend = self.pending.get(gram.send_id) orelse
+            return reject(self, due, gram, .reject_capability);
+        const w = struct {
+            fn at(p: []const u8, i: usize) u64 {
+                return std.mem.readInt(u64, p[i * 8 ..][0..8], .little);
+            }
+        }.at;
+        const job = AccelJob{
+            .coord = gram.dst_core,
+            .core = pend.reply.core,
+            .ctx = pend.reply.ctx,
+            .slot = @truncate(w(gram.payload, 1)),
+            .token = w(gram.payload, 2),
+            .m = 0,
+            .k = 0,
+            .n = 0,
+            .off_a = 0,
+            .off_b = 0,
+            .off_c = 0,
+        };
+        const desc = self.regionDesc(job) orelse
+            return reject(self, due, gram, .reject_capability);
+        if (desc.token == 0 or desc.token != job.token)
+            return reject(self, due, gram, .reject_capability);
+        if (desc.flags & ring.desc_flag_owned != 0)
+            return reject(self, due, gram, .reject_no_buffer); // a frame is already up
+        self.setRegionOwned(job, true);
+        ac.busy = true;
+        const id = self.accel_next_id;
+        self.accel_next_id += 1;
+        try self.accel_jobs.put(id, job);
+        try self.events.add(.{ .due = due + ac.period, .seq = self.nextSeq(), .kind = .{ .accel = .{ .id = id } } });
+        self.stats.delivered += 1;
+        self.stats.dev_deliveries += 1;
+        self.trace("display ${X} @{d} present slot{d}", .{ gram.dst_core, due, job.slot });
         try self.ackSender(due, gram, gram.dst_core, .ok, @intCast(gram.payload.len));
     }
 
@@ -658,32 +749,50 @@ pub const Machine = struct {
     fn accelComplete(self: *Machine, due: u64, id: u64) !void {
         const kv = self.accel_jobs.fetchRemove(id) orelse return;
         const job = kv.value;
-        if (self.accels.getPtr(job.coord)) |ac| ac.busy = false;
+        const acp = self.accels.getPtr(job.coord);
+        if (acp) |ac| ac.busy = false;
+        const is_display = acp != null and acp.?.kind == .display;
         var ok = false;
         if (self.regionDesc(job)) |desc| {
             if (desc.token != 0 and desc.token == job.token) {
-                // the DMA: C[i,j] = Σ_k A[i,k]·B[k,j], k ascending — the
-                // declared-deterministic contract, bit for bit
                 const core = &self.cores[job.core];
                 const ctx = &core.contexts[job.ctx];
-                var i: u64 = 0;
-                outer: while (i < job.m) : (i += 1) {
-                    var j: u64 = 0;
-                    while (j < job.n) : (j += 1) {
-                        var acc: f64 = 0;
-                        var kk: u64 = 0;
-                        while (kk < job.k) : (kk += 1) {
-                            const a_at = desc.base + job.off_a + (i * job.k + kk) * 8;
-                            const b_at = desc.base + job.off_b + (kk * job.n + j) * 8;
-                            const av: f64 = @bitCast(read64(core, ctx, a_at) catch break :outer);
-                            const bv: f64 = @bitCast(read64(core, ctx, b_at) catch break :outer);
-                            acc += av * bv;
-                        }
-                        const c_at = desc.base + job.off_c + (i * job.n + j) * 8;
-                        write64(core, ctx, c_at, @bitCast(acc)) catch break :outer;
+                if (is_display) {
+                    // Present: read the frame the actor drew (deferred —
+                    // a revoked grant would have failed the token check
+                    // above and scribbled nothing) and snapshot it. The
+                    // whole region is the frame; its checksum is the proof
+                    // the drawing reached the glass.
+                    var sum: u64 = 0;
+                    var off: u64 = 0;
+                    while (off + 8 <= desc.len) : (off += 8) {
+                        sum +%= read64(core, ctx, desc.base + off) catch break;
                     }
+                    acp.?.frames += 1;
+                    acp.?.checksum = sum;
+                    ok = true;
+                } else {
+                    // the DMA: C[i,j] = Σ_k A[i,k]·B[k,j], k ascending — the
+                    // declared-deterministic contract, bit for bit
+                    var i: u64 = 0;
+                    outer: while (i < job.m) : (i += 1) {
+                        var j: u64 = 0;
+                        while (j < job.n) : (j += 1) {
+                            var acc: f64 = 0;
+                            var kk: u64 = 0;
+                            while (kk < job.k) : (kk += 1) {
+                                const a_at = desc.base + job.off_a + (i * job.k + kk) * 8;
+                                const b_at = desc.base + job.off_b + (kk * job.n + j) * 8;
+                                const av: f64 = @bitCast(read64(core, ctx, a_at) catch break :outer);
+                                const bv: f64 = @bitCast(read64(core, ctx, b_at) catch break :outer);
+                                acc += av * bv;
+                            }
+                            const c_at = desc.base + job.off_c + (i * job.n + j) * 8;
+                            write64(core, ctx, c_at, @bitCast(acc)) catch break :outer;
+                        }
+                    }
+                    ok = i == job.m;
                 }
-                ok = i == job.m;
             }
         }
         self.setRegionOwned(job, false); // the release fence precedes the record

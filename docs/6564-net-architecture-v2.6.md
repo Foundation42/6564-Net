@@ -643,6 +643,7 @@ Defined for the reference simulator; the set is open, the conventions above are 
 | `block` | `$FF03` | Request {tag, reply window, op \| sector, data…}. A write applies at delivery — the fabric ack **is** the write ack. A read sends {tag, the sector} to the reply window. Both idempotent by construction. |
 | `net` | `$FF04` | The raw byte pipe to real TCP — open {tag, reply window, op, port, host} → {tag, connection id}; send bytes (the ack is the write ack); recv {tag, reply window, op, max} → {tag, 0..max bytes}, where a TAG-ONLY reply means "ask again" and a REJECTED request means EOF: the ack vocabulary is the framing. No protocol opinion — that lives in §7.5. |
 | `matmul` | `$FF05` (in-proc), `$FF06` (remote polyfill) | The first accelerator actor (§7.6): request {reserved word, region slot, token, M\|K\|N, three in-region offsets}; C ⟵ A·B inside the granted region; completion via the `$6772` convention. Declares `deterministic`: k ascending, IEEE RNE — the two implementations agree to the bit. |
+| `display` | `$FF07` | The frame clock (§7.7): request `Present {reserved word, region slot, token}`; the granted region is presented and returned one vblank interval later as `PresentDone` (the `$6772` completion). Single-buffered — a second `Present` in flight is refused; the backpressure *is* the frame rate. |
 
 An off-die network bridge is the row's natural fifth citizen: a NIC is just another device. As of v2.4 the plane beneath it is architectural (§6.5) — multi-die topologies arrived as an extension, not a redesign — and as of v2.5 the `net` device is the pipe off the board entirely.
 
@@ -689,6 +690,39 @@ and a software polyfill are indistinguishable per §7.5 — the
 reference implementation proves it with gates-vs-window-pull twins
 that agree to the bit. Silicon is an optimization, never an
 interface; now with numbers attached.
+
+### 7.7 The Display: a Completion Is a Clock (v2.6)
+
+A display is an accelerator (§7.6) whose work is to *present*. A core
+grants it a frame region — `Present {reserved word, region slot,
+token}`, the accelerator submission minus the dimensions, because a
+display does not compute, it shows — and the region is hardware-owned
+(§6.2) from the submission until the completion. One vblank interval
+later the display returns it: `PresentDone`, the ordinary `$6772` grant
+completion, which rebinds the region and hands the frame back.
+
+The consequence is the whole point. **Nobody calls a 6564 actor**, so a
+frame loop cannot be a platform calling `update()` sixty times a second.
+It is backpressure: a core cannot draw again until the display returns
+the region, and a single-buffered display returns it exactly once per
+frame. The completion *is* the frame clock; the grant *is* the pacing.
+A second `Present` while a frame is up is refused — saturation is
+backpressure, per §5.4 — and at the language level it cannot even be
+written, because the region is type-state-locked between grant and
+completion (§6.2): the runtime refusal is the early static check's twin
+(§2.3). The double buffer is not a queue the display grows on the
+program's behalf; it is two regions the program alternates, two grants
+in flight against two frames, the display still single-buffered per
+region. A frame's worst-case cost is priceable against the ISA table
+(every sprite a constant extent), so a display contract can be certified
+never to miss its vblank by surprise — the arithmetic lies die at
+compile time, and a game has no data lies to tell.
+
+This is the peripheral row's second *pushing* device by nature (§7.1,
+the line that named "a display's vblank"): the completion arrives unasked
+in the sense that no `RECV` solicited *this* frame's return — the grant
+did, one frame ago. Determinism is total inward (§7.4): the frame the
+glass receives is the frame the core drew, checksum for checksum.
 
 ---
 

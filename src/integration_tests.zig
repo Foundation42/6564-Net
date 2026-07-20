@@ -832,6 +832,49 @@ test "A4.7 dynamic spawn: one site, two incarnations, one capability" {
     try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Screen#0").?.state);
 }
 
+test "device row: the display is the frame clock — grant, present, get it back" {
+    // rocci §2, in the flesh. Nobody calls a 6564 actor, so where does
+    // 60Hz come from? Backpressure. The screen grants its frame to the
+    // display and cannot draw again until the display returns it; the
+    // completion IS the clock, the grant IS the pacing. Here the screen
+    // presents three frames, bumping a marker each time, and cannot run
+    // ahead of the glass — each Present waits for the PresentDone that a
+    // single-buffered display only sends when it has finished the last.
+    // The display counts what it presented and checksums the final frame:
+    // proof the drawing reached the glass, not just that a message did.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Present { f grant }
+        \\actor Screen(display addr) {
+        \\    var frame region [8]u64
+        \\    var frames u64 = 0
+        \\    frame[0] = 6564
+        \\    send display, Present{grant frame}
+        \\    serve {
+        \\        case done(frame):
+        \\            frames += 1
+        \\            if frames >= 3 {
+        \\                quiesce
+        \\            } else {
+        \\                frame[0] = frame[0] + 1
+        \\                send display, Present{grant frame}
+        \\            }
+        \\        case failed(frame):
+        \\            quiesce
+        \\    }
+        \\}
+        \\system {
+        \\    scr = Screen(display) on 0
+        \\    display = Display()
+        \\}
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    // Three frames drawn, three presented, and the glass saw the last one
+    // the screen drew — frame[0] = 6564 + 2, the rest of the region zero.
+    try testing.expectEqual(@as(u64, 3), o.varOf("scr", "frames").?);
+    try testing.expectEqual(@as(u64, 3), o.display_frames);
+    try testing.expectEqual(@as(u64, 6566), o.display_checksum);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability

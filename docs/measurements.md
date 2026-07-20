@@ -1415,3 +1415,49 @@ transitions that spawn the next, a frame lent down each life and returned
 by death. rocci-bird is no longer waiting on the language; what it waits
 on now is a device row (display, pad, APU) and the PresentDone frame
 clock — machine work, not language work.
+
+## The device row opens: the display, and a completion that is a clock
+
+rocci-bird's frame clock, in the flesh (sketch §2). A display is an
+accelerator (§7.6) whose work is to present: a core grants it a frame
+region, the region is hardware-owned until the completion, and one vblank
+interval later `PresentDone` — the ordinary `$6772` grant completion,
+routed by `case done(frame)` — hands the region back. No new joe surface:
+the grant-message and completion-case machinery built for the matmul
+accelerator (item 6) *is* the display's interface. The whole device is
+machine.zig (a `display` accel kind) plus one loader line and a result
+field; the language did not move.
+
+| claim | outcome |
+|---|---|
+| a granted frame is presented and returned as a clock | ✓ screen presents 3 frames, each waiting on the last's `PresentDone` |
+| the glass receives what the core drew | ✓ display checksum = 6566, the final `frame[0] = 6564 + 2`, rest zero |
+| the loop is backpressure, not a caller | ✓ the screen cannot draw ahead — `send Present` blocks on `case done` |
+| single-buffer is enforced at both levels | ✓ machine refuses a second Present (OWNED); the compiler locks the region first |
+| matmul is unchanged by the shared completion path | ✓ matmul.joe checksum 379, bit-identical |
+| the frozen ASM baseline is unmoved | ✓ 2820 B / 171,532 instr / 479,275 cy / 13,281 switches, a sixth time |
+
+149 tests.
+
+**Why the display is an accelerator, not a `dev.zig` device.** A `dev.zig`
+device sees only a payload — it cannot read the granting context's region
+memory. The display presents a *region*, so it lives with the accelerator
+machinery that already reads regions under the deferred-read discipline
+(revocation between grant and present turns into a clean reject, nothing
+scribbled). The completion latency, which for the matmul is a compute
+cost, is for the display the vblank interval — the backpressure that
+paces the frame loop. Parked cycles are free, so a realistic period does
+not inflate the instruction bill.
+
+**The single-buffer refusal is the type-state lock's runtime twin (§2.3).**
+The machine refuses a second Present while a frame is up (the region is
+OWNED); well-typed single-region joe cannot even reach that refusal,
+because the region is locked between grant and completion at compile
+time. The static check is the early copy of the dynamic one — the healthy
+direction — so the runtime guard is defence in depth, not a smell.
+
+Next on the row: the **pad** (a device that pushes `Pad{buttons}` unasked
+— input as messages the actor latches) and the **APU** (a fire-and-forget
+`Tone` sink — sound as a send that expects no answer). With those and the
+frame clock, rocci-bird's society is fully wired; what remains is the game
+itself.
