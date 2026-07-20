@@ -1790,3 +1790,36 @@ display actually scans out is the render-for-real work, and it arrives with
 hot-swappable plug-in devices) and **double buffering**, whose latency-
 hiding finally has something to hide behind once a real display scans real
 pixels.
+
+## Per-pipe gaps — the second SoA attribute, and real flappy (2026-07-20)
+
+The quick win the last entry named: each pipe now carries its own gap
+height, a **second SoA lane beside its x**. `var gap_y vec` is the
+List(Pipe)'s second field, and the gap rides with the lane — so when a pipe
+recycles off the left edge (the `where` wrap) its gap comes back around
+with it, and the bird sees the same eight gaps repeat, high and low.
+
+Reading the gap of the pipe *over the column* is a **lanewise gather written
+as a multiply and a reduce**: the same 1.0/0.0 mask that says "a pipe is
+here" (`pipe_x > 14 · pipe_x < 26`), multiplied by `gap_y` and summed,
+plucks out exactly that one pipe's gap centre (spacing 20 > band 12, so at
+most one lane is set). The draw then carves `[centre−18, centre+18)` open,
+clamped at the ceiling so a high gap opens to the top and the integer
+subtract never underflows. No new machine or language surface — it is the
+mask surface paying rent a third time (count, select, now gather).
+
+The game is real flappy now. With the recorded input the bird **threads
+five varied gaps** — climbing from y≈22 down to 13, then diving to 56 — and
+when the sixth pipe's gap sits high while she is falling past it she cannot
+reach it and clips it at frame 58, `score = 5`, `cause = 2` (a pipe, not
+the floor). The gap sequence is choreographed to the recording: input is
+the only nondeterminism, so a fixed trace and a fixed field are a fixed
+game — a TAS by construction (sketch §4), and tuning the level *is* tuning
+the recording. The joey golden pins it exactly (58 frames, 5 points, 8
+tones = 2 flaps + 5 points + 1 death).
+
+The "bird laps the field" endless test is **retired**: with real gaps the
+bird is mortal, so lapping the field would need a full TAS solve of a
+90-frame varied-gap run, not a hover. The *field* still recycles — that is
+the `where` unit test's job (a wrap `→ 830`), and it stands. Frozen table
+unmoved (this increment is joey.joe only). 158 tests.

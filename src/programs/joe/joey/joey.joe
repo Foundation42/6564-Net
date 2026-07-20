@@ -42,6 +42,8 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
     var score u64 = 0
     var flaps u64 = 0
     var cause u64 = 0                // how the game ended: 1 floor, 2 pipe
+    var gtop u64 = 0                 // the open gap's top row, this frame
+    var gbot u64 = 0                 // and its bottom row (exclusive)
 
     // The pipes: eight of them, as a single vector — Roc's List(Pipe) as
     // SoA lanes (sketch §6.1, the item-5 workload in miniature). They
@@ -51,8 +53,15 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
     var passed vec                   // 1.0 in each lane that just crossed
     var atcol vec                    // 1.0 in each lane now over the player
     var atcol2 vec                   // scratch for the second half of the band
+    var gap_y vec                    // each pipe's gap centre — its own lane
 
     pipe_x = [40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]
+    // Each pipe carries its own gap height, a second SoA attribute beside
+    // its x. The gap rides with the lane, so when a pipe recycles off the
+    // left edge (the `where` wrap) its gap comes back around with it — the
+    // bird sees the same eight gaps repeat, high and low, and must climb and
+    // dive to match. This is the List(Pipe) of the Roc, two fields wide.
+    gap_y = [22.0, 13.0, 15.0, 30.0, 56.0, 30.0, 74.0, 50.0]
 
     send pad, Poll{}                          // subscribe to input
     send display, Present{grant frame}        // the clock starts here
@@ -102,12 +111,30 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
             atcol = atcol * atcol2
             let blocked = int(atcol.reduce(+))
 
-            // Draw the world into the column: the gap [30, 85) is open sky,
-            // every other row is pipe body when a pipe is over the column.
-            // The bird is NOT drawn — that omission is the whole point of the
-            // peek that follows. 135 STBs, one region, no player in it.
+            // Which gap does the pipe over the column carry? The mask has one
+            // lane set (spacing 20 > band 12), so masking gap_y by it and
+            // summing plucks out that one pipe's gap centre — a lanewise
+            // gather written as a multiply and a reduce. Zero when no pipe is
+            // over the column, which the draw below treats as all-open.
+            atcol = atcol * gap_y
+            let gap = int(atcol.reduce(+))
+            // The open band is the gap centre ± 18, clamped at the ceiling so
+            // a high gap opens to the top of the screen (and integer subtract
+            // never underflows). No pipe → gap = 0 → an empty band the draw
+            // fills with blocked = 0 anyway: all open.
+            gbot = gap + 18
+            gtop = 0
+            if gap >= 18 {
+                gtop = gap - 18
+            }
+
+            // Draw the world into the column: the band [gtop, gbot) is open
+            // sky, every other row is pipe body when a pipe is over the
+            // column. The bird is NOT drawn — that omission is the whole
+            // point of the peek that follows. 135 STBs, one region, no player
+            // in it.
             for r in 0..135 {
-                if r >= 8 && r < 100 {
+                if r >= gtop && r < gbot {
                     frame[r] = 0
                 } else {
                     frame[r] = blocked

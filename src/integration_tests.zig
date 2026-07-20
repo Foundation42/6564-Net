@@ -1096,17 +1096,18 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     // The bird flapped (input reached it and moved it), presented frames
     // (the display counted them), played tones (flaps, points, and the
     // death), and died ON A PIPE — the pixel-peek, not the floor. Golden
-    // values: the run is deterministic, so these are exact. With these two
-    // flaps she cleared six gaps and then, when the input ran out and she
-    // fell, dropped out of the gap and clipped a pipe at frame 61 — at
-    // height ~102, well above the floor (134). `cause = 2` is the pipe;
-    // `cause = 1` would be the floor. Nine tones = 2 flaps + 6 points + 1
-    // death. The collision is the byte framebuffer read back under her.
-    try testing.expectEqual(@as(u64, 61), o.varOf("game", "t").?);
-    try testing.expectEqual(@as(u64, 61), o.display_frames);
+    // values: the run is deterministic, so these are exact. Each pipe now
+    // carries its own gap height (an SoA lane), so this is real flappy: she
+    // threads five varied gaps — climbing from y≈22 down to 13, then diving
+    // to 56 — and when the sixth pipe's gap sits high while she is falling
+    // past it, she cannot reach it and clips it at frame 58, height ~87,
+    // above the floor (134). `cause = 2` is the pipe; `cause = 1` the floor.
+    // Eight tones = 2 flaps + 5 points + 1 death.
+    try testing.expectEqual(@as(u64, 58), o.varOf("game", "t").?);
+    try testing.expectEqual(@as(u64, 58), o.display_frames);
     try testing.expectEqual(@as(u64, 2), o.varOf("game", "flaps").?);
-    try testing.expectEqual(@as(u64, 6), o.varOf("game", "score").?);
-    try testing.expectEqual(@as(u64, 9), o.apu_tones);
+    try testing.expectEqual(@as(u64, 5), o.varOf("game", "score").?);
+    try testing.expectEqual(@as(u64, 8), o.apu_tones);
     try testing.expectEqual(@as(u64, 30), o.pad_pushed);
     // She died on a pipe (cause 2), not the floor (cause 1) — and her
     // height at death proves it: a pipe body, not the ground.
@@ -1119,28 +1120,6 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
         o.varOf("game", "score").?,
         o.varOf("ref", "final_score").?,
     );
-}
-
-test "joey-bird: the pipes are endless — a longer-lived bird laps the field (where)" {
-    // With the old eight fixed pipes the score capped at eight: each pipe
-    // crossed the player once and was gone. `where` recycles a pipe off the
-    // left edge back to the right (+160, phase-preserving), so a bird kept
-    // in the gap long enough laps the whole field and scores again. This
-    // trace flaps every 24 frames — a rough hover inside the [8,100) gap —
-    // and she clears the eighth pipe (one full lap, ~frame 80) and keeps
-    // going, scoring past eight before drift eventually walks her out of the
-    // gap onto a pipe. Observed: she scores 10 by frame 100. The score past
-    // eight is the point: only a recycled field can produce it.
-    var trace: [300]u64 = .{0} ** 300;
-    var i: usize = 0;
-    while (i < trace.len) : (i += 24) trace[i] = 1;
-    var o = try @import("joe_run.zig").simulate(testing.allocator,
-        @embedFile("programs/joe/joey/joey.joe"),
-        .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },
-    );
-    defer o.deinit();
-    // Past the eight-pipe cap: the field wrapped and scored a second time.
-    try testing.expect(o.varOf("game", "score").? > 8);
 }
 
 test "A4.9 capability-passing spawn: the Cabinet spawns the bird, lending the device row" {
