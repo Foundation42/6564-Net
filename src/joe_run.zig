@@ -51,6 +51,11 @@ const joe = @import("joe.zig");
 /// cycles are free, so this does not inflate the instruction bill.
 const display_period: u64 = 2000;
 
+/// Cycles between pad pushes — the input rate. Pushes are interval-apart
+/// so they arrive in order; the value only has to be a real gap, since
+/// parked cycles between inputs are free.
+const pad_interval: u64 = 1500;
+
 const device_table = [_]struct {
     name: []const u8,
     coord: u16,
@@ -78,6 +83,10 @@ const device_table = [_]struct {
     // The APU: `send apu, Tone{n}` — a plain message, fire-and-forget. A
     // sink that counts what it was told to play.
     .{ .name = "Apu", .coord = 0xFF08, .dialect = .msg },
+    // The pad: the one device that pushes. An actor subscribes with an
+    // ask (`send pad, Poll{}`, `Poll -> Pad`) and the pad streams input.
+    // Answers like an asking device, so `reply_claim` aims its window here.
+    .{ .name = "Pad", .coord = 0xFF09, .answers = true, .dialect = .ask },
 };
 
 const abi_token = joe.abi.token;
@@ -104,6 +113,11 @@ pub const Options = struct {
     /// Item 7's measurement flag: route eligible byte-equality sites
     /// through the shared MAC comparator.
     use_mac: bool = false,
+    /// The pad's input trace (rocci's device row): the button states the
+    /// pad pushes, one per entry, in order. Empty = a silent pad. This is
+    /// the deterministic (harness) source; a seed-driven or real pad is a
+    /// separate implementation of the same contract (§7.5). Caller-owned.
+    pad_trace: []const u64 = &.{},
 };
 
 pub const VarOut = struct { name: []const u8, value: u64, f64: bool = false };
@@ -137,6 +151,8 @@ pub const Outcome = struct {
     apu_tones: u64 = 0,
     apu_last: u64 = 0,
     apu_sum: u64 = 0,
+    /// The pad's tally: how many input frames it pushed to its subscriber.
+    pad_pushed: u64 = 0,
 
     pub fn deinit(self: *Outcome) void {
         for (self.instances) |inst| {
@@ -420,6 +436,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             0xFF06 => try m.attachAccel(d.coord, d.token, .remote),
             0xFF07 => try m.attachDisplay(d.coord, d.token, display_period),
             0xFF08 => try m.attachDevice(d.coord, d.token, .{ .apu = .{} }),
+            0xFF09 => try m.attachPad(d.coord, d.token, opts.pad_trace, pad_interval),
             else => unreachable,
         }
     }
@@ -638,6 +655,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
     var apu_tones: u64 = 0;
     var apu_last: u64 = 0;
     var apu_sum: u64 = 0;
+    var pad_pushed: u64 = 0;
     for (devices.items) |*d| {
         if (m.device(d.coord)) |dv| switch (dv.*) {
             .console => |*c| console = try alloc.dupe(u8, c.out.items),
@@ -646,6 +664,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                 apu_last = a.last;
                 apu_sum = a.sum;
             },
+            .pad => |*pd| pad_pushed = pd.pushed,
             else => {},
         };
         if (m.displayStats(d.coord)) |ds| {
@@ -665,6 +684,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         .apu_tones = apu_tones,
         .apu_last = apu_last,
         .apu_sum = apu_sum,
+        .pad_pushed = pad_pushed,
     };
 }
 

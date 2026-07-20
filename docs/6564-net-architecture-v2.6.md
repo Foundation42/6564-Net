@@ -645,6 +645,7 @@ Defined for the reference simulator; the set is open, the conventions above are 
 | `matmul` | `$FF05` (in-proc), `$FF06` (remote polyfill) | The first accelerator actor (§7.6): request {reserved word, region slot, token, M\|K\|N, three in-region offsets}; C ⟵ A·B inside the granted region; completion via the `$6772` convention. Declares `deterministic`: k ascending, IEEE RNE — the two implementations agree to the bit. |
 | `display` | `$FF07` | The frame clock (§7.7): request `Present {reserved word, region slot, token}`; the granted region is presented and returned one vblank interval later as `PresentDone` (the `$6772` completion). Single-buffered — a second `Present` in flight is refused; the backpressure *is* the frame rate. |
 | `apu` | `$FF08` | The sound sink: `Tone {tag, value}`, a plain message with no reply. Fire-and-forget — you do not wait on a sound. The headless model tallies count and values; a real APU is a separate implementation of the same silent contract. |
+| `pad` | `$FF09` | Input, pushed (§7.8): an actor subscribes with a `Poll` ask (`Poll -> Pad`), and the pad streams `Pad {buttons}` to the ask's reply window using its echoed tag, one per input frame. The harness pad plays a fixed trace (deterministic replay, §7.4); a seed-driven or real pad is a separate implementation of the same contract. |
 
 An off-die network bridge is the row's natural fifth citizen: a NIC is just another device. As of v2.4 the plane beneath it is architectural (§6.5) — multi-die topologies arrived as an extension, not a redesign — and as of v2.5 the `net` device is the pipe off the board entirely.
 
@@ -724,6 +725,33 @@ the line that named "a display's vblank"): the completion arrives unasked
 in the sense that no `RECV` solicited *this* frame's return — the grant
 did, one frame ago. Determinism is total inward (§7.4): the frame the
 glass receives is the frame the core drew, checksum for checksum.
+
+### 7.8 The Pad: a Subscription Is an Ask That Never Stops Answering (v2.6)
+
+A WASM-4 game *polls* the gamepad; a 6564 actor is *pushed* to — the pad
+is the row's first genuinely unsolicited device, and the question it
+poses is how an actor names itself as the target of pushes it did not
+individually request. The answer needs no new mechanism: it is the
+echoed-tag ask (§7.3), read as a subscription. The actor sends one
+`Poll` ask (`Poll -> Pad`), which stages the reply message's tag and a
+reply window exactly as any device ask does; the pad captures both and,
+instead of answering once, streams `Pad {buttons}` to that window under
+that tag, one message per input frame. `case Pad(p)` matches them like
+any message; the actor latches `p.buttons` and reads edges at frame time.
+**A subscription is an ask whose answer never stops coming** — the whole
+of it reuses the reply-window wiring and the tag convention already on
+the row.
+
+Pushes ride the ordinary fault-injected fabric: a dropped push is a
+dropped input frame, which is what a real controller on a real link does
+too, and an idempotent latch is the correct response — the next frame's
+state supersedes it. Because input is the machine's only nondeterminism
+(§7.4) and it arrives as messages, recording the trace makes the whole
+run replayable: same seed, same trace, same game, bit for bit — TAS
+support as a corollary of the determinism bar. Silicon is an optimization
+(§7.5): the reference pad plays a fixed trace, a seed-driven pad generates
+one, a real pad reads hardware, and the actor holding the capability
+cannot tell which — only the trace's *source* differs, never the contract.
 
 ---
 

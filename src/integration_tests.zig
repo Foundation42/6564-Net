@@ -906,6 +906,44 @@ test "device row: the APU is a fire-and-forget sink — tones, no answer" {
     try testing.expectEqual(@as(u64, 3), o.varOf("p", "played").?);
 }
 
+test "device row: the pad pushes, the actor latches — input as a subscription" {
+    // rocci §1: a WASM-4 game polls the gamepad; a 6564 actor is pushed
+    // to. The Game subscribes once with an ordinary ask — `send pad,
+    // Poll{}`, where `Poll -> Pad` — and the pad streams `Pad{buttons}`
+    // to the ask's reply window, one per input frame, using the ask's
+    // echoed tag. No new wiring: a subscription is an ask whose answer
+    // never stops coming. The trace is a fixed sequence, so the run is a
+    // recording that replays bit for bit (§4).
+    const trace = [_]u64{ 1, 4, 6 };
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\message Pad { buttons u64 }
+        \\message Poll -> Pad {}
+        \\actor Game(pad addr) {
+        \\    var latched u64 = 0
+        \\    var frames u64 = 0
+        \\    send pad, Poll{}
+        \\    serve {
+        \\        case Pad(p):
+        \\            latched = p.buttons
+        \\            frames += 1
+        \\            if frames >= 3 {
+        \\                quiesce
+        \\            }
+        \\    }
+        \\}
+        \\system {
+        \\    g = Game(pad) on 0
+        \\    pad = Pad()
+        \\}
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace });
+    defer o.deinit();
+    // Three inputs pushed, three latched, and the last one held — pushes
+    // are interval-apart, so they arrive in the order they were recorded.
+    try testing.expectEqual(@as(u64, 3), o.pad_pushed);
+    try testing.expectEqual(@as(u64, 3), o.varOf("g", "frames").?);
+    try testing.expectEqual(@as(u64, 6), o.varOf("g", "latched").?);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability

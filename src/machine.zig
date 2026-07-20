@@ -483,6 +483,14 @@ pub const Machine = struct {
         return .{ .frames = ac.frames, .checksum = ac.checksum };
     }
 
+    /// A pad in the peripheral row: a device that pushes. The trace is the
+    /// button sequence (caller-owned), `interval` the input rate. It stays
+    /// silent until an actor subscribes with a Poll ask, then streams one
+    /// `Pad` per trace entry to the ask's reply window.
+    pub fn attachPad(self: *Machine, coord: u16, token: u64, input_trace: []const u64, interval: u64) !void {
+        try self.attachDevice(coord, token, .{ .pad = .{ .trace = input_trace, .interval = interval } });
+    }
+
     /// A matmul request arrives (contract, all u64 LE words):
     ///   w0 reserved (joe's tag word — silicon ignores it)
     ///   w1 region desc slot   w2 token presented
@@ -1323,6 +1331,40 @@ pub const Machine = struct {
             if (res.reply) |r| try self.deviceReply(ep, due, r);
         }
         try self.ackSender(due, gram, gram.dst_core, status, count);
+        // A pad's Poll starts its stream: the answer to a subscription is a
+        // sequence of pushes, not one reply. One Poll, one stream.
+        switch (ep.dev) {
+            .pad => |*pad| if (status == .ok and !pad.streaming) {
+                pad.streaming = true;
+                try self.events.add(.{ .due = due + pad.interval, .seq = self.nextSeq(), .kind = .{ .pad = .{ .coord = gram.dst_core } } });
+            },
+            else => {},
+        }
+    }
+
+    /// A pad's turn: push the next button state to the subscriber and
+    /// schedule the one after, until the trace runs dry. The push is an
+    /// ordinary device reply — same PTT capability, same fault-injected
+    /// fabric, so a dropped push is a dropped input frame, as it would be
+    /// on real hardware.
+    fn padPush(self: *Machine, due: u64, coord: u16) !void {
+        const ep = self.devices.getPtr(coord) orelse return;
+        const pad = switch (ep.dev) {
+            .pad => |*p| p,
+            else => return,
+        };
+        if (pad.index >= pad.trace.len) return; // the trace is spent
+        const buttons = pad.trace[pad.index];
+        pad.index += 1;
+        pad.pushed += 1;
+        var data: [16]u8 = undefined;
+        std.mem.writeInt(u64, data[0..8], pad.tag, .little);
+        std.mem.writeInt(u64, data[8..16], buttons, .little);
+        var r = dev.Reply{ .window = pad.window };
+        r.data.appendSlice(&data) catch return;
+        try self.deviceReply(ep, due, r);
+        if (pad.index < pad.trace.len)
+            try self.events.add(.{ .due = due + pad.interval, .seq = self.nextSeq(), .kind = .{ .pad = .{ .coord = coord } } });
     }
 
     /// Fire a device reply through the device's PTT: same capability
@@ -1493,6 +1535,7 @@ pub const Machine = struct {
             .ack => |a| try self.completeSend(a.send_id, a.status, a.byte_count),
             .timeout => |t| try self.completeSend(t.send_id, .timeout, 0),
             .accel => |a| try self.accelComplete(ev.due, a.id),
+            .pad => |pd| try self.padPush(ev.due, pd.coord),
         }
     }
 

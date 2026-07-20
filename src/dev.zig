@@ -129,6 +129,50 @@ pub const Apu = struct {
     }
 };
 
+// ── Pad: input as messages the actor latches ─────────────────────────────
+//
+// The one device that pushes. A WASM-4 game POLLS the gamepad; a 6564
+// actor is pushed to — `case Pad(p): buttons = p.buttons`, and edges
+// belong to frame time (rocci §1). The actor subscribes once with an
+// ordinary A3.3 device ask, `send pad, Poll{}` where `Poll -> Pad`, and
+// the pad streams `Pad{buttons}` to the ask's reply window using the
+// ask's echoed tag: no new wiring, no new tag lookup — a subscription is
+// an ask whose answer never stops coming.
+//
+// This is the deterministic (harness) implementation of the pad contract:
+// the button sequence is a fixed trace, so a recorded game replays bit
+// for bit (rocci §4, TAS as a corollary of determinism). A seed-driven
+// pad generates the trace from a seed; a real pad reads hardware. All
+// three satisfy the same contract — the actor cannot tell which it holds
+// (§7.5). Only the trace source differs.
+
+pub const Pad = struct {
+    /// The button states to push, in order. Caller-owned (outlives the
+    /// run); the machine schedules one push per entry.
+    trace: []const u64,
+    /// Cycles between pushes — the input rate. Pushes are interval-apart,
+    /// so they arrive in order (unlike a same-instant fire-and-forget burst).
+    interval: u64,
+    index: usize = 0,
+    pushed: u64 = 0,
+    /// Captured from the Poll: the reply (Pad) tag every push wears, and
+    /// the reply window every push is fired through.
+    tag: u64 = 0,
+    window: u64 = 0,
+    /// One subscription starts one stream; a second Poll does not restart it.
+    streaming: bool = false,
+
+    fn handle(self: *Pad, payload: []const u8) Result {
+        // A Poll subscription: word0 = the Pad (reply) tag, word1 = the
+        // reply window. Capturing them is the whole request — the stream
+        // that answers it is scheduled by the machine, not returned here.
+        if (payload.len < 16) return .{ .status = .reject_no_buffer };
+        self.tag = word(payload, 0);
+        self.window = word(payload, 1);
+        return .{};
+    }
+};
+
 // ── Entropy: seeded randomness as a service ──────────────────────────────
 //
 // Request: word0 = tag, word1 = reply window, word2 = byte count
@@ -351,6 +395,7 @@ pub const Device = union(enum) {
     block: Block,
     net: Net,
     apu: Apu,
+    pad: Pad,
 
     /// One request, delivered at fabric time `due`.
     pub fn handle(self: *Device, due: u64, payload: []const u8) Result {
@@ -361,6 +406,7 @@ pub const Device = union(enum) {
             .block => |*d| d.handle(payload),
             .net => |*d| d.handle(payload),
             .apu => |*d| d.handle(payload),
+            .pad => |*d| d.handle(payload),
         };
     }
 

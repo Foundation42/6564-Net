@@ -110,6 +110,9 @@ pub const Event = struct {
         /// An accelerator finishes a granted job (machine-side table
         /// holds the job; the event carries only its id).
         accel: struct { id: u64 },
+        /// A pad pushes its next input frame (the device at `coord` holds
+        /// the trace and cursor; the event only says whose turn it is).
+        pad: struct { coord: u16 },
     };
 
     pub fn order(_: void, a: Event, b: Event) std.math.Order {

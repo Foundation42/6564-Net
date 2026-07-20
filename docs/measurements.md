@@ -1461,3 +1461,45 @@ Next on the row: the **pad** (a device that pushes `Pad{buttons}` unasked
 `Tone` sink — sound as a send that expects no answer). With those and the
 frame clock, rocci-bird's society is fully wired; what remains is the game
 itself.
+
+## The device row completes: the pad, and input as a subscription
+
+The last device, and the only one that pushes. A WASM-4 game polls the
+gamepad; a 6564 actor is pushed to (rocci §1). The mechanism turned out
+to need nothing new: an actor subscribes with an ordinary A3.3 device ask
+— `send pad, Poll{}`, where `Poll -> Pad` — and the pad, instead of
+answering once, streams `Pad{buttons}` to the ask's reply window using
+its echoed tag, one message per input frame. `case Pad(p)` matches them
+like any message; the actor latches. A subscription is an ask whose
+answer never stops coming, and the whole of it reuses the reply-window
+wiring and tag convention already on the row.
+
+| claim | outcome |
+|---|---|
+| an actor subscribes and the pad streams input | ✓ Game `Poll`s once, receives 3 `Pad` messages, latches each |
+| pushes arrive in order | ✓ interval-apart, so the latched value ends at the last recorded (6) |
+| the trace is deterministic — a recording replays | ✓ a fixed `[1, 4, 6]` trace; same seed, same run (§4, TAS) |
+| pushes ride the fault-injected fabric | ✓ `deviceReply`, so a dropped push is a dropped input frame |
+| the frozen ASM baseline is unmoved | ✓ 2820 B / 171,532 instr / 479,275 cy / 13,281 switches, a seventh time |
+
+152 tests.
+
+**Why a subscription, not a wiring.** The alternative — the loader
+pre-wires the pad to one listener and looks up the `Pad` tag — needs new
+machinery and binds input to a single actor for the machine's life, which
+a screen-per-state game cannot use. Reading the ask as a subscription
+reuses everything (the reply window is the push target, the echoed tag is
+the `Pad` tag) and is dynamic: whichever actor `Poll`s is the one pushed
+to, so a transition re-subscribes on spawn. v1 keeps one subscriber at a
+time (the row's one-asker-per-device rule); many-subscriber fan-out is a
+later refinement, not a new contract.
+
+**The row, whole.** Display (frame clock), APU (sound sink), pad (input
+stream) — rocci-bird's society is now fully wired, and every device
+honors §7.5: the reference implementation is one of several the same
+contract admits, and the actor cannot tell which silicon answers. The
+frame clock is backpressure, the sound is fire-and-forget, the input is a
+subscription, and all three are messages on the same fabric the actors
+already live on. What remains is the bird itself — the Game actor's
+physics, the pipes, the sprite blits — which is a program now, not a
+machine or a language gap.
