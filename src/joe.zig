@@ -2310,6 +2310,29 @@ const Gen = struct {
         }
     }
 
+    /// The region-lock state, captured for the branch-independent tracking
+    /// below. Iteration order is stable while the map's keys don't change
+    /// (only the `locked` flags do), so a snapshot and its restore line up.
+    fn snapshotRegionLocks(self: *Gen) Error![]bool {
+        var out = std.ArrayList(bool).init(self.arena);
+        var it = self.regions.valueIterator();
+        while (it.next()) |rp| out.append(rp.locked) catch return Error.OutOfMemory;
+        return out.toOwnedSlice() catch Error.OutOfMemory;
+    }
+    fn restoreRegionLocks(self: *Gen, snap: []const bool) void {
+        var it = self.regions.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |rp| : (i += 1) rp.locked = snap[i];
+    }
+    /// Merge a sibling branch's locks in: a region is granted-out after the
+    /// `if` if EITHER arm left it granted — conservative, because at runtime
+    /// only one arm ran and we cannot know which.
+    fn mergeRegionLocks(self: *Gen, snap: []const bool) void {
+        var it = self.regions.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |rp| : (i += 1) rp.locked = rp.locked or snap[i];
+    }
+
     /// Item 7: collect the comparator shapes — every distinct bytes-field
     /// offset that a buf compares against, one MACTAB slot each (≤ 8;
     /// beyond that a site simply inlines). Runs with each case's binding
@@ -3810,14 +3833,25 @@ const Gen = struct {
             .if_ => |i| {
                 const l_else = self.label();
                 try self.branchIfFalse(i.cond, l_else);
+                // Region type-state across branches (§6.2): the arms are
+                // mutually exclusive, so a grant in one must not leak its
+                // lock into the sibling. Each arm runs from the same entry
+                // locks; after the `if`, a region is locked if EITHER arm
+                // granted it (a rebinding `done`/`failed` clears it next).
+                const locks0 = try self.snapshotRegionLocks();
                 try self.stmts(i.then);
+                const then_locks = try self.snapshotRegionLocks();
                 if (i.els.len == 0) {
+                    self.restoreRegionLocks(locks0);
+                    self.mergeRegionLocks(then_locks);
                     try self.w("L{d}:", .{l_else});
                 } else {
+                    self.restoreRegionLocks(locks0);
                     const l_end = self.label();
                     try self.w("        BRA L{d}", .{l_end});
                     try self.w("L{d}:", .{l_else});
                     try self.stmts(i.els);
+                    self.mergeRegionLocks(then_locks);
                     try self.w("L{d}:", .{l_end});
                 }
             },
