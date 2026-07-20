@@ -111,6 +111,17 @@ const usage_text =
     \\      staging and timers are the loader's job (src/joe_run.zig).
     \\      With no file: the built-in pingpong.joe across a lossy fabric.
     \\
+    \\  sim6564 joey [seed]
+    \\      joey-bird: WASM-4 flappy, reimagined as a society of actors on
+    \\      the device row. The display is the frame clock (backpressure,
+    \\      not a caller), the pad streams input the bird latches, the APU
+    \\      takes the flap and the death (programs/joe/joey/joey.joe).
+    \\
+    \\  sim6564 cabinet [seed]
+    \\      The same bird, but the Cabinet spawns it: capability-passing
+    \\      spawn lends each Game the display, pad and APU, and death
+    \\      inserts another coin — three lives (programs/joe/joey/cabinet.joe).
+    \\
     \\  sim6564 joec <file.joe> <Actor>
     \\      Compile one actor to 6564 assembly on stdout.
     \\
@@ -264,7 +275,16 @@ pub fn main() !void {
         const trace = [_]u64{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0 };
         var opts = sim.joe_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace };
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
-        return sim.joe_run.run(alloc, @embedFile("programs/joe/joey.joe"), opts);
+        return sim.joe_run.run(alloc, @embedFile("programs/joe/joey/joey.joe"), opts);
+    }
+
+    if (std.mem.eql(u8, first, "cabinet")) {
+        // The Cabinet spawns the bird (A4.9 capability-passing spawn):
+        // three lives, each lent the device row, insert-coin on death.
+        const trace = [_]u64{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0 };
+        var opts = sim.joe_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace };
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        return sim.joe_run.run(alloc, @embedFile("programs/joe/joey/cabinet.joe"), opts);
     }
 
     if (std.mem.eql(u8, first, "run")) {

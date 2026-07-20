@@ -125,6 +125,16 @@ Two properties make this safe rather than merely working. A screen halts *synchr
 
 With this, the Cabinet is expressible end to end: a boot screen, transitions that spawn the next, a frame lent down each life and returned by death, and probate that reaches a real successor. rocci-bird is no longer waiting on the language.
 
+## A4.9 Lending the world: capability-passing spawn
+
+A4.7 and A4.8 gave a supervisor a name for its child and let it spawn one mid-serve, but the child was born into an empty room. `spawn` took only literal numbers, so a Cabinet could start a `Game` and could not hand it the display it must draw on, the pad it must read, or the APU it must sound. The bird ran only as a top-level actor wired by the system block; the Cabinet that *is* the machine could supervise a screen it could not equip. This closes that: `spawn Game(display, pad, apu)` lends the child the very capabilities the supervisor holds.
+
+The mechanism is substitution, and that it is *only* substitution is the point. A spawn argument that is a name refers to one of the supervisor's own parameters — the one thing a supervisor is entitled to lend, because it already holds it — and the child inherits the supervisor's *binding* for it: the same device coordinate, the same peer context, resolved and staged into the child's near page exactly as the loader stages any instance's arguments. No capability is minted that the supervisor did not already have; nothing new is trusted. **A supervisor can lend only what it holds, and lending is the whole of it** — the child gets its own window onto the shared device, and the amendment's paper-trail principle holds without a new record, because a spawn argument is just a name for a capability that already existed.
+
+That the child is spawned *dynamically* (A4.8) changes nothing: the loader reserved the child's context and pre-stages its inherited bindings once, so every incarnation the site starts wakes already holding the world. The Cabinet in `cabinet.joe` proves it — three lives, each `spawn Game(display, pad, apu)` lending the device row, each bird presenting frames and playing tones through capabilities it was handed rather than born with, and death inserting the next coin. That a *spawned* child presents to the display at all is the proof: without this it could not reach a device it was given.
+
+One honest edge remains, and it is not in spawn. A device with a single reply window — the pad — admits one subscriber, so across a game's successive lives only the first bird hears the pad; the rest fall in silence. That is the row's one-asker rule (§7.8), not a limit of lending, and the fix is a re-subscribing pad, not a change to how capabilities pass. Probate hands an estate to a successor; A4.9 hands a supervisor's children the world it lives in; what is left is to let more than one of them listen at once.
+
 ---
 
 *A compiler that says "trust me" has said nothing. A capability that says "here is what I am, here is what you may do, and here is who gave it to me" has said everything.*

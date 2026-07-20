@@ -955,7 +955,7 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     // for bit (rocci §4).
     const trace = [_]u64{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0 };
     var o = try @import("joe_run.zig").simulate(testing.allocator,
-        @embedFile("programs/joe/joey.joe"),
+        @embedFile("programs/joe/joey/joey.joe"),
         .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },
     );
     defer o.deinit();
@@ -979,6 +979,36 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
         o.varOf("game", "score").?,
         o.varOf("ref", "final_score").?,
     );
+}
+
+test "A4.9 capability-passing spawn: the Cabinet spawns the bird, lending the device row" {
+    // The sketch's §3 Cabinet, finally expressible. The Cabinet holds the
+    // display, the pad, and the APU for the whole run and LENDS them to
+    // each Game it spawns — `spawn Game(display, pad, apu)` hands the child
+    // its own windows onto the devices the Cabinet holds. The bird plays,
+    // dies, tells the Cabinet its score, and the Cabinet inserts another
+    // coin. Three lives; the first has input and flies, the rest fall (the
+    // pad's one stream is spent on the first subscriber). That a SPAWNED
+    // child presents frames and plays tones at all is the proof: without
+    // capability-passing spawn it could not reach a device it was handed.
+    const trace = [_]u64{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0 };
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        @embedFile("programs/joe/joey/cabinet.joe"),
+        .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },
+    );
+    defer o.deinit();
+    // Three coins, and the best life is the one that got input (score 10,
+    // exactly the top-level bird's run) — capabilities threaded through the
+    // spawn to every incarnation.
+    try testing.expectEqual(@as(u64, 3), o.varOf("cab", "games").?);
+    try testing.expectEqual(@as(u64, 10), o.varOf("cab", "best").?);
+    // The spawned Game reached the lent devices: it presented frames and
+    // played tones through capabilities it was handed, not born with.
+    try testing.expect(o.display_frames >= 3);
+    try testing.expect(o.apu_tones >= 3);
+    try testing.expect(o.pad_pushed >= 1);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab").?.state);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Game#0").?.state);
 }
 
 test "A4 movement 2: succession — a capability moves, with provenance" {

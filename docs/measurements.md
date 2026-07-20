@@ -1552,3 +1552,41 @@ The bird's height and score are written into the frame each vblank and
 the display checksums them, which proves the draw reached the glass
 without pretending the headless machine can show a pixel. Frozen table
 unmoved an eighth time; 153 tests.
+
+## A4.9 — capability-passing spawn: the Cabinet spawns the bird
+
+The last gap joey-bird surfaced, closed. A4.7/A4.8 let a supervisor name
+and dynamically spawn a child, but `spawn` took only literal numbers — so
+a Cabinet could start a Game and not hand it the display, pad and APU it
+must use. Now `spawn Game(display, pad, apu)` lends the child the very
+capabilities the supervisor holds. The whole rocci-bird Cabinet (§3) is
+expressible: it holds the device row for the program's life, lends it to
+each Game it spawns, and inserts a coin on every death.
+
+The mechanism is substitution, and that it is only substitution is the
+point. A spawn argument that is a name refers to one of the supervisor's
+own params; the child inherits the supervisor's *binding* for it — same
+device coordinate, same peer context — staged into its near page exactly
+as the loader stages any instance's args. A supervisor can lend only what
+it holds, and no capability is minted that it did not already have.
+
+| claim | outcome |
+|---|---|
+| a spawned child reaches a device lent through spawn | ✓ `cab/Game#0` presents frames + plays tones via inherited caps |
+| capabilities pass to every incarnation | ✓ 3 lives, each `spawn Game(display, pad, apu)` — `games=3` |
+| the lent input reaches the bird | ✓ first life flaps and scores 10 (`best=10`), the rest fall in silence |
+| dynamic spawn + capability-passing compose | ✓ the Game is spawned in a `serve` handler, born already holding the world |
+| the frozen ASM baseline is unmoved | ✓ 2820 B / 171,532 instr / 479,275 cy / 13,281 switches, a ninth time |
+
+156 tests. `sim6564 cabinet` runs it; `sim6564 joey` runs the top-level
+bird. Both live under `src/programs/joe/joey/`.
+
+**The one honest edge, and it is not in spawn.** A device with a single
+reply window — the pad — admits one subscriber, so across a game's
+successive lives only the first bird hears the pad; the rest fall in
+silence (`best=10` from life one, then two natural deaths at 5). That is
+the row's one-asker rule (§7.8), not a limit of lending, and the fix is a
+re-subscribing pad, not a change to how capabilities pass. With that, the
+three-screen game — Title, Game, GameOver, each spawned and equipped by
+the Cabinet, each hearing the pad in turn — is a program, and every brick
+under it is built.

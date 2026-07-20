@@ -87,9 +87,9 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
 }
 
 // The referee stands in for the Cabinet: it hears the game end and
-// records the final score. (Routing transitions through a supervisor
-// that re-spawns the next screen needs capability-passing spawn, the
-// next gap; a peer that hears the obituary proves the death path today.)
+// records the final score. (For the Cabinet that actually *spawns* the
+// bird — lending it the device row and inserting a coin on each death —
+// see cabinet.joe next door, which capability-passing spawn made real.)
 actor Referee() {
     var final_score u64 = 0
     var overs u64 = 0

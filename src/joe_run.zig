@@ -372,7 +372,22 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
             if (cctx == 255) return fail("{s}: core {d} is out of contexts", .{ pc.name, core });
             try ctx_count.put(core, cctx + 1);
             const cargs = try scratch.alloc(joe.InstanceDecl.Arg, s.args.len);
-            for (s.args, 0..) |v, j| cargs[j] = .{ .int = v };
+            for (s.args, 0..) |sa, j| {
+                cargs[j] = switch (sa) {
+                    .int, .index => sa,
+                    // A4.9 capability-passing spawn: a ref names one of the
+                    // supervisor's params, and the child inherits the
+                    // supervisor's binding for it — its own window onto the
+                    // same device or peer. A supervisor can only lend what
+                    // it holds, so the name must be one of its params.
+                    .ref => |nm| blk: {
+                        const pi = for (r.params, 0..) |prm, pidx| {
+                            if (std.mem.eql(u8, prm.name, nm)) break pidx;
+                        } else return fail("{s}: spawn arg `{s}` is not a capability {s} holds", .{ pc.name, nm, pc.actor });
+                        break :blk pc.args[pi];
+                    },
+                };
+            }
             try all.append(.{
                 .name = try std.fmt.allocPrint(scratch, "{s}/{s}#{d}", .{ pc.name, s.actor, k }),
                 .actor = s.actor,

@@ -355,7 +355,7 @@ const Stmt = union(enum) {
     copy_: struct { dst: []const u8, src: *Expr, line: usize },
     spawn: struct {
         actor: []const u8,
-        args: []u64, // v1: literal args only
+        args: []InstanceDecl.Arg, // literals and inherited capabilities (A4.9)
         restarts: u64,
         watchdog: u64,
         /// `spawn W() as w` — the supervisor's name for the child. Binds a
@@ -1218,10 +1218,18 @@ const Parser = struct {
         if (try self.eatKw("spawn")) {
             const actor = try self.expect(.ident, "actor name");
             _ = try self.expect(.lparen, "(");
-            var args = std.ArrayList(u64).init(self.arena);
+            // A spawn argument is a literal OR a capability name — one of
+            // the supervisor's own params, which the child inherits (A4.9,
+            // capability-passing spawn). The child gets its own window onto
+            // the same device or peer; the supervisor lends what it holds.
+            var args = std.ArrayList(InstanceDecl.Arg).init(self.arena);
             while (self.tok.kind != .rparen) {
-                const v = try self.expect(.int, "a literal arg (v1)");
-                try args.append(v.value);
+                switch (self.tok.kind) {
+                    .int => try args.append(.{ .int = self.tok.value }),
+                    .ident => try args.append(.{ .ref = self.tok.text }),
+                    else => return self.fail("a spawn argument is a literal or a capability name", Error.Syntax),
+                }
+                try self.advance();
                 if (self.tok.kind == .comma) try self.advance();
             }
             try self.advance(); // )
@@ -5468,7 +5476,10 @@ pub const SpawnOut = struct {
     rec_off: u16,
     restarts: u64,
     watchdog: u64,
-    args: []u64,
+    /// The child's arguments: literals, and `ref` names the loader resolves
+    /// against the supervisor's own bindings (A4.9). Ref names point into
+    /// the source, which outlives the run — nothing to free but the slice.
+    args: []InstanceDecl.Arg,
     /// The supervisor's near slot for a capability to this child, when it
     /// was named (`spawn … as w`). The loader mints the PTT entry — aimed
     /// at the child's RX ring — and stages the window here. null = unnamed.
@@ -5741,7 +5752,7 @@ pub fn compile(
             .rec_off = gen.spawnRec(@intCast(k)),
             .restarts = s.spawn.restarts,
             .watchdog = s.spawn.watchdog,
-            .args = try alloc.dupe(u64, s.spawn.args),
+            .args = try alloc.dupe(InstanceDecl.Arg, s.spawn.args),
             .cap_off = gen.childcap_of.get(@intCast(k)),
         });
     }
