@@ -2645,10 +2645,23 @@ const Gen = struct {
             return self.fail(0, "vector expression too deep (v1)", Error.Unsupported);
         switch (e.*) {
             .ident => |name| {
-                const slab = self.vecs.get(name) orelse
-                    return self.fail(0, "not a vec variable", Error.Semantics);
-                try self.w("        LDX {s}", .{try self.imm(slab)});
-                try self.w("        VLD {d}", .{d});
+                if (self.vecs.get(name)) |slab| {
+                    try self.w("        LDX {s}", .{try self.imm(slab)});
+                    try self.w("        VLD {d}", .{d});
+                } else if (self.arrays.get(name)) |arr| {
+                    // `v = xs` — fill a vector from an f64 region (VLD). The
+                    // silicon moves 64 bytes at [X]; joe points X at the
+                    // region's base, so eight addressable lanes become a
+                    // vector again — the spill's inverse (A1.x).
+                    if (!arr.f64 or arr.len < 8)
+                        return self.fail(0, "only a region [8]f64 (or larger) fills a vector", Error.Semantics);
+                    if (self.regions.get(name)) |r| {
+                        if (r.locked)
+                            return self.fail(0, "a granted region is inaccessible until done/failed rebinds it (§6.2)", Error.Semantics);
+                    }
+                    try self.w("        LDX ${X}", .{arr.ptr_slot});
+                    try self.w("        VLD {d}", .{d});
+                } else return self.fail(0, "not a vec variable", Error.Semantics);
             },
             .vlit => |lanes| {
                 for (lanes, 0..) |bits, i| {
@@ -2731,7 +2744,11 @@ const Gen = struct {
             }
             return;
         }
-        if (self.exprType(e) != .vec_) {
+        // A whole f64 region on the right fills the vector (VLD, handled in
+        // vecEvalInto); it types as its element, so route it explicitly
+        // rather than through the scalar-broadcast fallback below.
+        const region_fill = e.* == .ident and if (self.arrays.get(e.ident)) |arr| (arr.f64 and arr.len >= 8) else false;
+        if (!region_fill and self.exprType(e) != .vec_) {
             // `v = 2.0` — a scalar broadcast assignment
             try self.evalFloatScalar(e);
             try self.w("        VBCA 0", .{});
@@ -3675,6 +3692,26 @@ const Gen = struct {
                     if (a.op != .set)
                         return self.fail(0, "vec assignment is `=` (v1)", Error.Unsupported);
                     try self.storeVec(slab, a.expr);
+                    return;
+                }
+                if (self.arrays.get(a.name)) |arr| {
+                    // `xs = pipe_x` — spill a whole vector into an f64 region
+                    // (VST). Eight SoA lanes become addressable memory a loop
+                    // can walk, closing the gap the northstar exposed: a scene
+                    // built from vector state needs its lanes in memory (A1.x).
+                    if (a.op != .set)
+                        return self.fail(0, "region assignment is `=` (v1)", Error.Unsupported);
+                    if (!arr.f64 or arr.len < 8)
+                        return self.fail(0, "a vector spills only into a region [8]f64 (or larger)", Error.Semantics);
+                    if (self.exprType(a.expr) != .vec_)
+                        return self.fail(0, "a whole region takes a vector; a slot takes a value", Error.Semantics);
+                    if (self.regions.get(a.name)) |r| {
+                        if (r.locked)
+                            return self.fail(0, "a granted region is inaccessible until done/failed rebinds it (§6.2)", Error.Semantics);
+                    }
+                    try self.vecEvalInto(a.expr, 0);
+                    try self.w("        LDX ${X}", .{arr.ptr_slot});
+                    try self.w("        VST 0", .{});
                     return;
                 }
                 const slot = self.slots.get(a.name) orelse

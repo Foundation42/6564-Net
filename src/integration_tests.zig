@@ -1078,6 +1078,40 @@ test "byte regions: joe `region [N]u8` stores and reads bytes (LDB/STB path)" {
     try testing.expectEqual(@as(u64, 55), o.varOf("x", "s").?);
 }
 
+test "vec spill/fill: a vector reaches memory and comes back (VST/VLD)" {
+    // The northstar's gap, closed: SoA lanes live in the vector file, but a
+    // scene built from them needs its lanes in ADDRESSABLE memory. `xs =
+    // pipe_x` spills the eight lanes to an f64 region (VST); a loop then
+    // walks them as scalars (xs[i]); and `back = xs` fills a vector again
+    // (VLD). The silicon already had the ops — joe now names them. The lane
+    // sum 880 read two ways (a scalar loop, and a vector reduce of the
+    // filled-back copy) proves the round trip.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\actor Spill() {
+        \\    var xs region [8]f64
+        \\    var v vec
+        \\    var back vec
+        \\    var loop_sum u64 = 0
+        \\    var reduce_sum u64 = 0
+        \\    var third u64 = 0
+        \\    v = [40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]
+        \\    xs = v
+        \\    for i in 0..8 {
+        \\        loop_sum += int(xs[i])
+        \\    }
+        \\    third = int(xs[3])
+        \\    back = xs
+        \\    reduce_sum = int(back.reduce(+))
+        \\    halt ok
+        \\}
+        \\system { x = Spill() on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 880), o.varOf("x", "loop_sum").?);
+    try testing.expectEqual(@as(u64, 880), o.varOf("x", "reduce_sum").?);
+    try testing.expectEqual(@as(u64, 100), o.varOf("x", "third").?);
+}
+
 test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     // The bird, in the flesh, on the device row it was written against.
     // The display is the frame clock (each `Present` waits on the last
