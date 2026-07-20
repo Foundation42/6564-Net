@@ -61,6 +61,10 @@ const device_table = [_]struct {
     coord: u16,
     token: u64 = abi_token,
     answers: bool = false,
+    /// A pushing device (the pad) redirects its own reply window at run
+    /// time on every subscription, so it is exempt from the load-time
+    /// one-asker wiring — many actors may hold and Poll it, last wins.
+    pushes: bool = false,
     /// What this endpoint IS (A4 movement 1): a console takes bytes, an
     /// asking device takes the §7.3 framing, an accelerator takes its
     /// own contract (a message image, checked by its own reserved word).
@@ -85,8 +89,9 @@ const device_table = [_]struct {
     .{ .name = "Apu", .coord = 0xFF08, .dialect = .msg },
     // The pad: the one device that pushes. An actor subscribes with an
     // ask (`send pad, Poll{}`, `Poll -> Pad`) and the pad streams input.
-    // Answers like an asking device, so `reply_claim` aims its window here.
-    .{ .name = "Pad", .coord = 0xFF09, .answers = true, .dialect = .ask },
+    // `pushes` = it aims its own window at whoever last subscribed, so
+    // many screens may hold it and take the input in turn (§7.8).
+    .{ .name = "Pad", .coord = 0xFF09, .answers = true, .pushes = true, .dialect = .ask },
 };
 
 const abi_token = joe.abi.token;
@@ -235,6 +240,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
         coord: u16,
         token: u64,
         answers: bool,
+        pushes: bool,
         dialect: ring.Dialect,
     }).init(scratch);
     for (pl.instances) |inst| {
@@ -249,6 +255,7 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                 .coord = d.coord,
                 .token = d.token,
                 .answers = d.answers,
+                .pushes = d.pushes,
                 .dialect = d.dialect,
             });
         } else {
@@ -520,7 +527,11 @@ pub fn simulate(alloc: std.mem.Allocator, source: []const u8, opts: Options) !Ou
                         // gets its own reply window aimed back here —
                         // the loader wiring driver to device, the same
                         // act as wiring two actors together.
-                        if (d.answers and c.r.asks_devices) {
+                        // A pushing device (the pad) aims its own window at
+                        // whoever last subscribed, at run time — so it is
+                        // exempt from the one-asker load-time wiring, and
+                        // many screens may hold and Poll it in turn (§7.8).
+                        if (d.answers and c.r.asks_devices and !d.pushes) {
                             const gop = try reply_claim.getOrPut(d.coord);
                             if (gop.found_existing)
                                 return fail("{s}: {s} already answers {s} (v1: one asker per device)", .{ p.name, rname, gop.value_ptr.* });

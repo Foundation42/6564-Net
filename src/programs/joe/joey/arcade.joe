@@ -1,0 +1,154 @@
+// arcade.joe — joey-bird, the whole state machine the sketch draws (§3).
+// Three screens — Title, Game, GameOver — and the tag union is which one
+// is alive. The Cabinet is the machine that outlives them all: it spawns
+// each screen, lends it the device row (A4.9), and routes the transition
+// when a screen announces its successor and leaves. A crash in any screen
+// would just insert a coin; here every screen leaves politely.
+//
+// The brick this stands on is the re-subscribing pad (§7.8): each screen
+// Polls the pad when it wakes, and the pad aims its stream at whoever last
+// subscribed — so the input follows the living screen. Title hears the
+// press that starts the game; the bird hears the flaps; GameOver hears the
+// press that drops another coin. Only the first screen would hear anything
+// without it, and the loop below could never come back to the Title.
+
+message Present { f grant }
+message Pad { buttons u64 }
+message Poll -> Pad {}
+message Tone { n u64 }
+message Next { screen u64 }
+
+// screen ids: 1 = Title, 2 = Game, 3 = GameOver
+
+actor Title(display addr, pad addr, apu addr) {
+    var frame region [8]u64
+    var frames u64 = 0
+    var presses u64 = 0
+
+    send pad, Poll{}
+    send display, Present{grant frame}
+
+    serve {
+        case Pad(p):
+            if p.buttons != 0 {
+                presses += 1
+            }
+        case done(frame):
+            frames += 1
+            frame[0] = 1                       // the title is up
+            if presses >= 1 {
+                send boss, Next{2}             // a press starts the game
+                halt ok
+            }
+            send display, Present{grant frame}
+        case failed(frame):
+            halt err
+    }
+}
+
+actor Game(display addr, pad addr, apu addr) {
+    var frame region [8]u64
+    var t u64 = 0
+    var y f64 = 40.0
+    var vy f64 = 0.0
+    var buttons u64 = 0
+    var flap_held u64 = 1
+    var score u64 = 0
+    var since u64 = 0
+    var flaps u64 = 0
+    var heard u64 = 0
+
+    send pad, Poll{}
+    send display, Present{grant frame}
+
+    serve {
+        case Pad(p):
+            buttons = p.buttons
+            heard += 1
+        case done(frame):
+            t += 1
+            if buttons != 0 && flap_held == 0 {
+                vy = 0.0 - 2.2
+                flaps += 1
+                send apu, Tone{1}
+            } else {
+                vy = vy + 0.12
+            }
+            flap_held = buttons
+            y = y + vy
+            since += 1
+            if since >= 8 {
+                score += 1
+                since = 0
+            }
+            frame[0] = int(y)
+            if y >= 134.0 {
+                send apu, Tone{9}
+                send boss, Next{3}             // the bird dies: game over
+                halt ok
+            }
+            send display, Present{grant frame}
+        case failed(frame):
+            send boss, Next{3}
+            halt err
+    }
+}
+
+actor GameOver(display addr, pad addr, apu addr) {
+    var frame region [8]u64
+    var frames u64 = 0
+    var presses u64 = 0
+
+    send pad, Poll{}
+    send display, Present{grant frame}
+
+    serve {
+        case Pad(p):
+            if p.buttons != 0 {
+                presses += 1
+            }
+        case done(frame):
+            frames += 1
+            frame[0] = 3                       // GAME OVER is up
+            // a press restarts — but only after a beat, so the death
+            // button-hold does not skip the screen in a single frame.
+            if presses >= 1 && frames >= 3 {
+                send boss, Next{1}             // back to the title
+                halt ok
+            }
+            send display, Present{grant frame}
+        case failed(frame):
+            halt err
+    }
+}
+
+actor Cabinet(display addr, pad addr, apu addr) {
+    var loops u64 = 0
+
+    send self, Next{1}                         // boot to the title
+
+    serve {
+        case Next(n):
+            if n.screen == 2 {
+                spawn Game(display, pad, apu)
+            }
+            if n.screen == 3 {
+                spawn GameOver(display, pad, apu)
+            }
+            if n.screen == 1 {
+                loops += 1
+                if loops >= 2 {
+                    halt ok                    // one full lap: Title→Game→Over→Title
+                } else {
+                    spawn Title(display, pad, apu)
+                }
+            }
+    }
+}
+
+system {
+    cab = Cabinet(display, pad, apu) on 0
+    display = Display()
+    apu = Apu()
+    pad = Pad()
+}

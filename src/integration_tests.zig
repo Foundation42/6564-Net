@@ -1011,6 +1011,36 @@ test "A4.9 capability-passing spawn: the Cabinet spawns the bird, lending the de
     try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Game#0").?.state);
 }
 
+test "joey-bird arcade: three screens, and the pad follows the living one" {
+    // The whole state machine (sketch §3): Title -> Game -> GameOver ->
+    // Title. Each screen is a different actor kind — a different context —
+    // spawned and equipped by the Cabinet, and each subscribes to the pad
+    // when it wakes. The re-subscribing pad (§7.8) aims the input at
+    // whoever last Polled, so every screen hears the press it waits for:
+    // the Title the one that starts the game, the bird its inputs, the
+    // GameOver the one that drops another coin. THE LOOP COMPLETING IS THE
+    // PROOF — without re-subscription only the Title would ever hear the
+    // pad, GameOver could never advance, and the machine would never come
+    // back to the Title. A held button drives the whole lap.
+    const trace = [_]u64{1} ** 200;
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        @embedFile("programs/joe/joey/arcade.joe"),
+        .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },
+    );
+    defer o.deinit();
+    // One full lap: the Cabinet returns to the Title and closes the arcade.
+    try testing.expectEqual(@as(u64, 2), o.varOf("cab", "loops").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab").?.state);
+    // All three screens heard the pad in turn — the redirect reached each.
+    // Golden, because the run is deterministic: the Title's start press,
+    // the bird's inputs across its life, the game-over coin.
+    try testing.expectEqual(@as(u64, 1), o.varOf("cab/Title#2", "presses").?);
+    try testing.expectEqual(@as(u64, 66), o.varOf("cab/Game#0", "heard").?);
+    try testing.expectEqual(@as(u64, 4), o.varOf("cab/GameOver#1", "presses").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/Title#2").?.state);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("cab/GameOver#1").?.state);
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability

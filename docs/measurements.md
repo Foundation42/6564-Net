@@ -1590,3 +1590,49 @@ re-subscribing pad, not a change to how capabilities pass. With that, the
 three-screen game — Title, Game, GameOver, each spawned and equipped by
 the Cabinet, each hearing the pad in turn — is a program, and every brick
 under it is built.
+
+## The re-subscribing pad, and joey-bird whole: the three-screen arcade
+
+The last brick. A game is not one actor but a succession — title, bird,
+game-over — and only one is alive at a time, so only one may hold the
+input. The pad has a single reply window; now every `Poll` re-aims it at
+whoever just subscribed, so the input stream follows the living screen. A
+transition is automatic: the new screen Polls on waking and the pad turns
+to it; the old screen, dead, receives nothing. The one-asker rule was a
+load-time convenience for devices that answer in place — a pushing device
+that redirects itself at run time is exempt (§7.8), and the whole change
+is the machine re-pointing the pad's window at the Poll's sender on every
+subscription, plus letting several actors hold and ask it.
+
+With it, `arcade.joe` (`sim6564 arcade`) runs the full state machine the
+sketch draws (§3): Title → Game → GameOver → Title, each screen a
+different actor kind — a different context — spawned and equipped by the
+Cabinet (A4.9), each subscribing to the pad when it wakes.
+
+| claim | outcome |
+|---|---|
+| every screen hears the pad in its turn | ✓ Title `presses=1`, Game `heard=66`, GameOver `presses=4` |
+| the loop completes — the proof of re-subscription | ✓ `loops=2`, all four actors halted, one full lap |
+| the pad follows the living screen, not the first | ✓ without it only the Title would hear input; GameOver could never advance |
+| single-subscriber programs are unchanged | ✓ joey (7 flaps, score 10) and cabinet (best 10) bit-identical |
+| the frozen ASM baseline is unmoved | ✓ 2820 B / 171,532 instr / 479,275 cy / 13,281 switches, a tenth time |
+
+157 tests.
+
+**The proof is the loop coming home.** GameOver only advances on a press,
+so without the redirect it would never hear one, never announce its
+successor, and the Cabinet would never return to the Title. That the
+machine halts at `loops=2` — one full lap — is the whole demonstration:
+input reached a screen two transitions downstream of the first to Poll.
+The pushes that fall in the gap between a dying screen and its successor
+(127 rejects) are dropped like any other lost input, and the idempotent
+latch makes that the right answer.
+
+**joey-bird is whole.** Every brick the sketch's §1 mapping table named
+is built: the frame clock is a completion, the tag union is which actor
+is alive, transitions route through the supervisor, the pad pushes and the
+actor latches, sound is fire-and-forget, and a comment the Roc kept by
+convention — "must run before drawing the player" — is a region type-state
+the compiler enforces. What is left is not machine or language: it is the
+bird's own richness — the SoA-vector pipes, the sprite pages, the byte
+framebuffer — a program to write on a foundation that is finished.

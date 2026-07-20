@@ -122,6 +122,12 @@ const usage_text =
     \\      spawn lends each Game the display, pad and APU, and death
     \\      inserts another coin — three lives (programs/joe/joey/cabinet.joe).
     \\
+    \\  sim6564 arcade [seed]
+    \\      The whole state machine: Title -> Game -> GameOver -> Title,
+    \\      each screen spawned and equipped by the Cabinet. The
+    \\      re-subscribing pad aims the input at the living screen, so each
+    \\      hears the press it waits for (programs/joe/joey/arcade.joe).
+    \\
     \\  sim6564 joec <file.joe> <Actor>
     \\      Compile one actor to 6564 assembly on stdout.
     \\
@@ -285,6 +291,18 @@ pub fn main() !void {
         var opts = sim.joe_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace };
         if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
         return sim.joe_run.run(alloc, @embedFile("programs/joe/joey/cabinet.joe"), opts);
+    }
+
+    if (std.mem.eql(u8, first, "arcade")) {
+        // The whole state machine: Title -> Game -> GameOver -> Title. The
+        // re-subscribing pad (§7.8) aims the input at the living screen, so
+        // each hears the press it waits for. A held button (all 1s) starts
+        // the title, lets the bird fall to its natural death, and drops the
+        // coin at game-over — one full lap, then the Cabinet halts.
+        const trace = [_]u64{1} ** 200;
+        var opts = sim.joe_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace };
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        return sim.joe_run.run(alloc, @embedFile("programs/joe/joey/arcade.joe"), opts);
     }
 
     if (std.mem.eql(u8, first, "run")) {

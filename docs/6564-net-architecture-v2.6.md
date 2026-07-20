@@ -753,6 +753,21 @@ support as a corollary of the determinism bar. Silicon is an optimization
 one, a real pad reads hardware, and the actor holding the capability
 cannot tell which — only the trace's *source* differs, never the contract.
 
+**Last subscriber wins.** A game is not one actor but a succession of
+them — a title, a bird, a game-over — and only one is alive at a time, so
+only one may hold the input. The pad has a single reply window, and every
+`Poll` re-aims it at whoever just subscribed: the stream follows the
+living screen. A transition is therefore automatic — the new screen Polls
+on waking and the pad turns to it; the old screen, dead, receives nothing,
+and the few pushes that fall in the gap between them are dropped like any
+other lost input. This makes the pad a *shared* device claimed by turns
+rather than one wired to a single actor for the machine's life: the row's
+one-asker rule (§7.4) is a load-time convenience for devices that answer
+in place, and a pushing device that redirects itself at run time is
+exempt. The whole three-screen state machine — each screen spawned and
+equipped by the supervisor (Amendment 4.9), each taking the pad in its
+turn — needs nothing the row did not already carry.
+
 ---
 
 ## 8. Instruction Set Sketch (I/O and Concurrency Subset)

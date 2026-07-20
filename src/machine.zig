@@ -1331,12 +1331,28 @@ pub const Machine = struct {
             if (res.reply) |r| try self.deviceReply(ep, due, r);
         }
         try self.ackSender(due, gram, gram.dst_core, status, count);
-        // A pad's Poll starts its stream: the answer to a subscription is a
-        // sequence of pushes, not one reply. One Poll, one stream.
+        // A pad's Poll is a subscription: the answer is a stream of pushes,
+        // not one reply. Every Poll re-aims the pad's push window at whoever
+        // just subscribed — last wins — so a screen transition moves the
+        // input stream to the new screen (§7.8). The first Poll also starts
+        // the stream; later ones only redirect it.
         switch (ep.dev) {
-            .pad => |*pad| if (status == .ok and !pad.streaming) {
-                pad.streaming = true;
-                try self.events.add(.{ .due = due + pad.interval, .seq = self.nextSeq(), .kind = .{ .pad = .{ .coord = gram.dst_core } } });
+            .pad => |*pad| if (status == .ok) {
+                if (self.pending.get(gram.send_id)) |pend| {
+                    const dc = &self.cores[pend.reply.core];
+                    const dx = &dc.contexts[pend.reply.ctx];
+                    const rx_token = read64(dc, dx, @as(u64, ring.slot_rx) * ring.desc_size + 24) catch 0;
+                    self.setDevicePtt(gram.dst_core, 0, .{
+                        .prefix_hi = 0xfd65_6400_0000_0000,
+                        .prefix_lo = ring.PttEntry.loFrom(pend.reply.core, pend.reply.ctx, ring.slot_rx),
+                        .rights = .{ .send = true },
+                        .token = rx_token,
+                    });
+                }
+                if (!pad.streaming) {
+                    pad.streaming = true;
+                    try self.events.add(.{ .due = due + pad.interval, .seq = self.nextSeq(), .kind = .{ .pad = .{ .coord = gram.dst_core } } });
+                }
             },
             else => {},
         }
