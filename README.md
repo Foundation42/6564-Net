@@ -16,6 +16,7 @@ zig build run           # ping-pong actors across a 25%-lossy fabric
 ./zig-out/bin/sim6564 0xBEEF 3000 12      # 73% packet loss; still finishes
 ./zig-out/bin/sim6564 supervise           # supervision tree demo
 ./zig-out/bin/sim6564 hello               # the machine says hello
+./zig-out/bin/sim6564 joey                # joey-bird: flappy on the device row
 ./zig-out/bin/sim6564 run src/programs/asm/ring_node.asm   # any program runs itself
 ./zig-out/bin/sim6564 run src/programs/joe/ring.joe        # either language
 ```

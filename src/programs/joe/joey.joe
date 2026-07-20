@@ -1,0 +1,110 @@
+// joey.joe — the bird, in the flesh. rocci-bird runs on a platform that
+// calls her; joey-bird runs on joe, where nobody calls at all. This is
+// the reimagining sketch's §4 Game actor, on the device row it was
+// written against: the display is the frame clock, the pad pushes input
+// the bird latches, the APU takes the flap and the death. Nobody calls
+// this actor sixty times a second — the display writes back, the pad
+// speaks up, and the bird decides.
+//
+// The frame loop is backpressure: `send display, Present{grant frame}`
+// hands the framebuffer to the glass, and `case done(frame)` is vblank —
+// the frame is ours again, one tick later. The bird cannot draw faster
+// than the display returns its region, and every crash is just another
+// coin (probate hands the estate to the successor; here the bird simply
+// tells the referee its score and dies).
+//
+// Determinism is total: the only nondeterminism is input, input is
+// messages, and the pad's trace is a recording — the same seed and the
+// same trace replay the same game, bit for bit. TAS as a corollary.
+
+message Present { f grant }
+message Pad { buttons u64 }
+message Poll -> Pad {}
+message Tone { n u64 }
+message Over { score u64 }
+
+actor Game(display addr, pad addr, apu addr, ref addr) {
+    var frame region [8]u64          // the framebuffer, granted each vblank
+
+    var t u64 = 0                    // frame counter
+    var y f64 = 40.0                 // the bird's height
+    var vy f64 = 0.0                 // its vertical velocity
+    var buttons u64 = 0              // the latched pad state
+    var flap_held u64 = 1            // swallow the starting press (Roc's last_flap: True)
+    var score u64 = 0
+    var since u64 = 0                // frames since the last point
+    var flaps u64 = 0
+
+    send pad, Poll{}                          // subscribe to input
+    send display, Present{grant frame}        // the clock starts here
+
+    serve {
+        case Pad(p):
+            buttons = p.buttons               // latch; edges belong to frame time
+
+        case done(frame):                     // vblank: the frame is ours again
+            t += 1
+
+            // a flap is a rising edge: pressed now, not pressed last frame.
+            if buttons != 0 && flap_held == 0 {
+                vy = 0.0 - 2.2
+                flaps += 1
+                send apu, Tone{1}             // FLAP_TONE
+            } else {
+                vy = vy + 0.12                // gravity: same napkin as the Roc
+            }
+            flap_held = buttons
+            y = y + vy
+
+            // survive to score — a stand-in for passing a pipe.
+            since += 1
+            if since >= 8 {
+                score += 1
+                since = 0
+                send apu, Tone{2}             // POINT_TONE
+            }
+
+            // draw the bird's height and the score into the frame the
+            // glass will read; the checksum proves it reached the display.
+            frame[0] = int(y)
+            frame[1] = score
+
+            // the floor. The bird dies, and the actor dies with it —
+            // but first it tells the referee where the game ended.
+            if y >= 134.0 {
+                send apu, Tone{9}             // DEATH_TONE
+                send ref, Over{score}
+                halt ok
+            }
+
+            send display, Present{grant frame}   // and the clock ticks again
+
+        case failed(frame):
+            // the glass refused the frame — nothing to do but leave.
+            send ref, Over{score}
+            halt err
+    }
+}
+
+// The referee stands in for the Cabinet: it hears the game end and
+// records the final score. (Routing transitions through a supervisor
+// that re-spawns the next screen needs capability-passing spawn, the
+// next gap; a peer that hears the obituary proves the death path today.)
+actor Referee() {
+    var final_score u64 = 0
+    var overs u64 = 0
+    serve {
+        case Over(o):
+            final_score = o.score
+            overs += 1
+            halt ok
+    }
+}
+
+system {
+    game = Game(display, pad, apu, ref) on 0
+    ref = Referee() on 0
+    display = Display()
+    apu = Apu()
+    pad = Pad()
+}

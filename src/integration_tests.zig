@@ -944,6 +944,43 @@ test "device row: the pad pushes, the actor latches — input as a subscription"
     try testing.expectEqual(@as(u64, 6), o.varOf("g", "latched").?);
 }
 
+test "joey-bird: the whole society runs — frame clock, input, sound, death" {
+    // The bird, in the flesh, on the device row it was written against.
+    // The display is the frame clock (each `Present` waits on the last
+    // `done`); the pad streams input the bird latches and flaps on; the
+    // APU takes the flap and the death; and when the bird hits the floor
+    // it tells the referee its score and dies. Nobody calls this actor —
+    // the display writes back, the pad speaks up, the bird decides. A
+    // fixed input trace makes the whole run a recording that replays bit
+    // for bit (rocci §4).
+    const trace = [_]u64{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0 };
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        @embedFile("programs/joe/joey.joe"),
+        .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },
+    );
+    defer o.deinit();
+    // The bird flapped (input reached it and moved it), presented frames
+    // (the display counted them), played tones (flaps and the death), and
+    // died on the floor — the referee heard the final score exactly once.
+    // Golden values: the run is deterministic, so these are exact. Input
+    // is what kept the bird alive — with these seven flaps it survived 84
+    // frames and scored 10; the no-input run (the CLI default) falls in 40
+    // and scores 5. Eighteen tones = 7 flaps + 10 points + 1 death.
+    try testing.expectEqual(@as(u64, 84), o.varOf("game", "t").?);
+    try testing.expectEqual(@as(u64, 84), o.display_frames);
+    try testing.expectEqual(@as(u64, 7), o.varOf("game", "flaps").?);
+    try testing.expectEqual(@as(u64, 10), o.varOf("game", "score").?);
+    try testing.expectEqual(@as(u64, 18), o.apu_tones);
+    try testing.expectEqual(@as(u64, 30), o.pad_pushed);
+    // The bird hit the floor and told the referee, exactly once.
+    try testing.expectEqual(@as(u64, 1), o.varOf("ref", "overs").?);
+    try testing.expectEqual(machine.CtxState.halted, o.instance("game").?.state);
+    try testing.expectEqual(
+        o.varOf("game", "score").?,
+        o.varOf("ref", "final_score").?,
+    );
+}
+
 test "A4 movement 2: succession — a capability moves, with provenance" {
     // Rocci's fourth costume, in miniature: a dying screen hands its live
     // framebuffer to its successor. No copy, no redraw — the capability

@@ -1503,3 +1503,52 @@ subscription, and all three are messages on the same fabric the actors
 already live on. What remains is the bird itself — the Game actor's
 physics, the pipes, the sprite blits — which is a program now, not a
 machine or a language gap.
+
+## joey-bird runs: the whole society, end to end
+
+rocci-bird runs on a platform that calls her sixty times a second;
+joey-bird runs on joe, where nobody calls at all. The reimagining
+sketch's §4 Game actor is now a program (`src/programs/joe/joey.joe`,
+`sim6564 joey`), and it runs on the device row it was written against —
+the display is the frame clock, the pad streams input the bird latches,
+the APU takes the flap and the death, and on the floor the bird tells a
+referee its score and halts. Nobody calls the actor: the display writes
+back (`case done(frame)`), the pad speaks up (`case Pad(p)`), the bird
+decides.
+
+The frame loop is backpressure made literal: `send display,
+Present{grant frame}` hands the framebuffer to the glass, and the next
+`case done(frame)` is vblank — the region is the bird's again, one tick
+later, and it cannot draw ahead of the display. Input is the only
+nondeterminism, it arrives as messages, and the pad plays a fixed trace,
+so the whole run is a recording that replays bit for bit.
+
+| run | frames | flaps | score | outcome |
+|---|---|---|---|---|
+| no input (`sim6564 joe joey.joe … 0`) | 40 | 0 | 5 | the bird falls under gravity and dies on the floor |
+| with input (`sim6564 joey`) | 84 | 7 | 10 | seven flaps keep it aloft twice as long |
+
+Eighteen tones in the input run = 7 flaps + 10 points + 1 death; the
+referee hears the final score exactly once; both actors halt; 134 fabric
+sends, none lost, none into the void. Golden values, because the run is
+deterministic — the test pins all of them.
+
+**What it needed, and what it did not.** It needed the whole campaign:
+regions and grants (the framebuffer), the display (the clock), the pad
+(input as a subscription), the APU (fire-and-forget sound), f64 physics,
+region writes, `&&` and edge detection. It did *not* need one thing the
+sketch assumes — capability-passing spawn. joe's `spawn` takes literal
+args, so a Cabinet cannot hand a spawned screen its `display`/`pad`/`apu`
+capabilities; joey-bird is therefore a top-level actor wired in the
+system block, and a peer referee stands in for the transition a
+supervisor would route. That is the next gap, and the last one between
+this and the full three-screen game: **spawn must carry capabilities, not
+only numbers.**
+
+The frame is a region `[8]u64`, not the sketch's `[6400]u8` — regions
+are u64/f64 and cap at 512 words, so the full 160×160 @ 2bpp framebuffer
+wants a byte-region surface (or a wider region) that does not exist yet.
+The bird's height and score are written into the frame each vblank and
+the display checksums them, which proves the draw reached the glass
+without pretending the headless machine can show a pixel. Frozen table
+unmoved an eighth time; 153 tests.

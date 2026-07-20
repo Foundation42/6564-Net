@@ -256,6 +256,17 @@ pub fn main() !void {
         return sim.joe_run.run(alloc, source, opts);
     }
 
+    if (std.mem.eql(u8, first, "joey")) {
+        // joey-bird: the whole society on the device row — display frame
+        // clock, pad input, APU. A built-in trace makes the bird flap; the
+        // fabric is clean because the frame clock is backpressure with no
+        // retry, so a dropped vblank would simply stall it.
+        const trace = [_]u64{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0 };
+        var opts = sim.joe_run.Options{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace };
+        if (args.next()) |s| opts.seed = parseOr(u64, s, "seed");
+        return sim.joe_run.run(alloc, @embedFile("programs/joe/joey.joe"), opts);
+    }
+
     if (std.mem.eql(u8, first, "run")) {
         const path = args.next() orelse {
             std.debug.print("usage: sim6564 run <file.joe|file.asm> [seed] [loss_ppm4k] [trace] [scorch]\n", .{});
