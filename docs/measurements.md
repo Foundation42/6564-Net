@@ -1729,3 +1729,64 @@ real external display to make its latency-hiding observable — in the
 current discrete sim, region type-state already forbids tearing, so it
 is plumbing whose benefit switches on with the device-extraction work,
 not before.
+
+## Pixel-peek collision — byte memory, byte regions, and a bird that dies on a pipe (2026-07-20)
+
+The last entry named collision as the one brick left, and it turned on a
+gap in the machine: the 6564 widened the 6502's word to 64 bits, so
+**every `STA` writes eight bytes** — there was no way to write one. A
+framebuffer wants one. So the machine grew the missing primitive.
+
+**Two opcodes, `LDB`/`STB`, on the extended page's indirect `$?1` column**
+($A1 / $81). `LDB (ind),Y` loads a byte zero-extended into A; `STB (ind),Y`
+stores A's low byte and leaves the other seven untouched — memory is
+bytes, so it is a plain one-byte write, no read-modify-write. They are the
+byte-width siblings of `FLDS`/`FSTS` (the FP32 narrowing memory ops), and
+they ride (ind),Y because that is how a region's base cell is dereferenced.
+A machine test proves the discipline: poke byte 3 of `$1122334455667788`
+with `$AB`, read back exactly `$AB`, and the word is `$11223344AB667788` —
+one byte of eight moved.
+
+**`region [N]u8` in joe.** A byte region indexes by the byte itself (no
+`ASL #3`) and lowers `frame[i]` to `LDB`/`STB`; its descriptor length is in
+bytes; its RAM area is byte-sized and rounded to a word so word regions
+after it stay aligned; and it earns a wider extent (up to 4096 bytes) since
+it packs eight to the word. Everything else — the grant, the display
+present, the type-state lock — is unchanged: a byte region is a region.
+
+**joey-bird's `frame` is now a real framebuffer** — `region [135]u8`, one
+byte per row of the player's column (0..134, the floor), so `frame[int(y)]`
+needs no scaling. Each vblank the bird draws the *world* into it with a
+`for r in 0..135` loop (a pipe over the column is solid outside the gap
+`[8,100)`, open inside) and draws *itself not at all*, then reads back the
+byte under its own height. That read is the collision (sketch §5): the
+region type-state forbids reading a granted frame, so the draw, the peek
+and the present are one ordered burst, and the bird finds a pipe in a
+world it never appears in.
+
+| run | frames | score | death |
+|---|---|---|---|
+| golden trace (`sim6564 joey`) | 61 | 6 | pipe (`cause=2`), fell out the gap at y≈102 |
+| endless (flap every 24) | 100 | 10 | pipe, after lapping the field past the eight-cap |
+
+She clears six gaps, then — when the input runs out and she falls — drops
+out of the gap bottom and clips a pipe at frame 61, well above the floor:
+`cause = 2` (the pipe), not `1` (the floor). Nine tones = 2 flaps + 6
+points + 1 death. The endless demonstration retuned around collision: a
+steady hover in the wide gap laps the field and scores 10 before drift
+walks her onto a pipe — the score past eight still being the proof that
+the field recycled.
+
+Frozen table **unmoved** (2820 B / 171,532 instr / 479,275 cy / 13,281
+switches): two opcodes at unused slots and a byte-region path nothing else
+reaches for. 159 tests.
+
+**What is left, honestly.** The gap is one fixed band for every pipe, so
+the game is "stay in the lane"; per-pipe gap heights (another SoA vector,
+`where`-selected on recycle) make it real flappy. The framebuffer is one
+column — the collision surface — not the whole screen; a 2D byte grid the
+display actually scans out is the render-for-real work, and it arrives with
+**device extraction** (lifting the display/pad/APU out of machine.zig into
+hot-swappable plug-in devices) and **double buffering**, whose latency-
+hiding finally has something to hide behind once a real display scans real
+pixels.

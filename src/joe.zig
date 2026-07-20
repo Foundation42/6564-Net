@@ -426,6 +426,9 @@ const VarDecl = struct {
     buf_cap: u16 = 0,
     region_len: u16 = 0,
     region_f64: bool = false,
+    /// `region [N]u8` — a byte region (a framebuffer). Elements are one
+    /// byte, indexed and stored with LDB/STB, not the word path.
+    region_u8: bool = false,
     /// `var anim Anim` (A3.4): the record this variable is shaped by.
     record: ?[]const u8 = null,
 };
@@ -908,18 +911,23 @@ const Parser = struct {
                 _ = try self.expect(.lbracket, "[");
                 const n = try self.expect(.int, "region length");
                 _ = try self.expect(.rbracket, "]");
-                const t = try self.expect(.ident, "u64 or f64");
+                const t = try self.expect(.ident, "u64, f64 or u8");
                 const is_f = std.mem.eql(u8, t.text, "f64");
-                if (!is_f and !std.mem.eql(u8, t.text, "u64"))
-                    return self.fail("v1 regions hold u64 or f64", Error.Unsupported);
-                if (n.value == 0 or n.value > 512)
-                    return self.fail("region length is 1..512 elements in v1", Error.Semantics);
+                const is_b = std.mem.eql(u8, t.text, "u8");
+                if (!is_f and !is_b and !std.mem.eql(u8, t.text, "u64"))
+                    return self.fail("v1 regions hold u64, f64 or u8", Error.Unsupported);
+                // A byte region (a framebuffer) packs eight to the word, so
+                // it earns a wider extent — bounded by the block's RAM.
+                const cap: u64 = if (is_b) 4096 else 512;
+                if (n.value == 0 or n.value > cap)
+                    return self.fail("region length is 1..512 elements (1..4096 bytes for u8)", Error.Semantics);
                 try vlist.append(.{
                     .name = vname.text,
                     .ty = if (is_f) .f64_ else .u64_,
                     .init = null,
                     .region_len = @intCast(n.value),
                     .region_f64 = is_f,
+                    .region_u8 = is_b,
                 });
                 continue;
             }
@@ -1764,6 +1772,7 @@ const RegionInfo = struct {
     f64: bool,
     len: u16,
     area: u64,
+    byte: bool = false,
     granted_anywhere: bool = false,
     locked: bool = false,
 };
@@ -1895,7 +1904,7 @@ const Gen = struct {
     next_slot: u16 = 0,
     /// RAM arrays: name → near slot holding the base pointer. Group
     /// params, array vars and regions all land here.
-    arrays: std.StringHashMap(struct { ptr_slot: u16, area: u64, len: u16, f64: bool = false }),
+    arrays: std.StringHashMap(struct { ptr_slot: u16, area: u64, len: u16, f64: bool = false, byte: bool = false }),
     /// Registered regions (item 6): grantable RAM arrays with a
     /// descriptor. `locked` is the compile-time type-state — granted
     /// means inaccessible until the done/failed case rebinds.
@@ -2117,11 +2126,14 @@ const Gen = struct {
         var next_region_slot: u8 = 8; // rings own 0..5; regions from 8
         for (self.actor.vars) |v| {
             if (v.region_len == 0) continue;
-            try self.arrays.put(v.name, .{ .ptr_slot = aoff, .area = area, .len = v.region_len, .f64 = v.region_f64 });
-            try self.regions.put(v.name, .{ .slot = next_region_slot, .f64 = v.region_f64, .len = v.region_len, .area = area });
+            const esz: u64 = if (v.region_u8) 1 else 8;
+            try self.arrays.put(v.name, .{ .ptr_slot = aoff, .area = area, .len = v.region_len, .f64 = v.region_f64, .byte = v.region_u8 });
+            try self.regions.put(v.name, .{ .slot = next_region_slot, .f64 = v.region_f64, .len = v.region_len, .area = area, .byte = v.region_u8 });
             next_region_slot += 1;
             aoff += 8;
-            area += @as(u64, v.region_len) * 8;
+            // keep the next area 8-byte aligned so word regions after a
+            // byte one still land on a word boundary.
+            area += (@as(u64, v.region_len) * esz + 7) & ~@as(u64, 7);
         }
         for (self.actor.vars) |v| {
             if (v.buf_cap == 0) continue;
@@ -2815,9 +2827,16 @@ const Gen = struct {
                         return self.fail(0, "a granted region is inaccessible until done/failed rebinds it (§6.2)", Error.Semantics);
                 }
                 try self.evalInto(ix.idx);
-                try self.w("        ASL #3", .{});
-                try self.w("        TAY", .{});
-                try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
+                if (arr.byte) {
+                    // A byte region: the index IS the byte offset; LDB
+                    // zero-extends the one byte into A.
+                    try self.w("        TAY", .{});
+                    try self.w("        LDB (${X}),Y", .{arr.ptr_slot});
+                } else {
+                    try self.w("        ASL #3", .{});
+                    try self.w("        TAY", .{});
+                    try self.w("        LDA (${X}),Y", .{arr.ptr_slot});
+                }
             },
             .paylen => |px| {
                 const bind = self.bind orelse
@@ -3628,22 +3647,26 @@ const Gen = struct {
                     }
                     if (a.op != .set)
                         return self.fail(0, "v1 array assignment is `=` only", Error.Unsupported);
+                    // A byte region indexes by the byte itself and stores
+                    // one byte (STB); a word region scales by 8 and stores
+                    // the whole word (STA).
+                    const store_mn: []const u8 = if (arr.byte) "STB" else "STA";
                     if (self.simpleOperand(a.expr)) |opr| {
                         try self.evalInto(ix);
-                        try self.w("        ASL #3", .{});
+                        if (!arr.byte) try self.w("        ASL #3", .{});
                         try self.w("        TAY", .{});
                         try self.opSimple("LDA", opr);
-                        try self.w("        STA (${X}),Y", .{arr.ptr_slot});
+                        try self.w("        {s} (${X}),Y", .{ store_mn, arr.ptr_slot });
                         return;
                     }
                     const tmp = try self.pushTmp();
                     try self.evalInto(a.expr);
                     try self.w("        STA ${X}", .{tmp});
                     try self.evalInto(ix);
-                    try self.w("        ASL #3", .{});
+                    if (!arr.byte) try self.w("        ASL #3", .{});
                     try self.w("        TAY", .{});
                     try self.w("        LDA ${X}", .{tmp});
-                    try self.w("        STA (${X}),Y", .{arr.ptr_slot});
+                    try self.w("        {s} (${X}),Y", .{ store_mn, arr.ptr_slot });
                     self.popTmp();
                     return;
                 }
@@ -4727,9 +4750,10 @@ const Gen = struct {
             while (rit.next()) |e| {
                 const r = e.value_ptr.*;
                 const off = @as(u64, r.slot) * ring.desc_size;
+                const esz: u64 = if (r.byte) 1 else 8;
                 try self.store(self.layout.data + abi.array_off + r.area, off);
                 try self.store(@as(u64, ring.desc_flag_region) << 56, off + 8);
-                try self.store(@as(u64, r.len) * 8, off + 16);
+                try self.store(@as(u64, r.len) * esz, off + 16); // length in bytes
                 try self.store(abi.token, off + 24);
             }
         }

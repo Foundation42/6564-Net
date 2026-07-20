@@ -929,6 +929,10 @@ pub const Machine = struct {
         return (try bytesAt(core, ctx, addr, 1))[0];
     }
 
+    fn write8(core: *Core, ctx: *Context, addr: u64, value: u64) MemError!void {
+        (try bytesAt(core, ctx, addr, 1))[0] = @truncate(value);
+    }
+
     fn readDesc(ctx: *Context, slot: u8) ring.Desc {
         var words: [4]u64 = undefined;
         for (&words, 0..) |*w, i| {
@@ -1704,6 +1708,14 @@ pub const Machine = struct {
             .sta => try self.store(core, ctx_idx, ctx, ea, ctx.a),
             .stx => try self.store(core, ctx_idx, ctx, ea, ctx.x),
             .sty => try self.store(core, ctx_idx, ctx, ea, ctx.y),
+            // Byte memory: one byte at the effective address. `LDB` zero-
+            // extends into A; `STB` writes A's low byte, the other seven
+            // in memory untouched — no read-modify-write, memory is bytes.
+            .ldb => {
+                ctx.a = try read8(core, ctx, ea);
+                ctx.p.setNZ(ctx.a);
+            },
+            .stb => try write8(core, ctx, ea, ctx.a),
             // ── Transfers ─────────────────────────────────────────────────
             .tax => {
                 ctx.x = ctx.a;

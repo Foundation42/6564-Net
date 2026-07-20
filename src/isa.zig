@@ -147,6 +147,14 @@ pub const Mnemonic = enum {
     itof,
     flds,
     fsts,
+    // Sub-word memory (extended page): the 6502 was byte-addressed, but the
+    // 6564 widened its word to 64 bits and every `STA` writes eight bytes.
+    // A byte framebuffer wants one. `LDB` loads a byte zero-extended; `STB`
+    // stores A's low byte, leaving the other seven untouched — the analog of
+    // `FLDS`/`FSTS`'s narrowing, at byte width. They ride the indirect
+    // `$?1` column, where a region's base cell is dereferenced by Y.
+    ldb,
+    stb,
     // Tier 1 vectors (extended page, the $?7 column — the base page spent
     // its $?7 column on I/O and concurrency; the extended page spends its
     // on the vector unit). V0–V7 × 512-bit, EIGHT f64/u64 lanes, ONE
@@ -386,6 +394,8 @@ pub const xtable = [_]Encoding{
     x(.flds, .ind_y, 0xB1, 6),  x(.fsts, .near, 0x85, 4),
     x(.fsts, .near_x, 0x95, 4), x(.fsts, .abs, 0x8D, 5),
     x(.fsts, .ind, 0x92, 6),    x(.fsts, .ind_y, 0x91, 6),
+    // ── Byte memory: load zero-extended, store the low byte (indirect,Y) ──
+    x(.ldb, .ind_y, 0xA1, 4),   x(.stb, .ind_y, 0x81, 4),
     // ── Tier 1 vectors: the extended $?7 column, spent whole ────────────
     // Lanewise costs mirror the scalar ops (eight lanes are parallel
     // silicon, not eight passes); loads/stores price the 64-byte move;

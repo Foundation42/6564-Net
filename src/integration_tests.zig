@@ -1008,6 +1008,76 @@ test "Tier 1 vectors: `where` is lanewise select — the mask that counts now ch
     try testing.expectEqual(@as(u64, 428), o.varOf("c", "psum").?);
 }
 
+test "byte memory: STB writes one byte of eight, LDB reads it back zero-extended" {
+    // The 6564 widened the 6502's word to 64 bits, so every STA writes eight
+    // bytes. A byte framebuffer wants one. STB stores A's low byte and leaves
+    // the other seven untouched (memory is bytes — no read-modify-write);
+    // LDB reads a byte zero-extended. Both ride (ind),Y off a near base cell,
+    // exactly as a joe region's `frame[i]` will.
+    var m = try Machine.init(testing.allocator, .{
+        .cores = 1,
+        .contexts_per_core = 1,
+        .ram_size = 0x8000,
+    });
+    defer m.deinit();
+    const src =
+        \\        .org $1000
+        \\        LDA ##$2000                 ; region base
+        \\        STA $10                     ; park it in a near cell
+        \\        LDA ##$1122334455667788     ; a full word at the base
+        \\        STA !$2000
+        \\        LDY #3                      ; byte index 3
+        \\        LDA #$AB
+        \\        STB ($10),Y                 ; write one byte at $2000+3
+        \\        LDB ($10),Y                 ; read it back, zero-extended
+        \\        STA !$2050                  ; record the loaded byte
+        \\        LDA !$2000                  ; the word, after the byte poke
+        \\        STA !$2058
+        \\        HLT
+    ;
+    try assembleInto(&m, 0, src);
+    try m.spawn(0, 0, 0x1000, 0x3000, 0);
+    try testing.expectEqual(machine.StopReason.all_halted, try m.run());
+    const at = struct {
+        fn word(mm: *Machine, addr: u64) u64 {
+            return std.mem.readInt(u64, mm.cores[0].ram[addr - 0x1000 ..][0..8], .little);
+        }
+    }.word;
+    // LDB zero-extended the byte: A held exactly $AB.
+    try testing.expectEqual(@as(u64, 0xAB), at(&m, 0x2050));
+    // Only byte 3 changed: $55 → $AB, the other seven bytes intact.
+    try testing.expectEqual(@as(u64, 0x11223344AB667788), at(&m, 0x2058));
+}
+
+test "byte regions: joe `region [N]u8` stores and reads bytes (LDB/STB path)" {
+    // A byte region is a framebuffer: one byte per element, indexed by the
+    // byte itself (no ×8), drawn with STB and read with LDB. A for-loop
+    // fills ten bytes 1..10; a byte poke must not disturb its neighbours,
+    // which the sum 55 and the two spot reads together prove.
+    var o = try @import("joe_run.zig").simulate(testing.allocator,
+        \\actor Bytes() {
+        \\    var buf region [10]u8
+        \\    var a u64 = 0
+        \\    var b u64 = 0
+        \\    var s u64 = 0
+        \\    for r in 0..10 {
+        \\        buf[r] = r + 1
+        \\    }
+        \\    a = buf[3]
+        \\    b = buf[7]
+        \\    for r in 0..10 {
+        \\        s += buf[r]
+        \\    }
+        \\    halt ok
+        \\}
+        \\system { x = Bytes() on 0 }
+    , .{ .loss_ppm4k = 0, .dup_ppm4k = 0 });
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 4), o.varOf("x", "a").?);
+    try testing.expectEqual(@as(u64, 8), o.varOf("x", "b").?);
+    try testing.expectEqual(@as(u64, 55), o.varOf("x", "s").?);
+}
+
 test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     // The bird, in the flesh, on the device row it was written against.
     // The display is the frame clock (each `Present` waits on the last
@@ -1024,20 +1094,25 @@ test "joey-bird: the whole society runs — frame clock, input, sound, death" {
     );
     defer o.deinit();
     // The bird flapped (input reached it and moved it), presented frames
-    // (the display counted them), played tones (flaps and the death), and
-    // died on the floor — the referee heard the final score exactly once.
-    // Golden values: the run is deterministic, so these are exact. Input
-    // is what kept the bird alive — with these seven flaps it survived 83
-    // frames and passed 8 pipes; the no-input run (the CLI default) falls
-    // in 40 and passes 4. Sixteen tones = 7 flaps + 8 points + 1 death.
-    // The score is now the SoA-vector popcount, one point per pipe crossed.
-    try testing.expectEqual(@as(u64, 83), o.varOf("game", "t").?);
-    try testing.expectEqual(@as(u64, 83), o.display_frames);
-    try testing.expectEqual(@as(u64, 7), o.varOf("game", "flaps").?);
-    try testing.expectEqual(@as(u64, 8), o.varOf("game", "score").?);
-    try testing.expectEqual(@as(u64, 16), o.apu_tones);
+    // (the display counted them), played tones (flaps, points, and the
+    // death), and died ON A PIPE — the pixel-peek, not the floor. Golden
+    // values: the run is deterministic, so these are exact. With these two
+    // flaps she cleared six gaps and then, when the input ran out and she
+    // fell, dropped out of the gap and clipped a pipe at frame 61 — at
+    // height ~102, well above the floor (134). `cause = 2` is the pipe;
+    // `cause = 1` would be the floor. Nine tones = 2 flaps + 6 points + 1
+    // death. The collision is the byte framebuffer read back under her.
+    try testing.expectEqual(@as(u64, 61), o.varOf("game", "t").?);
+    try testing.expectEqual(@as(u64, 61), o.display_frames);
+    try testing.expectEqual(@as(u64, 2), o.varOf("game", "flaps").?);
+    try testing.expectEqual(@as(u64, 6), o.varOf("game", "score").?);
+    try testing.expectEqual(@as(u64, 9), o.apu_tones);
     try testing.expectEqual(@as(u64, 30), o.pad_pushed);
-    // The bird hit the floor and told the referee, exactly once.
+    // She died on a pipe (cause 2), not the floor (cause 1) — and her
+    // height at death proves it: a pipe body, not the ground.
+    try testing.expectEqual(@as(u64, 2), o.varOf("game", "cause").?);
+    try testing.expect(@as(f64, @bitCast(o.varOf("game", "y").?)) < 134.0);
+    // The bird died and told the referee, exactly once.
     try testing.expectEqual(@as(u64, 1), o.varOf("ref", "overs").?);
     try testing.expectEqual(machine.CtxState.halted, o.instance("game").?.state);
     try testing.expectEqual(
@@ -1050,16 +1125,15 @@ test "joey-bird: the pipes are endless — a longer-lived bird laps the field (w
     // With the old eight fixed pipes the score capped at eight: each pipe
     // crossed the player once and was gone. `where` recycles a pipe off the
     // left edge back to the right (+160, phase-preserving), so a bird kept
-    // aloft long enough laps the field and scores again. This trace flaps
-    // roughly every sixteen frames — enough upward drift to stay off the
-    // floor for the whole recording (there is no ceiling to die against) —
-    // and the score climbs past eight, which only recycling can produce.
-    // Observed: she survives 196 of the 208 recorded frames and scores 19,
-    // where the old fixed field capped at eight. The assertion stays an
-    // inequality — it is recycling that is under test, not the physics.
-    var trace: [208]u64 = .{0} ** 208;
+    // in the gap long enough laps the whole field and scores again. This
+    // trace flaps every 24 frames — a rough hover inside the [8,100) gap —
+    // and she clears the eighth pipe (one full lap, ~frame 80) and keeps
+    // going, scoring past eight before drift eventually walks her out of the
+    // gap onto a pipe. Observed: she scores 10 by frame 100. The score past
+    // eight is the point: only a recycled field can produce it.
+    var trace: [300]u64 = .{0} ** 300;
     var i: usize = 0;
-    while (i < trace.len) : (i += 16) trace[i] = 1;
+    while (i < trace.len) : (i += 24) trace[i] = 1;
     var o = try @import("joe_run.zig").simulate(testing.allocator,
         @embedFile("programs/joe/joey/joey.joe"),
         .{ .loss_ppm4k = 0, .dup_ppm4k = 0, .pad_trace = &trace },

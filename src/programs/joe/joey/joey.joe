@@ -24,7 +24,15 @@ message Tone { n u64 }
 message Over { score u64 }
 
 actor Game(display addr, pad addr, apu addr, ref addr) {
-    var frame region [8]u64          // the framebuffer, granted each vblank
+    // The framebuffer is now a REAL one: a byte per row of the player's
+    // column, 0..134 (the floor). Each frame the bird draws the world into
+    // it — a pipe body is solid, the gap is open — and draws itself NOT AT
+    // ALL, then reads back the byte under its own height. That read is the
+    // collision (sketch §5, the pixel-peek): the region type-state forbids
+    // reading a granted frame, so the draw, the peek and the present are one
+    // ordered burst. `region [135]u8` lands in RAM as bytes, drawn with STB
+    // and read with LDB — the byte memory the 64-bit machine grew for this.
+    var frame region [135]u8         // the player's column, granted each vblank
 
     var t u64 = 0                    // frame counter
     var y f64 = 40.0                 // the bird's height
@@ -33,6 +41,7 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
     var flap_held u64 = 1            // swallow the starting press (Roc's last_flap: True)
     var score u64 = 0
     var flaps u64 = 0
+    var cause u64 = 0                // how the game ended: 1 floor, 2 pipe
 
     // The pipes: eight of them, as a single vector — Roc's List(Pipe) as
     // SoA lanes (sketch §6.1, the item-5 workload in miniature). They
@@ -40,6 +49,8 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
     // when its x reaches the player: a lanewise compare to a mask, summed.
     var pipe_x vec                   // the eight pipe positions
     var passed vec                   // 1.0 in each lane that just crossed
+    var atcol vec                    // 1.0 in each lane now over the player
+    var atcol2 vec                   // scratch for the second half of the band
 
     pipe_x = [40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]
 
@@ -81,17 +92,50 @@ actor Game(display addr, pad addr, apu addr, ref addr) {
                 send apu, Tone{2}             // POINT_TONE
             }
 
-            // draw the bird's height and the score into the frame the
-            // glass will read; the checksum proves it reached the display.
-            frame[0] = int(y)
-            frame[1] = score
+            // Is a pipe over the player's column right now? A pipe spans a
+            // band six wide around x = 20; two lanewise compares ANDed (the
+            // product of two 1.0/0.0 masks) mark the lanes inside it, and the
+            // sum is 0 (open sky) or 1 (a pipe is here). Spacing is 20 and
+            // the band is 12, so at most one lane ever counts.
+            atcol = pipe_x > 14.0
+            atcol2 = pipe_x < 26.0
+            atcol = atcol * atcol2
+            let blocked = int(atcol.reduce(+))
 
-            // the floor. The bird dies, and the actor dies with it —
-            // but first it tells the referee where the game ended.
+            // Draw the world into the column: the gap [30, 85) is open sky,
+            // every other row is pipe body when a pipe is over the column.
+            // The bird is NOT drawn — that omission is the whole point of the
+            // peek that follows. 135 STBs, one region, no player in it.
+            for r in 0..135 {
+                if r >= 8 && r < 100 {
+                    frame[r] = 0
+                } else {
+                    frame[r] = blocked
+                }
+            }
+
+            // the floor: the bird dies, and the actor dies with it — but
+            // first it tells the referee where the game ended.
             if y >= 134.0 {
+                cause = 1
                 send apu, Tone{9}             // DEATH_TONE
                 send ref, Over{score}
                 halt ok
+            }
+
+            // the pixel-peek: read back the byte under the bird's height. A
+            // solid byte means a pipe body is exactly where the bird is —
+            // collision, read from the world she never appears in. Guarded by
+            // y >= 0 because above the screen there is nothing to read (and no
+            // ceiling to die against).
+            if y >= 0.0 {
+                let hit = frame[int(y)]
+                if hit != 0 {
+                    cause = 2
+                    send apu, Tone{9}         // DEATH_TONE
+                    send ref, Over{score}
+                    halt ok
+                }
             }
 
             send display, Present{grant frame}   // and the clock ticks again

@@ -720,6 +720,19 @@ region. A frame's worst-case cost is priceable against the ISA table
 never to miss its vblank by surprise — the arithmetic lies die at
 compile time, and a game has no data lies to tell.
 
+The granted frame is a **byte region** — `region [N]u8` (§8, byte
+memory) — so the program draws into it a pixel at a time with `STB`, and,
+crucially, reads it back with `LDB` between the completion and the next
+grant. That read-back is **pixel-peek collision**: draw the world into the
+frame, draw the player *not at all*, then look up the byte under the
+player's position — a solid byte is a hit. The type-state makes the
+ordering free: the frame cannot be read while it is granted (being
+scanned), so the draw, the peek and the next present are one burst, and
+the collision is read from a world the player never appears in. The
+obstacle geometry is ordinary vector work (an SoA lane compare marks which
+obstacles overlap the player's column), so a frame's collision is priced
+into its worst-case cost like everything else it draws.
+
 This is the peripheral row's second *pushing* device by nature (§7.1,
 the line that named "a display's vblank"): the completion arrives unasked
 in the sense that no `RECV` solicited *this* frame's return — the grant
@@ -792,6 +805,8 @@ Descriptor operands (`desc`) are one-byte near-page offsets. The general-purpose
 Instructions remain byte-granular and variable-length in the 6502 tradition: one-byte opcodes, with operands sized by addressing mode. Inherited 6502/65C02 instructions retain their classic opcode bytes; new I/O and concurrency operations occupy columns NMOS never defined. Near-page modes keep the hot path (queue ops, continuation ops) at 2–3 bytes per instruction. Code density is a stated goal: instruction fetch is a bandwidth consumer like any other, and a message-passing machine should not spend its bandwidth describing itself.
 
 **Counted shifts (v2.5).** `ASL/LSR/ROL/ROR #n` occupy the `$?B` column: a 64-bit machine extracts fields, and eight-line single-bit shift ladders were instruction burn with no silicon justification — a barrel shifter is constant-time, so any count costs 2 cycles. Count is taken mod 64; count 0 is a no-op that preserves the flags; carry is the last bit shifted out, exactly as n single-bit shifts would leave it. The bare single-bit forms keep their classic bytes and behavior.
+
+**Byte memory (v2.6).** The 6502 was byte-addressed; the 6564 widened its word to 64 bits, so every `STA` writes eight bytes and there was no way to write one. A byte framebuffer wants one. `LDB`/`STB` (extended page, the indirect `$?1` column, `(ind),Y`) are the byte-width memory ops: `LDB` loads a byte zero-extended into A; `STB` stores A's low byte and leaves the other seven untouched — memory is bytes, so it is a plain one-byte write, no read-modify-write. They are the byte-width analog of `FLDS`/`FSTS`'s FP32 narrowing, and they let a `region [N]u8` (§7.7) be a real framebuffer a program draws into with byte granularity. Words still move eight bytes at a time; nothing that does not name a byte pays for one.
 
 ### 8.1 The Extended Page and the FP Tiers (v2.6)
 
